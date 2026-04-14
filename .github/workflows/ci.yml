@@ -4,11 +4,6 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened]
-    paths:
-      - 'src/**'
-      - 'tests/**'
-      - 'pyproject.toml'
-      - '.github/workflows/**'
 
 concurrency:
   group: ci-${{ github.head_ref }}
