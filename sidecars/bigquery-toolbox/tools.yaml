@@ -1,0 +1,60 @@
+sources:
+  my_bq:
+    kind: bigquery
+    project: your-gcp-project-id
+    location: us
+    writeMode: blocked
+    useClientOAuth: true
+    maxQueryResultRows: 100
+    scopes:
+      - "https://www.googleapis.com/auth/bigquery.readonly"
+    # allowedDatasets:            # Uncomment to restrict — leave empty for all
+    #   - analytics
+
+tools:
+  # --- Core metadata + SQL ---
+  list_datasets:
+    kind: bigquery-list-dataset-ids
+    source: my_bq
+    description: "List all dataset IDs in the project"
+
+  list_tables:
+    kind: bigquery-list-table-ids
+    source: my_bq
+    description: "List table IDs in a dataset"
+
+  get_dataset_info:
+    kind: bigquery-get-dataset-info
+    source: my_bq
+    description: "Get metadata for a dataset"
+
+  get_table_info:
+    kind: bigquery-get-table-info
+    source: my_bq
+    description: "Get schema and metadata for a table"
+
+  execute_sql:
+    kind: bigquery-execute-sql
+    source: my_bq
+    description: "Execute a SQL query against BigQuery"
+
+  # --- Analytics ---
+  conversational_analytics:
+    kind: bigquery-conversational-analytics
+    source: my_bq
+    description: "Ask questions about your data in natural language"
+
+  forecast:
+    kind: bigquery-forecast
+    source: my_bq
+    description: "Forecast time series data"
+
+  analyze_contribution:
+    kind: bigquery-analyze-contribution
+    source: my_bq
+    description: "Analyze key drivers and contributions in data"
+
+  search_catalog:
+    kind: bigquery-search-catalog
+    source: my_bq
+    description: "Search for tables and datasets in the catalog"

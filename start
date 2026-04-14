@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# MCP Broker — development commands
+set -e
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV="$DIR/.venv"
+
+# --- Ensure venv exists ---
+ensure_venv() {
+    if [ ! -d "$VENV" ]; then
+        echo "Creating venv..."
+        python3.11 -m venv "$VENV"
+        "$VENV/bin/pip" install --upgrade pip -q
+        "$VENV/bin/pip" install -e ".[dev]" -q
+        echo "Installed."
+    fi
+    source "$VENV/bin/activate"
+    if [ -f "$DIR/.env" ]; then
+        set -a; source "$DIR/.env"; set +a
+    fi
+    export PYTHONPATH="$DIR/src"
+}
+
+# --- Resolve broker URL (positional arg > env > default) ---
+resolve_broker_url() {
+    echo "${BROKER_URL:-http://localhost:${BROKER_PORT:-8002}}"
+}
+
+# --- Admin API helper (keeps admin key out of /proc/*/cmdline) ---
+admin_api() {
+    local method="$1" path="$2" body="${3:-}"
+    local url="$(resolve_broker_url)${path}"
+    local tmpfile; tmpfile=$(mktemp)
+    trap 'rm -f "$tmpfile"' RETURN
+    printf 'header = "X-Admin-Key: %s"\n' "${BROKER_ADMIN_KEY}" > "$tmpfile"
+    if [ -n "$body" ]; then
+        curl -s -X "$method" "$url" --config "$tmpfile" -H "Content-Type: application/json" -d "$body"
+    else
+        curl -s -X "$method" "$url" --config "$tmpfile"
+    fi
+}
+
+# --- Commands ---
+case "${1:-help}" in
+    start)
+        ensure_venv
+        exec uvicorn broker.main:app --reload --reload-dir "$DIR/src" \
+            --host "${BROKER_HOST:-0.0.0.0}" --port "${BROKER_PORT:-8002}"
+        ;;
+    test)
+        ensure_venv
+        shift
+        exec python -m pytest tests/ -v "$@"
+        ;;
+    connect)
+        ensure_venv
+        shift
+        if [[ "${1:-}" == http* ]]; then BROKER_URL="$1"; shift; fi
+        exec python "$DIR/scripts/connect.py" --broker-url "${BROKER_URL:-http://localhost:${BROKER_PORT:-8002}}" "$@"
+        ;;
+    mcp-config)
+        ensure_venv
+        shift
+        if [[ "${1:-}" == http* ]]; then BROKER_URL="$1"; shift; fi
+        exec python "$DIR/scripts/connect.py" --show-config --broker-url "${BROKER_URL:-http://localhost:${BROKER_PORT:-8002}}" "$@"
+        ;;
+    lint)
+        ensure_venv
+        exec ruff check "$DIR/src" "$DIR/tests"
+        ;;
+    health)
+        BROKER_URL="${2:-${BROKER_URL:-http://localhost:${BROKER_PORT:-8002}}}"
+        curl -s "${BROKER_URL}/health" | python3 -m json.tool
+        ;;
+    generate-admin-key)
+        python3 -c "import secrets; key='br_admin_'+secrets.token_urlsafe(32); print(key); print(); print('Set this in your .env:'); print(f'  BROKER_ADMIN_KEY={key}')"
+        ;;
+    create-key)
+        ensure_venv
+        shift; if [[ "${1:-}" == http* ]]; then BROKER_URL="$1"; shift; fi
+        echo "Fetching app list..."
+        response=$(admin_api GET /admin/keys)
+        apps_without_keys=$(echo "$response" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+apps = data.get('apps', data) if isinstance(data, dict) else data
+candidates = [a for a in apps if not a.get('has_key')]
+if not candidates:
+    print('NO_CANDIDATES')
+else:
+    for i, a in enumerate(candidates, 1):
+        print(f\"{i}. {a['app_key']}\")
+" 2>/dev/null)
+        if [ "$apps_without_keys" = "NO_CANDIDATES" ] || [ -z "$apps_without_keys" ]; then
+            echo "No apps without keys found (all apps already have keys, or no apps configured)."
+            exit 0
+        fi
+        echo "Apps without keys:"
+        echo "$apps_without_keys"
+        printf "Select app number: "
+        read -r selection
+        selected_app=$(echo "$response" | _SEL="$selection" python3 -c "
+import sys, json, os
+data = json.load(sys.stdin)
+apps = data.get('apps', data) if isinstance(data, dict) else data
+candidates = [a for a in apps if not a.get('has_key')]
+idx = int(os.environ.get('_SEL', '0')) - 1
+if 0 <= idx < len(candidates):
+    print(candidates[idx]['app_key'])
+" 2>/dev/null)
+        if [ -z "$selected_app" ]; then
+            echo "Invalid selection."
+            exit 1
+        fi
+        echo "Creating key for app: $selected_app"
+        create_response=$(admin_api POST /admin/keys "$(printf '{"app_key": "%s"}' "$selected_app")")
+        echo "$create_response" | python3 -c "
+import sys, json
+r = json.load(sys.stdin)
+if 'api_key' in r:
+    print()
+    print('Generated key:')
+    print(f\"  {r['api_key']}\")
+    print()
+    print('Save this key — it cannot be retrieved later.')
+    print('Add this to your MCP client config as the X-Broker-Key header value.')
+else:
+    print('Error:', json.dumps(r, indent=2))
+" 2>/dev/null
+        ;;
+    rotate-key)
+        ensure_venv
+        shift; if [[ "${1:-}" == http* ]]; then BROKER_URL="$1"; shift; fi
+        echo "Fetching app list..."
+        response=$(admin_api GET /admin/keys)
+        apps_with_keys=$(echo "$response" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+apps = data.get('apps', data) if isinstance(data, dict) else data
+candidates = [a for a in apps if a.get('has_key')]
+if not candidates:
+    print('NO_CANDIDATES')
+else:
+    for i, a in enumerate(candidates, 1):
+        print(f\"{i}. {a['app_key']}\")
+" 2>/dev/null)
+        if [ "$apps_with_keys" = "NO_CANDIDATES" ] || [ -z "$apps_with_keys" ]; then
+            echo "No apps with keys found."
+            exit 0
+        fi
+        echo "Apps with keys:"
+        echo "$apps_with_keys"
+        printf "Select app number to rotate: "
+        read -r selection
+        selected_app=$(echo "$response" | _SEL="$selection" python3 -c "
+import sys, json, os
+data = json.load(sys.stdin)
+apps = data.get('apps', data) if isinstance(data, dict) else data
+candidates = [a for a in apps if a.get('has_key')]
+idx = int(os.environ.get('_SEL', '0')) - 1
+if 0 <= idx < len(candidates):
+    print(candidates[idx]['app_key'])
+" 2>/dev/null)
+        if [ -z "$selected_app" ]; then
+            echo "Invalid selection."
+            exit 1
+        fi
+        echo "Rotating key for app: $selected_app"
+        rotate_response=$(admin_api POST "/admin/keys/$selected_app/rotate")
+        echo "$rotate_response" | python3 -c "
+import sys, json
+r = json.load(sys.stdin)
+if 'api_key' in r:
+    print()
+    print('New key:')
+    print(f\"  {r['api_key']}\")
+    print()
+    print('Old key is now invalid. Update your MCP client config.')
+else:
+    print('Error:', json.dumps(r, indent=2))
+" 2>/dev/null
+        ;;
+    list-keys)
+        ensure_venv
+        shift; if [[ "${1:-}" == http* ]]; then BROKER_URL="$1"; shift; fi
+        response=$(admin_api GET /admin/keys)
+        echo "$response" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+apps = data.get('apps', data) if isinstance(data, dict) else data
+if not apps:
+    print('No apps configured.')
+    sys.exit(0)
+col_app = max(len('App'), max(len(a['app_key']) for a in apps))
+print(f\"{'App':<{col_app}}  {'Has Key':<8}  {'Connectors':<30}  {'Created':<24}\")
+print('-' * (col_app + 8 + 30 + 24 + 6))
+for a in apps:
+    has_key = 'yes' if a.get('has_key') else 'no'
+    connectors = ', '.join(a.get('allowed_connectors', [])) or 'all'
+    created = a.get('created_at', '-') or '-'
+    print(f\"{a['app_key']:<{col_app}}  {has_key:<8}  {connectors:<30}  {created:<24}\")
+" 2>/dev/null
+        ;;
+    delete-key)
+        ensure_venv
+        shift; if [[ "${1:-}" == http* ]]; then BROKER_URL="$1"; shift; fi
+        echo "Fetching app list..."
+        response=$(admin_api GET /admin/keys)
+        apps_with_keys=$(echo "$response" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+apps = data.get('apps', data) if isinstance(data, dict) else data
+candidates = [a for a in apps if a.get('has_key')]
+if not candidates:
+    print('NO_CANDIDATES')
+else:
+    for i, a in enumerate(candidates, 1):
+        print(f\"{i}. {a['app_key']}\")
+" 2>/dev/null)
+        if [ "$apps_with_keys" = "NO_CANDIDATES" ] || [ -z "$apps_with_keys" ]; then
+            echo "No apps with keys found."
+            exit 0
+        fi
+        echo "Apps with keys:"
+        echo "$apps_with_keys"
+        printf "Select app number to delete key: "
+        read -r selection
+        selected_app=$(echo "$response" | _SEL="$selection" python3 -c "
+import sys, json, os
+data = json.load(sys.stdin)
+apps = data.get('apps', data) if isinstance(data, dict) else data
+candidates = [a for a in apps if a.get('has_key')]
+idx = int(os.environ.get('_SEL', '0')) - 1
+if 0 <= idx < len(candidates):
+    print(candidates[idx]['app_key'])
+" 2>/dev/null)
+        if [ -z "$selected_app" ]; then
+            echo "Invalid selection."
+            exit 1
+        fi
+        printf "Delete key for '%s'? [y/N] " "$selected_app"
+        read -r confirm
+        if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+            echo "Cancelled."
+            exit 0
+        fi
+        delete_response=$(admin_api DELETE "/admin/keys/$selected_app")
+        echo "$delete_response" | python3 -c "
+import sys, json
+r = json.load(sys.stdin)
+if r.get('deleted'):
+    print(f\"Key deleted.\")
+else:
+    print('Response:', json.dumps(r, indent=2))
+" 2>/dev/null || echo "Key deleted (or app had no key)."
+        ;;
+    setup)
+        ensure_venv
+        echo "Venv ready at $VENV"
+        ;;
+    help|*)
+        echo "MCP Broker — dev commands"
+        echo ""
+        echo "  ./start start               Start broker server (port 8002, live reload)"
+        echo "  ./start connect [url]       Interactive OAuth connection manager"
+        echo "  ./start mcp-config [url]    Show MCP server config for connected services"
+        echo "  ./start test                Run tests (extra args passed to pytest)"
+        echo "  ./start lint                Run ruff linter"
+        echo "  ./start health [url]        Check broker health endpoint"
+        echo "  ./start setup               Create venv and install deps"
+        echo ""
+        echo "Key management (requires broker running except generate-admin-key):"
+        echo "  ./start generate-admin-key    Generate a new BROKER_ADMIN_KEY (offline)"
+        echo "  ./start list-keys [url]       List all apps and key status"
+        echo "  ./start create-key [url]      Create an API key for an app (interactive)"
+        echo "  ./start rotate-key [url]      Rotate an existing API key (interactive)"
+        echo "  ./start delete-key [url]      Delete an API key (interactive, with confirmation)"
+        echo ""
+        echo "First run auto-creates venv. Loads .env if present."
+        echo "Key commands use BROKER_ADMIN_KEY from .env and BROKER_URL (default: http://localhost:8002)."
+        ;;
+esac

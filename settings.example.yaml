@@ -1,0 +1,44 @@
+broker:
+  host: 0.0.0.0
+  port: 8002
+  log_level: INFO
+  connectors:
+    - hubspot
+    - notion
+    - workspace_mcp
+  admin_key: ${BROKER_ADMIN_KEY}           # For /admin/* endpoints (X-Admin-Key header)
+  encryption_keys:
+    - ${BROKER_ENCRYPTION_KEY}
+  state_secret: ${BROKER_STATE_SECRET}
+  success_redirect_url: http://localhost:3000  # Where to redirect after successful OAuth
+  public_url: http://localhost:8002/     # Public base URL for OAuth callbacks (must include trailing slash)
+  # token_refresh_enabled: true          # Background token refresh loop (default: true)
+  # token_refresh_interval_seconds: 300  # How often to scan for expiring tokens (default: 300)
+
+store:
+  backend: sqlite
+  sqlite:
+    db_path: ./data/tokens.db
+
+# Per-app auth config — scopes and connector access control.
+# API keys are managed via the admin API (POST /admin/keys), not stored in YAML.
+# After deploy, create keys: curl -X POST /admin/keys -H "X-Admin-Key: ..." -d '{"app_key": "my_company:app1"}'
+clients:
+  my_company:
+    app1:
+      scopes: [proxy, status]                              # Available scopes: proxy, status
+      allowed_connectors: [hubspot, notion, workspace_mcp] # Empty list = all connectors
+
+# Only needed for static connectors (discovery connectors get credentials automatically)
+apps:
+  my_company:
+    app1:
+      hubspot:
+        client_id: ${HUBSPOT_CLIENT_ID}
+        client_secret: ${HUBSPOT_CLIENT_SECRET}
+      twitter:
+        client_id: ${TWITTER_OAUTH2_CLIENT_ID}
+        client_secret: ${TWITTER_OAUTH2_CLIENT_SECRET}
+      workspace_mcp:
+        client_id: ${GOOGLE_OAUTH_CLIENT_ID}
+        client_secret: ${GOOGLE_OAUTH_CLIENT_SECRET}
