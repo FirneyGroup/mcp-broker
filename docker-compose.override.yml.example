@@ -1,0 +1,20 @@
+# Example override: put the broker on the shared sidecar-internal network
+# so it can reach local sidecar MCP servers (workspace-mcp, bigquery-toolbox, etc.).
+#
+# Usage:
+#   1. docker network create sidecar-internal  # once
+#   2. cp docker-compose.override.yml.example docker-compose.override.yml
+#   3. docker compose up -d  (auto-merges with docker-compose.yml)
+#
+# Docker Compose picks up docker-compose.override.yml automatically — no flags needed.
+# Sidecars under sidecars/* join the same external network and become reachable by
+# container name (e.g. http://workspace-mcp:8000/mcp).
+
+services:
+  broker:
+    networks:
+      - sidecar-internal
+
+networks:
+  sidecar-internal:
+    external: true

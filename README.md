@@ -1,13 +1,19 @@
 # mcp-broker
 
+[![CI](https://github.com/FirneyGroup/mcp-broker/actions/workflows/ci.yml/badge.svg)](https://github.com/FirneyGroup/mcp-broker/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+
 OAuth token broker and reverse proxy for remote MCP server connections.
 
 > Built and maintained by [Firney](https://firney.com). Apache 2.0 licensed.
 
 AI agents need to call tools on remote MCP servers (Notion, HubSpot, Reddit, Twitter/X), but those servers require OAuth credentials. The broker sits between your agent and remote servers, handling OAuth 2.1 flows and injecting tokens transparently so agents never see credentials.
 
-```
-Agent  ──[X-Broker-Key + X-App-Id]──>  mcp-broker  ──[Authorization: Bearer]──>  Remote MCP Server
+```mermaid
+flowchart LR
+    Agent -->|X-Broker-Key + X-App-Id| Broker[mcp-broker]
+    Broker -->|Authorization: Bearer| Remote[Remote MCP Server]
 ```
 
 ## Table of Contents
@@ -24,7 +30,7 @@ Agent  ──[X-Broker-Key + X-App-Id]──>  mcp-broker  ──[Authorization:
 - [API Reference](#api-reference)
 - [Testing](#testing)
 - [Security](#security)
-- [Scaling Roadmap](#scaling-roadmap)
+- [Scaling & Multi-Instance](#scaling--multi-instance)
 - [Contributing](#contributing)
 
 ## How It Works
@@ -72,7 +78,7 @@ Agent  ──[X-Broker-Key + X-App-Id]──>  mcp-broker  ──[Authorization:
 ```bash
 git clone https://github.com/FirneyGroup/mcp-broker.git
 cd mcp-broker
-pip install -e ".[dev]"
+uv sync --extra dev          # or: pip install -e ".[dev]"
 ```
 
 Copy the example configuration files and fill in your secrets:
@@ -140,22 +146,14 @@ If you plan to use **sidecar connectors** (e.g. Google Workspace MCP, BigQuery),
 docker network create sidecar-internal
 ```
 
-Each sidecar under `sidecars/*` has its own `docker-compose.yml` and is deployed independently (`cd sidecars/<name> && docker compose up -d`). Sidecars communicate with the broker over the `sidecar-internal` network, so the broker's own compose should join that network too — see `sidecars/_template/` for the pattern.
+Each sidecar under `sidecars/*` has its own `docker-compose.yml` and is deployed independently (`cd sidecars/<name> && docker compose up -d`). To put the broker on the same `sidecar-internal` network so it can reach sidecars, copy the provided override:
 
-```yaml
-# docker-compose.yml
-services:
-  broker:
-    build: .
-    ports:
-      - "8002:8002"
-    volumes:
-      - ./data:/app/data
-      - ./settings.yaml:/app/settings.yaml:ro
-    env_file: .env
+```bash
+cp docker-compose.override.yml.example docker-compose.override.yml
+docker compose up -d   # auto-merges base + override
 ```
 
-The Dockerfile runs as a non-root user (`appuser`, UID 1000) and exposes port 8002.
+The shipped `docker-compose.yml` lives at the repo root and runs the broker as a non-root user (`appuser`, UID 1000) on port 8002. For custom setups, extend it via `docker-compose.override.yml`.
 
 ## Configuration
 
@@ -168,8 +166,10 @@ Configuration is split between `settings.yaml` (structure) and `.env` (secrets).
 | `BROKER_ADMIN_KEY` | Bootstrap secret for admin API (`X-Admin-Key` header) |
 | `BROKER_ENCRYPTION_KEY` | MultiFernet key for encrypting tokens at rest |
 | `BROKER_STATE_SECRET` | HMAC secret for signing OAuth state parameters |
-| `{CONNECTOR}_CLIENT_ID` | OAuth client ID (static connectors only) |
-| `{CONNECTOR}_CLIENT_SECRET` | OAuth client secret (static connectors only) |
+| `{CONNECTOR}_CLIENT_ID` | OAuth client ID (static connectors only, e.g. `HUBSPOT_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_ID`, `LINKEDIN_CLIENT_ID`, `REDDIT_CLIENT_ID`, `TWITTER_CLIENT_ID`) |
+| `{CONNECTOR}_CLIENT_SECRET` | OAuth client secret (matching pairs for each static connector above) |
+
+See `.env.example` for the full list of supported connector env vars.
 
 Per-app broker keys are managed via the admin API (`./start create-key`), not stored in YAML or `.env`.
 
@@ -353,7 +353,7 @@ The `/connect` endpoint supports two auth modes:
 Or directly:
 
 ```bash
-PYTHONPATH=src pytest tests/ -v
+uv run pytest tests/ -v
 ```
 
 ## Security
@@ -376,11 +376,11 @@ The broker implements defense-in-depth for OAuth credential management:
 ### Known Limitations
 
 - **No rate limiting** — Consider [slowapi](https://github.com/laurents/slowapi) or an upstream reverse proxy for production.
-- **Single-instance state** — OAuth nonces, PKCE verifiers, and connect tokens are in-memory. Multi-instance deployments require shared storage (see [Scaling Roadmap](#scaling-roadmap)).
+- **Single-instance state** — OAuth nonces, PKCE verifiers, and connect tokens are in-memory. Multi-instance deployments require shared storage (see [Scaling & Multi-Instance](#scaling--multi-instance)).
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
-## Scaling Roadmap
+## Scaling & Multi-Instance
 
 Current architecture is single-instance with SQLite. The `TokenStore` and `BrokerKeyStore` ABCs are designed for backend swapping.
 
@@ -405,7 +405,7 @@ Current architecture is single-instance with SQLite. The `TokenStore` and `Broke
 
 ## Contributing
 
-Contributions are welcome. Please open an issue to discuss proposed changes before submitting a pull request.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, PR process, and code style. This project adopts the [Contributor Covenant v2.1](CODE_OF_CONDUCT.md). Security issues follow the private-reporting flow in [SECURITY.md](SECURITY.md).
 
 ## License
 
