@@ -36,7 +36,7 @@ cp .env.example .env
    uv run pyright
    uv run pytest tests/ -v
    ```
-5. Commit with a clear message. One logical change per commit. Do not reference AI assistants or Claude in commit messages.
+5. Commit in [Conventional Commits](https://www.conventionalcommits.org/) format — `<type>(<scope>): <description>`. One logical change per commit. See [AGENTS.md](AGENTS.md#commit-messages-must) for the allowed types, scopes, and the `!` marker for breaking changes. Do not reference AI assistants or Claude in commit messages.
 6. Open a PR using the pull-request template. Fill every section — "not applicable" is a valid answer, empty is not.
 
 CI runs linting and the full test suite on every PR. PRs must be green before review.

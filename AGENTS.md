@@ -64,9 +64,21 @@ Flag only things outside these gates: project-specific invariants, logic bugs, c
 - YAML references to env vars use `${VAR_NAME}` syntax. No inline defaults in YAML — defaults live on the Pydantic model. **Rationale:** two sources of truth for defaults (YAML and Python) drift. The Pydantic model is authoritative.
 - Per-app broker keys are NEVER stored in `settings.yaml` or `.env`. They live in SQLite (`broker_keys.db`) as SHA-256 hashes, managed via the admin API. **Rationale:** YAML and .env are operator-visible; key rotation would require file edits. The admin API keeps the raw-key surface to a single one-shot response.
 
+## Testing Rules (MUST)
+
+- Tests MUST exercise real crypto (`MultiFernet`, HMAC signing, PKCE), real SQLite stores (`TokenStore`, `BrokerKeyStore`, `ConnectTokenStore`), and real middleware. Mock only outbound HTTP to upstream MCP servers and OAuth providers. **Rationale:** the broker's security properties live in these components. A test that mocks `TokenStore.get` cannot catch the encryption bug it was written to prevent, and a test that mocks the auth middleware cannot catch the key-to-identity cross-check failing.
+- Tests MUST assert on observable behaviour — HTTP responses, persisted state, log records via `caplog` — not on internal method calls via `mock.assert_called_with`. **Rationale:** interaction-based assertions break on every refactor without catching real bugs. Behavioural assertions survive refactoring and verify the contract the caller actually depends on.
+- Every new Security Invariant MUST land with a regression test that fails without the fix. **Rationale:** invariants decay when the only thing enforcing them is reviewer memory. A failing test promotes the rule from "please remember" to a machine-checkable gate.
+
+## Commit Messages (MUST)
+
+- Commit subjects MUST follow [Conventional Commits](https://www.conventionalcommits.org/): `<type>(<scope>): <description>`. Types: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `ci`. Scope is a connector name (`notion`, `hubspot`), a subsystem (`proxy`, `oauth`, `auth`, `store`, `admin`), or `deps`. **Rationale:** scoped conventional commits make the hand-maintained CHANGELOG parseable, let reviewers filter PRs by area, and let tooling auto-draft release notes.
+- Breaking changes MUST mark the subject with `!` after the scope (e.g. `feat(proxy)!: reject app_key from query params`) AND include a `BREAKING CHANGE:` footer describing the migration. **Rationale:** the `!` marker is what tooling and reviewers grep for to spot breaking changes. Without it, a breaking change silently lands as a minor feature and ships to pinned users unannounced.
+- Commit messages MUST NOT reference AI assistants, Claude, or any code-generation tool. **Rationale:** the commit log is the project's history of human decisions. Authorship noise from tooling degrades `git blame` and `git log` without adding signal.
+
 ## Breaking Changes + CHANGELOG
 
-Any breaking change to the public surface MUST add an entry under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md). **Rationale:** the project is pre-1.0 and users pin to tags. The CHANGELOG is how they decide whether a minor bump is safe to apply.
+Any breaking change to the public surface MUST add an entry under `## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md) and use the `!` marker in its commit subject (see Commit Messages). **Rationale:** the project is pre-1.0 and users pin to tags. The CHANGELOG is how they decide whether a minor bump is safe to apply.
 
 The public surface:
 
