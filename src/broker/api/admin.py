@@ -192,9 +192,7 @@ class AdminEndpoints:
         if self._token_store is not None:
             tokens_deleted = await self._token_store.delete_all_for_app(app_key)
 
-        logger.info(
-            "[Admin] Deleted key for app: %s (cascade: %d tokens)", app_key, tokens_deleted
-        )
+        logger.info("[Admin] Deleted key for app: %s (cascade: %d tokens)", app_key, tokens_deleted)
         return _json_response(
             200, {"app_key": app_key, "deleted": True, "tokens_deleted": tokens_deleted}
         )
