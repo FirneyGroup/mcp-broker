@@ -100,5 +100,5 @@ Should show `"connector": "bigquery", "connected": true, "token_valid": true`.
 | OAuth redirect fails | Check redirect URI matches `http://localhost:8002/oauth/bigquery/callback` |
 | Sidecar won't start | Check `docker compose logs` — may need `platform: linux/amd64` on Apple Silicon |
 | 401 from proxy | No token stored — connect via `./start connect` |
-| Query timeout | Increase `timeout` in ADK's `McpServerConfig` (default 30s) |
+| Query timeout | Increase the request timeout in your MCP client config (default 30s) |
 | "Access Denied" from BigQuery | User's Google account needs BigQuery access in the GCP project |

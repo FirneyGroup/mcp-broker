@@ -81,7 +81,7 @@ class ConnectorMeta(BaseModel):
     )
 
     # JSON-RPC method allowlist — broker rejects any method not in this set.
-    # Default covers standard ADK→MCP tool usage. Connectors can override.
+    # Default covers standard MCP tool usage. Connectors can override.
     allowed_mcp_methods: frozenset[str] = Field(
         default=frozenset(
             {

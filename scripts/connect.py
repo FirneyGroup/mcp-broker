@@ -104,7 +104,7 @@ def _admin_request(  # noqa: PLR0913 — admin request needs all params
 def _find_broker_key_in_env() -> str | None:
     """Search environment for a br_* broker key.
 
-    Checks common env var names used in ADK and broker configs.
+    Checks a small list of common env var names.
     Returns the first valid-looking key found, or None.
     """
     candidate_vars = [
@@ -173,7 +173,7 @@ def _ensure_app_key(broker_url: str, admin_key: str, app_key: str) -> str:  # no
             if rotate_response.status_code == _HTTP_OK:
                 raw_key = rotate_response.json()["api_key"]
                 print(f"{logger_prefix}Key rotated: {raw_key}")
-                print(f"{logger_prefix}Update your ADK .env with this key.")
+                print(f"{logger_prefix}Update your MCP client config with this key.")
                 return raw_key
             print(f"{logger_prefix}Rotate failed: {rotate_response.text}")
             sys.exit(1)
@@ -417,22 +417,27 @@ def _show_mcp_config(  # noqa: PLR0913 — display function needs all params
     broker_key: str,
     transport: str,
 ) -> None:
-    """Print the McpServerConfig snippet for ADK client definitions."""
-    print(f"{logger_prefix}── {connector_name} ──\n")
-    print("        McpServerConfig(")
-    print(f'            transport="{transport}",')
-    print(f'            url="{broker_url}/proxy/{connector_name}/mcp",')
-    print("            headers={")
-    print(f'                "X-App-Id": "{app_key}",')
+    """Print MCP server config for the connector.
+
+    Output is JSON-like and directly usable by Claude Desktop, Claude Code,
+    Cursor, Cline, and any other MCP client that accepts streamable-http
+    servers. ADK users can translate to McpServerConfig(...) trivially.
+    """
     _MASK_VISIBLE_CHARS = 4
     masked_key = (
         f"***{broker_key[-_MASK_VISIBLE_CHARS:]}"
         if len(broker_key) > _MASK_VISIBLE_CHARS
         else "****"
     )
-    print(f'                "X-Broker-Key": "{masked_key}",')
-    print("            },")
-    print("        ),\n")
+    print(f"{logger_prefix}── {connector_name} ──")
+    print(f'  "{connector_name}": {{')
+    print(f'    "transport": "{transport}",')
+    print(f'    "url": "{broker_url}/proxy/{connector_name}/mcp",')
+    print('    "headers": {')
+    print(f'      "X-App-Id": "{app_key}",')
+    print(f'      "X-Broker-Key": "{masked_key}"')
+    print("    }")
+    print("  }\n")
 
 
 def _get_connector_transport(broker_url: str, connector_name: str) -> str:
@@ -494,7 +499,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--show-config",
         action="store_true",
-        help="Show McpServerConfig snippets for connected connectors (no OAuth flow)",
+        help="Show MCP server config for connected connectors (no OAuth flow)",
     )
     return parser
 
@@ -536,7 +541,7 @@ def _show_all_configs(
         print(f"{logger_prefix}No connected connectors for {app_key}")
         print(f"{logger_prefix}Run ./start connect first to set up OAuth")
         sys.exit(1)
-    print(f"\n{logger_prefix}McpServerConfig snippets for {app_key}:\n")
+    print(f"\n{logger_prefix}MCP server config for {app_key}:\n")
     for conn in connected:
         name = conn.get("connector", "unknown")
         transport = _get_connector_transport(broker_url, name)
