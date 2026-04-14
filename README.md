@@ -12,9 +12,11 @@ AI agents need to call tools on remote MCP servers (Notion, HubSpot, Reddit, Twi
 
 ```mermaid
 flowchart LR
-    Agent -->|X-Broker-Key + X-App-Id| Broker[mcp-broker]
+    Agent[MCP Client] -->|X-Broker-Key + X-App-Id| Broker[mcp-broker]
     Broker -->|Authorization: Bearer| Remote[Remote MCP Server]
 ```
+
+Works with any MCP-compatible client (Claude Desktop, Claude Code, Google ADK, custom agents).
 
 ## Table of Contents
 
@@ -35,21 +37,21 @@ flowchart LR
 
 ## How It Works
 
-```
-┌─────────┐         ┌──────────────────────────────┐         ┌──────────────┐
-│  Agent  │         │         mcp-broker            │         │  Remote MCP  │
-│  (ADK)  │         │                               │         │   Server     │
-│         │ ──────> │  1. Validate X-Broker-Key     │         │              │
-│         │         │  2. Check scope + connector   │         │              │
-│         │         │  3. Look up OAuth token       │ ──────> │              │
-│         │         │  4. Inject Authorization hdr  │         │              │
-│         │ <────── │  5. Stream response back      │ <────── │              │
-└─────────┘         └──────────────────────────────┘         └──────────────┘
+```mermaid
+sequenceDiagram
+    participant Agent as MCP Client
+    participant Broker as mcp-broker
+    participant Remote as Remote MCP Server
+    Agent->>Broker: Request + X-Broker-Key + X-App-Id
+    Note over Broker: 1. Validate X-Broker-Key<br/>2. Check scope + connector<br/>3. Look up OAuth token<br/>4. Inject Authorization header
+    Broker->>Remote: Request + Authorization: Bearer ...
+    Remote-->>Broker: Response (streamed)
+    Broker-->>Agent: Response (streamed)
 ```
 
-**Proxy flow**: Your agent sends MCP requests to the broker with an `X-Broker-Key` header. The broker validates the key, looks up the stored OAuth token for that connector, injects it as a `Bearer` token, and forwards the request. The response streams back unchanged.
+**Proxy flow**: Your MCP client sends MCP requests to the broker with an `X-Broker-Key` header. The broker validates the key, looks up the stored OAuth token for that connector, injects it as a `Bearer` token, and forwards the request. The response streams back unchanged.
 
-**OAuth flow**: An operator runs `./start connect` to initiate an OAuth consent flow in a browser. The broker handles PKCE, state signing, code exchange, and token storage. Once connected, the agent can proxy requests without knowing about OAuth.
+**OAuth flow**: An operator runs `./start connect` to initiate an OAuth consent flow in a browser. The broker handles PKCE, state signing, code exchange, and token storage. Once connected, the client can proxy requests without knowing about OAuth.
 
 **Token lifecycle**: Tokens are encrypted at rest (MultiFernet) and refreshed automatically when they expire. A background loop proactively refreshes tokens approaching expiry.
 

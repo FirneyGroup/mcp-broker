@@ -1,7 +1,7 @@
 """
 MCP Reverse Proxy
 
-Forwards MCP requests from ADK to remote MCP servers with OAuth token injection.
+Forwards MCP requests from clients to remote MCP servers with OAuth token injection.
 Handles authentication, token refresh, header stripping, and response streaming.
 
 Critical: MCP Streamable HTTP is stateful -- sessions use Mcp-Session-Id headers,
@@ -127,7 +127,7 @@ _STRIP_REQUEST_HEADERS = {
     "content-length",
     "transfer-encoding",
     "authorization",
-    "cookie",  # Prevent leaking ADK auth to remote MCP servers
+    "cookie",  # Prevent leaking client auth to remote MCP servers
     # Hop-by-hop + forwarding headers — prevent host header injection
     "x-forwarded-for",
     "x-forwarded-host",

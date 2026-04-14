@@ -123,7 +123,7 @@ if 'api_key' in r:
     print(f\"  {r['api_key']}\")
     print()
     print('Save this key — it cannot be retrieved later.')
-    print('Add to your ADK .env as the X-Broker-Key header value.')
+    print('Add this to your MCP client config as the X-Broker-Key header value.')
 else:
     print('Error:', json.dumps(r, indent=2))
 " 2>/dev/null
@@ -175,7 +175,7 @@ if 'api_key' in r:
     print('New key:')
     print(f\"  {r['api_key']}\")
     print()
-    print('Old key is now invalid. Update your ADK .env.')
+    print('Old key is now invalid. Update your MCP client config.')
 else:
     print('Error:', json.dumps(r, indent=2))
 " 2>/dev/null
@@ -263,7 +263,7 @@ else:
         echo ""
         echo "  ./start start               Start broker server (port 8002, live reload)"
         echo "  ./start connect [url]       Interactive OAuth connection manager"
-        echo "  ./start mcp-config [url]    Show McpServerConfig for connected services"
+        echo "  ./start mcp-config [url]    Show MCP server config for connected services"
         echo "  ./start test                Run tests (extra args passed to pytest)"
         echo "  ./start lint                Run ruff linter"
         echo "  ./start health [url]        Check broker health endpoint"
