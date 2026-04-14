@@ -134,7 +134,13 @@ docker compose up -d
 
 The broker runs on port 8002 with data persisted in `./data/`. Configuration is mounted read-only from `settings.yaml`, and secrets are loaded from `.env`.
 
-For sidecars (e.g. Google Workspace MCP), see `sidecars/*/docker-compose.yml` — these are deployed independently and communicate over Docker networks.
+If you plan to use **sidecar connectors** (e.g. Google Workspace MCP, BigQuery), create the shared Docker network once before starting any sidecar:
+
+```bash
+docker network create sidecar-internal
+```
+
+Each sidecar under `sidecars/*` has its own `docker-compose.yml` and is deployed independently (`cd sidecars/<name> && docker compose up -d`). Sidecars communicate with the broker over the `sidecar-internal` network, so the broker's own compose should join that network too — see `sidecars/_template/` for the pattern.
 
 ```yaml
 # docker-compose.yml
@@ -237,7 +243,15 @@ All admin endpoints require the `X-Admin-Key` header.
 
 ## Adding a Connector
 
-All connectors auto-register via `__init_subclass__` on import. Choose between static and discovery based on whether the provider supports MCP OAuth discovery.
+All connectors auto-register via `__init_subclass__` on import. Three flavours exist — pick one before writing code:
+
+| Flavour | When to use | Where the MCP server runs | Where credentials come from |
+|---------|-------------|---------------------------|------------------------------|
+| **Static** | Upstream is a remote OAuth 2.1 MCP server, no RFC 8414 discovery | Remote (e.g. `https://mcp.example.com/mcp`) | `settings.yaml` `apps` section (client_id + client_secret) |
+| **Discovery** | Upstream supports RFC 8414 discovery + RFC 7591 dynamic client registration | Remote | Auto-registered on first `/connect`; no `settings.yaml` entry |
+| **Sidecar** | MCP server runs as a local Docker container next to the broker | Local (`http://<container>:8000/mcp`) | Either broker-managed OAuth (`auth_mode="broker"`) or sidecar-managed (`auth_mode="sidecar"`) — see `sidecars/_template/` |
+
+If you're adding a sidecar, also see `sidecars/_template/README.md` for the full step-by-step including the `docker-compose.yml` and adapter skeletons.
 
 ### Static Connector (e.g. HubSpot)
 

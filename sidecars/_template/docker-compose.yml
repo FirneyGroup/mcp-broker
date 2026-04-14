@@ -1,0 +1,37 @@
+# =============================================================================
+# Sidecar Template — stdio MCP server via supergateway
+#
+# Copy this directory for a new sidecar. Fill in .env with your MCP command.
+#
+# Setup:
+#   docker network create sidecar-internal  # once, if not exists
+#   docker compose up -d
+# =============================================================================
+
+services:
+  mcp-sidecar:
+    image: supercorp/supergateway
+    container_name: ${CONTAINER_NAME}
+    restart: unless-stopped
+    command: >
+      --stdio "${MCP_COMMAND}"
+      --port ${MCP_PORT:-8000}
+      --outputTransport streamableHttp
+    env_file: .env
+    ports:
+      - "${HOST_PORT:-}:${MCP_PORT:-8000}"    # Set HOST_PORT for local dev (broker on host)
+    volumes:
+      - ./config:/root/.config
+    networks:
+      - sidecar-internal
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:${MCP_PORT:-8000}/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+
+networks:
+  sidecar-internal:
+    external: true
