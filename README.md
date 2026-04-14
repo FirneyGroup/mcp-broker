@@ -18,8 +18,22 @@ flowchart LR
 
 Works with any MCP-compatible client (Claude Desktop, Claude Code, Google ADK, custom agents).
 
+## Is this for me?
+
+**Use mcp-broker if you:**
+- Operate multiple AI agents or apps that need OAuth access to the same set of third-party services (Notion, HubSpot, Google Workspace, etc.)
+- Want per-app credential isolation — compromising one app's broker key should not expose the others
+- Prefer agents that never touch raw OAuth tokens or client secrets
+- Need to drop in new OAuth providers without redeploying every agent that uses them
+
+**Skip mcp-broker if you:**
+- Have a single agent with a single hardcoded credential — a `.env` var is simpler
+- Need a full identity provider with user authentication — use Keycloak, Auth0, or similar
+- Want to serve MCP *tools* (write a sidecar or upstream MCP server instead)
+
 ## Table of Contents
 
+- [Quickstart](#quickstart)
 - [How It Works](#how-it-works)
 - [Features](#features)
 - [Prerequisites](#prerequisites)
@@ -33,7 +47,51 @@ Works with any MCP-compatible client (Claude Desktop, Claude Code, Google ADK, c
 - [Testing](#testing)
 - [Security](#security)
 - [Scaling & Multi-Instance](#scaling--multi-instance)
+- [API Stability](#api-stability)
 - [Contributing](#contributing)
+
+## Quickstart
+
+Stand up the broker, connect your first OAuth provider (Notion — no credentials needed thanks to RFC 7591 dynamic registration), and make your first proxied MCP request in about five minutes.
+
+```bash
+# 1. Clone and install
+git clone https://github.com/FirneyGroup/mcp-broker.git
+cd mcp-broker
+uv sync --extra dev
+
+# 2. Write a fresh .env with the three required secrets
+cat > .env <<EOF
+BROKER_ADMIN_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
+BROKER_ENCRYPTION_KEY=$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')
+BROKER_STATE_SECRET=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
+EOF
+
+# 3. Start from the example YAML (includes a demo app 'my_company:app1' and 'notion' connector)
+cp settings.example.yaml settings.yaml
+./start start &
+
+# 4. Create a broker key for the demo app
+./start create-key
+# Choose 'my_company:app1' — copy the br_* key that prints
+
+# 5. Connect Notion (opens browser for OAuth consent)
+./start connect
+# Choose 'notion'
+
+# 6. Make your first proxied MCP call (paste the key from step 4 below)
+export BROKER_KEY="<paste-broker-key-from-step-4>"
+curl -s -X POST \
+  -H "X-Broker-Key: $BROKER_KEY" \
+  -H "X-App-Id: my_company:app1" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}' \
+  http://localhost:8002/proxy/notion/mcp | python3 -m json.tool
+```
+
+You should see Notion's tool catalogue. Point any MCP client at `http://localhost:8002/proxy/notion/mcp` with the same headers and it can now call Notion without ever seeing an OAuth token.
+
+Next: [connect more services](#adding-a-connector), [wire the broker into an agent](#api-reference), or [harden the deployment](#security).
 
 ## How It Works
 
@@ -397,6 +455,21 @@ Current architecture is single-instance with SQLite. The `TokenStore` and `Broke
 2. **Distributed locks** — Replace `asyncio.Lock` with database transactions or distributed locks
 3. **Shared nonce storage** — Move `_consumed_nonces` and `_pkce_verifiers` to shared store
 4. **Shared connect tokens** — Move `ConnectTokenStore` to shared store with TTL
+
+## API Stability
+
+**This project is pre-1.0.** Minor version bumps (`0.x` → `0.y`) may contain breaking changes to:
+
+- The HTTP API surface (`/proxy`, `/oauth`, `/admin`, `/status`)
+- The `BaseConnector` extension contract and `ConnectorMeta` fields
+- `settings.yaml` schema and environment variable names
+- The `./start` CLI subcommands and output formats
+
+Patch bumps (`0.x.y` → `0.x.z`) are bug fixes and documentation only — safe to upgrade.
+
+In production, **pin to a specific tag** (e.g. `git clone --branch v0.1.0` or `pip install mcp-broker==0.1.0` once published) rather than tracking `main`. The [CHANGELOG](CHANGELOG.md) documents every breaking change.
+
+The 1.0 release will signal stable HTTP and connector APIs with semver-honest compatibility guarantees going forward.
 
 ## Contributing
 
