@@ -1,0 +1,11 @@
+services:
+  broker:
+    build: .
+    container_name: mcp-broker
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./data:/app/data
+      - ./settings.yaml:/app/settings.yaml:ro
