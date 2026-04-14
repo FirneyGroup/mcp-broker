@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security issue
+    url: https://github.com/FirneyGroup/mcp-broker/security/advisories/new
+    about: Report a security vulnerability privately. See SECURITY.md for details.
+  - name: Commercial support
+    url: https://firney.com
+    about: For commercial support enquiries, contact Firney.
