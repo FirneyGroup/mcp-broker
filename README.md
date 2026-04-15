@@ -25,11 +25,11 @@ Works with any MCP-compatible client (Claude Desktop, Claude Code, Google ADK, c
 - Want per-app credential isolation — compromising one app's broker key should not expose the others
 - Prefer agents that never touch raw OAuth tokens or client secrets
 - Need to drop in new OAuth providers without redeploying every agent that uses them
+- Want to author custom MCP tools — wrap a Python SDK or expose internal APIs via a native connector, without standing up a separate MCP server
 
 **Skip mcp-broker if you:**
 - Have a single agent with a single hardcoded credential — a `.env` var is simpler
 - Need a full identity provider with user authentication — use Keycloak, Auth0, or similar
-- Want to serve MCP *tools* (write a sidecar or upstream MCP server instead)
 
 ## Table of Contents
 
@@ -113,6 +113,8 @@ sequenceDiagram
 
 **Token lifecycle**: Tokens are encrypted at rest (MultiFernet) and refreshed automatically when they expire. A background loop proactively refreshes tokens approaching expiry.
 
+**Native flow**: Some connectors (e.g. Twitter/X) implement MCP tools directly inside the broker — no upstream server. The broker validates, looks up the access token, and dispatches to a tool handler in-process. From the client's perspective the protocol is identical to the proxy flow.
+
 ## Features
 
 - **OAuth 2.1 + PKCE** — Full authorization code flow with S256 code challenge for all connectors
@@ -123,7 +125,7 @@ sequenceDiagram
 - **Encrypted token storage** — Tokens and dynamic registration credentials encrypted at rest with MultiFernet (supports key rotation)
 - **Signed OAuth state** — HMAC-signed state parameter with single-use nonces and 10-minute expiry
 - **Streaming proxy** — Passes through SSE and Streamable HTTP responses without buffering
-- **Pluggable connectors** — Add new OAuth providers by subclassing `BaseConnector` with auto-registration
+- **Pluggable connectors** — Add new OAuth providers by subclassing `BaseConnector` (remote upstreams) or `NativeConnector` (tools implemented in-process); both auto-register on import
 - **Hashed API keys** — Per-app broker keys stored as SHA-256 hashes, managed via admin API
 - **Scope enforcement** — Per-app scopes (`proxy`, `status`) and connector access control
 - **Connect tokens** — Single-use, time-limited tokens for browser OAuth (avoids key exposure in URLs)
@@ -296,79 +298,32 @@ All admin endpoints require the `X-Admin-Key` header.
 
 ## Adding a Connector
 
-All connectors auto-register via `__init_subclass__` on import. Three flavours exist — pick one before writing code:
+All connectors auto-register via `__init_subclass__` on import. Four flavours exist — pick one before writing code:
 
 | Flavour | When to use | Where the MCP server runs | Where credentials come from |
 |---------|-------------|---------------------------|------------------------------|
-| **Static** | Upstream is a remote OAuth 2.1 MCP server, no RFC 8414 discovery | Remote (e.g. `https://mcp.example.com/mcp`) | `settings.yaml` `apps` section (client_id + client_secret) |
-| **Discovery** | Upstream supports RFC 8414 discovery + RFC 7591 dynamic client registration | Remote | Auto-registered on first `/connect`; no `settings.yaml` entry |
-| **Sidecar** | MCP server runs as a local Docker container next to the broker | Local (`http://<container>:8000/mcp`) | Either broker-managed OAuth (`auth_mode="broker"`) or sidecar-managed (`auth_mode="sidecar"`) — see `sidecars/_template/` |
+| **Static** | Remote OAuth 2.1 MCP server with fixed endpoints | Remote (e.g. `https://mcp.example.com/mcp`) | `settings.yaml` `apps` section (client_id + client_secret) |
+| **Discovery** | Remote MCP server supporting RFC 8414 + RFC 7591 | Remote | Auto-registered on first `/connect`; no `settings.yaml` entry |
+| **Sidecar** | MCP server runs as a local Docker container next to the broker | Local (`http://<container>:8000/mcp`) | Either broker-managed OAuth (`auth_mode="broker"`) or sidecar-managed (`auth_mode="sidecar"`) |
+| **Native** | No MCP server exists — wrap a provider's SDK / REST API in-process | In-process (broker serves MCP directly) | `settings.yaml` `apps` section; broker passes access tokens to each tool handler |
 
-If you're adding a sidecar, also see `sidecars/_template/README.md` for the full step-by-step including the `docker-compose.yml` and adapter skeletons.
+**Quick start:**
 
-### Static Connector (e.g. HubSpot)
+1. Read [AGENTS.md § Provider Onboarding](AGENTS.md#provider-onboarding) and pick a flavour by running the probes.
+2. Copy the matching template from `src/connectors/_template/{flavour}/` to `src/connectors/{your_name}/`.
+3. Rename the class, replace every `FILL_ME_IN`, and follow `SETUP.md` in the copied directory.
+4. Add `{your_name}` to `broker.connectors` in `settings.example.yaml` (and `apps` entries for Static / Sidecar-broker / Native).
+5. Add a test at `tests/test_{your_name}_connector.py`.
+6. Run `pytest tests/ -v` — all green before opening a PR.
 
-Credentials configured manually in `settings.yaml`:
+**Reference examples:**
 
-```python
-from broker.connectors.base import BaseConnector
-from broker.models.connector_config import ConnectorMeta
+- Static → `src/connectors/hubspot/adapter.py`
+- Discovery → `src/connectors/notion/adapter.py` (HTTP Basic Auth + Notion-Version header)
+- Sidecar → `src/connectors/workspace_mcp/adapter.py` + `sidecars/workspace-mcp/`
+- Native → `src/connectors/twitter/adapter.py` (xdk SDK wrapped with `run_in_executor`)
 
-class MyConnector(BaseConnector):
-    meta = ConnectorMeta(
-        name="my_service",
-        display_name="My Service",
-        mcp_url="https://mcp.example.com/mcp",
-        oauth_authorize_url="https://example.com/oauth/authorize",
-        oauth_token_url="https://example.com/oauth/token",
-        scopes=["read", "write"],
-    )
-```
-
-1. Create `src/connectors/{name}/adapter.py` with the above
-2. Override hooks only if the provider deviates from standard OAuth2
-3. Add connector name to `connectors` list in `settings.yaml`
-4. Add OAuth credentials to the `apps` section of `settings.yaml`
-
-### Discovery Connector (e.g. Notion)
-
-Endpoints discovered automatically, credentials obtained via dynamic registration:
-
-```python
-class MyMCPConnector(BaseConnector):
-    meta = ConnectorMeta(
-        name="my_mcp_service",
-        display_name="My MCP Service",
-        mcp_url="https://mcp.example.com/mcp",
-        mcp_oauth_url="https://mcp.example.com",  # Triggers discovery path
-    )
-```
-
-1. Create `src/connectors/{name}/adapter.py` — set `mcp_oauth_url` to trigger discovery
-2. Override hooks if needed (e.g. `build_token_request_auth` for Basic Auth)
-3. Add connector name to `connectors` list in `settings.yaml`
-4. No credentials in `settings.yaml` — dynamic registration handles it
-
-### Sidecar Connector (e.g. Google Workspace)
-
-The broker manages OAuth, but the MCP server runs as a local Docker container:
-
-```python
-class WorkspaceMcpConnector(BaseConnector):
-    meta = ConnectorMeta(
-        name="workspace_mcp",
-        display_name="Google Workspace",
-        mcp_url="http://workspace-mcp:8000/mcp",
-        auth_mode="broker",
-        oauth_authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
-        oauth_token_url="https://oauth2.googleapis.com/token",
-        scopes=["openid", "email", "..."],
-    )
-```
-
-1. Create `src/connectors/{name}/adapter.py` with `auth_mode="broker"`
-2. Create `sidecars/{name}/docker-compose.yml` with `EXTERNAL_OAUTH21_PROVIDER=true`
-3. Add OAuth credentials to `.env` and `settings.yaml`
+**Reviewers check against** [AGENTS.md § Connector Rules](AGENTS.md#connector-rules-must) — every `MUST` in that section is enforced on PR review.
 
 ## API Reference
 

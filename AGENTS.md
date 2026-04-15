@@ -19,7 +19,6 @@ Flag only things outside these gates: project-specific invariants, logic bugs, c
 ## Architecture Rules (MUST / MUST NOT)
 
 - The broker MUST NOT import from any agent-framework SDK. **Rationale:** it speaks MCP over HTTP; which framework calls it is not its concern. Coupling to a specific SDK breaks the neutrality that lets any MCP client use the broker.
-- Connectors MUST subclass `BaseConnector`. They auto-register via `__init_subclass__` — do NOT call `register()` manually. **Rationale:** the registry lookup assumes every connector arrived via the subclass hook. Manual registration creates two registration paths and the health check / listing endpoints become inconsistent.
 - Runtime configuration MUST live in `settings.yaml`. `.env` holds secrets only, referenced via `${VAR}` interpolation in YAML. **Rationale:** separating structure from secrets lets operators commit settings.yaml while keeping .env local. Inline secrets in YAML leak into logs and version control.
 - Config Pydantic models MUST use `ConfigDict(extra="forbid")`. **Rationale:** unknown keys are almost always typos. Silently ignoring them means a misspelled field silently reverts to the default.
 - Use Pydantic, never dataclasses. **Rationale:** the codebase depends on `ConfigDict(frozen=True)`, `extra="forbid"`, field validators, and `model_dump_json` throughout — dataclasses don't provide any of these.
@@ -48,14 +47,113 @@ Flag only things outside these gates: project-specific invariants, logic bugs, c
 5. **Streaming proxy** — The proxy forwards SSE and Streamable HTTP responses unbuffered. New code on the proxy path MUST use `httpx` streaming consistently. **Rationale:** buffering a response before forwarding breaks MCP sessions — clients time out waiting for the first chunk.
 6. **Identity binding** — `app_key` is sourced exclusively from `request.state.identity` (set by middleware). Routes MUST NOT accept `app_key` from query params, bodies, or client-supplied headers. **Rationale:** any path that lets a client supply `app_key` bypasses the middleware's key-to-identity cross-check and enables impersonation.
 
+## Connector Architecture
+
+The broker has four connector flavours, all subclassing `BaseConnector`. Flavour is derived from `ConnectorMeta` field values — not declared. The `meta.is_native`, `meta.uses_discovery`, and `meta.is_sidecar_managed` properties compute flavour from fields.
+
+| Flavour | Trigger | Dispatch |
+|---------|---------|----------|
+| **Static** | `mcp_url` set, `mcp_oauth_url` unset | Proxy forwards to `mcp_url` with `Authorization: Bearer {token}` injected |
+| **Discovery** | `mcp_oauth_url` set | Same as Static, but authorize/token URLs discovered at first connect via RFC 8414; client credentials minted via RFC 7591 |
+| **Sidecar** | `mcp_url` points at Docker-internal hostname (e.g. `http://workspace-mcp:8000/mcp`) | Static path if `auth_mode="broker"`; if `auth_mode="sidecar"` the broker proxies without token injection |
+| **Native** | `mcp_url` is `None` (→ `meta.is_native == True`) | Broker serves MCP in-process via `NativeConnector.handle_mcp_request`; tool handlers receive `access_token` as a keyword argument |
+
+**Registration.** `BaseConnector.__init_subclass__` validates URL fields, then calls `ConnectorRegistry.auto_register(cls)` which instantiates the class (one instance per connector name) and stores it. Activation is gated by `settings.yaml`'s `broker.connectors` list — a class whose name isn't listed is registered but inert.
+
+**Dispatch.** `/proxy/{name}/mcp` looks up the connector via `ConnectorRegistry.get(name)`, then branches: `isinstance(NativeConnector)` → `handle_mcp_request()`; otherwise → httpx streaming forward with `build_auth_header(access_token)` applied.
+
+**Extension points on `BaseConnector`** — override only to handle provider deviations from standard OAuth 2.1:
+
+- `customize_authorize_params(params)` — add provider-specific authorize-URL params (e.g. Google's `access_type=offline`, `prompt=consent`).
+- `build_auth_header(access_token)` — default `Authorization: Bearer {token}`. Override to add sibling headers (e.g. Notion's `Notion-Version`).
+- `build_token_request_auth(credentials)` — default puts `client_id`/`client_secret` in the POST body (`client_secret_post`). Override to use HTTP Basic Auth (`client_secret_basic`, e.g. Notion).
+- `parse_token_response(raw)` — default pass-through. Override when the provider returns extra fields outside the OAuth 2 standard (e.g. Notion's `workspace_id`).
+
+**Data contracts** (see `src/broker/models/connector_config.py`):
+
+- `ConnectorMeta` — frozen class variable. One per connector class.
+- `AppConnectorCredentials` — per-app `client_id`/`client_secret` loaded from `settings.yaml`'s `apps` section at request time.
+- `DynamicRegistration` — persisted RFC 7591 registration result (Discovery flavour only). Stored encrypted alongside tokens.
+- `NativeToolMeta` — JSON Schema wrapper for each `@native_tool`-decorated method. Becomes the `tools/list` response.
+
 ## Connector Rules (MUST)
 
-- New connectors MUST subclass `BaseConnector` and set a `meta = ConnectorMeta(...)` class attribute. **Rationale:** the registry discovers connectors by reading `meta` on each subclass.
-- The connector name MUST appear in `settings.example.yaml` under `broker.connectors`. **Rationale:** auto-registration happens on import, but the connectors list controls which are actually loaded. A missing entry means the class exists but is inactive.
-- Static connectors MUST have `{CONNECTOR}_CLIENT_ID` and `{CONNECTOR}_CLIENT_SECRET` entries in `.env.example` with the canonical env var names. **Rationale:** operators copy `.env.example` to `.env`. Missing entries mean silent failure at OAuth time with no hint about what's missing.
-- Every new connector MUST ship `src/connectors/{name}/SETUP.md` covering OAuth registration, redirect URI, and required scopes. **Rationale:** OAuth provider setup is always connector-specific. Without SETUP.md, operators have to read your adapter code to guess the scopes.
+### All flavours
+
+- New connectors MUST subclass `BaseConnector` (directly, or via `NativeConnector`) and set `meta = ConnectorMeta(...)` as a class attribute. Do NOT call `ConnectorRegistry.auto_register` manually. **Rationale:** the registry lookup assumes every connector arrived via `__init_subclass__`. Manual registration creates two paths and health-check output diverges.
+- The connector name MUST appear in `settings.example.yaml` under `broker.connectors`. **Rationale:** auto-registration happens on import, but the connectors list controls which are actually loaded. A missing entry means the class exists but is inert.
+- Every new connector MUST ship `src/connectors/{name}/SETUP.md` covering OAuth registration, redirect URI, and minimum required scopes. **Rationale:** OAuth provider setup is always provider-specific. Without SETUP.md, operators have to read adapter code to guess the scopes.
+- Every new connector MUST ship at least one test in `tests/test_{name}_connector.py` asserting: (a) it auto-registers, (b) `meta` validates, (c) any overridden hook returns the expected structure. **Rationale:** without a test, nothing catches a silent meta-validation change or a forgotten override.
+
+### Static
+
+- Static connectors MUST have `{CONNECTOR}_CLIENT_ID` and `{CONNECTOR}_CLIENT_SECRET` entries in `.env.example`, referenced from `settings.example.yaml`'s `apps` section via `${VAR}` interpolation. **Rationale:** operators copy `.env.example` to `.env`. Missing entries mean silent failure at OAuth time with no hint about what's missing.
+- Static connectors MUST leave `mcp_oauth_url` unset. **Rationale:** setting both static URLs and a discovery URL triggers the discovery path and ignores the static config — reviewers expect unused fields to be absent, not misleading placeholders.
+
+### Discovery
+
 - Discovery connectors MUST set `mcp_oauth_url` in `ConnectorMeta` and MUST NOT have YAML app credentials. **Rationale:** discovery connectors use RFC 7591 dynamic registration — credentials are minted per app, not shared. YAML credentials would be unused and misleading.
-- Sidecar connectors MUST declare `auth_mode` explicitly (`"broker"` or `"sidecar"`). **Rationale:** the two modes behave oppositely — `broker` injects Bearer tokens, `sidecar` doesn't. A missing `auth_mode` means a silent default that likely isn't what the operator wants. See `sidecars/_template/` for the worked pattern.
+- Discovery connectors SHOULD still set `oauth_authorize_url` and `oauth_token_url` for documentation, with a comment noting they are ignored when `mcp_oauth_url` is present. **Rationale:** reviewers reading the adapter need to see the static fallback URLs even though the discovery path takes precedence.
+
+### Sidecar
+
+- Sidecar connectors MUST declare `auth_mode` explicitly (`"broker"` or `"sidecar"`). **Rationale:** the two modes behave oppositely — `broker` injects Bearer tokens, `sidecar` doesn't. A missing `auth_mode` defaults to `"broker"`, which is likely wrong for a sidecar running its own OAuth.
+- Sidecar connectors with `auth_mode="broker"` MUST point `mcp_url` at a Docker service name (e.g. `http://workspace-mcp:8000/mcp`) and the sidecar container MUST run with `EXTERNAL_OAUTH21_PROVIDER=true` (or equivalent). **Rationale:** the sidecar must trust the injected `Authorization` header instead of performing its own OAuth — otherwise you have two OAuth flows competing for the same request.
+- Every sidecar MUST ship `sidecars/{name}/docker-compose.yml` joining the `firney-net` network. **Rationale:** the broker reaches sidecars via Docker DNS; a sidecar on a different network is unreachable. See `sidecars/_template/` for the worked pattern.
+
+### Native
+
+- Native connectors MUST subclass `NativeConnector` (not `BaseConnector` directly) and MUST leave `mcp_url` unset. **Rationale:** `NativeConnector` wires up the `@native_tool` decorator collection and JSON-RPC dispatch. Subclassing `BaseConnector` directly skips both and the connector has no tools. `mcp_url is None` is what makes the proxy route dispatch in-process.
+- Every tool method MUST be decorated with `@native_tool(NativeToolMeta(...))` and MUST be `async def name(self, *, access_token: str, ...) -> list[dict[str, Any]]`. **Rationale:** `_dispatch_tool` invokes handlers with `access_token` as a keyword argument and expects MCP content blocks back. A positional `access_token`, a missing decorator, or a sync function all silently de-register the tool.
+- Synchronous SDK calls inside tool methods MUST be wrapped in `asyncio.get_running_loop().run_in_executor(...)`. **Rationale:** the proxy path is async; a blocking SDK call stalls the entire event loop, freezing every concurrent proxy request across every connector. See `src/connectors/twitter/adapter.py` for the pattern.
+- Tool input schemas (`NativeToolMeta.input_schema`) MUST have `"type": "object"` at the top level and a `"required"` list for mandatory parameters. **Rationale:** MCP `tools/list` delivers this schema to LLMs verbatim; a malformed schema degrades tool-selection accuracy upstream.
+- Tool handlers MUST NOT log, persist, or include `access_token` in their return value. **Rationale:** tokens belong to the broker's in-memory flow only. A handler leaking the token into logs or MCP responses breaks the security model.
+
+## Provider Onboarding
+
+Use this algorithm when adding a connector for a new OAuth provider. Each step has a mechanical probe — don't skip to a flavour by guessing.
+
+1. **Does the upstream expose an MCP server you can proxy?**
+   - Check PyPI, Docker Hub, and the provider's docs for an existing MCP server implementation.
+   - **Yes, hosted remotely** → go to step 2 (Static or Discovery).
+   - **Yes, but only as a package you run yourself** → **Sidecar**. Package it under `sidecars/{name}/docker-compose.yml`.
+   - **No MCP server exists** → **Native**. Wrap the provider's REST API or SDK in-process. Skip to step 4.
+
+2. **Does the remote MCP server support OAuth 2.1 discovery (RFC 8414 + RFC 7591)?** Probe in order:
+
+   ```bash
+   curl -fsSL {base}/.well-known/oauth-authorization-server
+   # 200 with a JSON body containing registration_endpoint → discovery works
+   curl -fsSL {base}/.well-known/oauth-protected-resource
+   # 200 → MCP server declares itself OAuth-protected
+   curl -fsS -X POST {registration_endpoint} \
+     -H 'Content-Type: application/json' \
+     -d '{"redirect_uris":["http://localhost"],"client_name":"probe"}'
+   # 201 or well-formed error → RFC 7591 dynamic registration works
+   ```
+
+   - **All three pass** → **Discovery**. No client credentials needed in `settings.yaml`.
+   - **Otherwise** → **Static**. Go to step 3.
+
+3. **For Static, determine the OAuth contract from provider docs:**
+   - `oauth_authorize_url` and `oauth_token_url`.
+   - PKCE support — broker requires S256. If the provider doesn't support PKCE, the connector is not usable; stop and flag this.
+   - Token-exchange auth method — body (`client_secret_post`, default) or HTTP Basic Auth (`client_secret_basic`, requires `build_token_request_auth` override).
+   - Scopes — minimum necessary for the tools you expose. Document any privileged scope in `SETUP.md` with justification.
+   - Refresh-token support — if the provider doesn't issue refresh tokens, OAuth sessions are short-lived. Document in `SETUP.md`.
+
+4. **For Native, determine the tool surface and SDK contract from provider docs:**
+   - Which operations map to tools (one tool per operation; keep handlers small).
+   - SDK is sync or async — sync requires `run_in_executor` wrapping.
+   - Does the SDK accept `access_token` per-call or per-client? Per-call is simpler — reconstruct the client inside each handler.
+   - JSON Schema for each tool's input. Keep it minimal; every property should map to a provider API parameter.
+
+5. **Judgment calls the probes cannot answer** — document in `SETUP.md`, not in code:
+   - Whether the provider's ToS permits your use case.
+   - Scope minimization when a single broad scope exists — justify adopting it over multiple narrow ones.
+   - Whether to expose write tools or restrict to read-only.
+
+Scaffolding for each flavour lives in `src/connectors/_template/{static,discovery,sidecar,native}/`. Copy the directory, fill in the `TODO` markers, run the test.
 
 ## Config Contract
 
