@@ -20,7 +20,6 @@ from typing import Any
 from broker.connectors.native import NativeConnector, NativeToolMeta, native_tool
 from broker.models.connector_config import ConnectorMeta
 
-
 # === TOOL METADATA ===
 #
 # Each tool needs a NativeToolMeta describing its JSON Schema. The schema is
@@ -89,7 +88,5 @@ class TemplateNativeConnector(NativeConnector):
         - Do NOT log, persist, or return `access_token`.
         """
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            None, _call_example_api_sync, access_token, example_arg
-        )
+        result = await loop.run_in_executor(None, _call_example_api_sync, access_token, example_arg)
         return [{"type": "text", "text": str(result)}]
