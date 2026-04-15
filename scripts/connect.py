@@ -48,7 +48,6 @@ _HTTP_UNAUTHORIZED = 401
 _HTTP_NOT_FOUND = 404
 _HTTP_REDIRECT_CODES = (302, 307)
 _BROKER_ROOT = Path(__file__).parent.parent
-_MASK_VISIBLE_CHARS = 4
 
 
 # =============================================================================
@@ -411,13 +410,6 @@ def _select_app_key(clients: dict[str, dict], cli_app: str | None) -> str:
     sys.exit(0)
 
 
-def _mask_secret(value: str) -> str:
-    """Mask a secret for display: ***last4 (or **** if too short to mask safely)."""
-    if len(value) > _MASK_VISIBLE_CHARS:
-        return f"***{value[-_MASK_VISIBLE_CHARS:]}"
-    return "****"
-
-
 def _get_cf_access_headers() -> dict[str, str]:
     """Return Cloudflare Access service-token headers if both env vars are set.
 
@@ -432,7 +424,7 @@ def _get_cf_access_headers() -> dict[str, str]:
         return {}
     return {
         "CF-Access-Client-Id": cf_id,
-        "CF-Access-Client-Secret": _mask_secret(cf_secret),
+        "CF-Access-Client-Secret": cf_secret,
     }
 
 
@@ -449,6 +441,10 @@ def _show_mcp_config(  # noqa: PLR0913 — display function needs all params
     Cursor, Cline, and any other MCP client that accepts streamable-http
     servers. ADK users can translate to McpServerConfig(...) trivially.
 
+    The output contains the real broker key (and any CF Access service
+    secret) verbatim so it can be pasted directly into a client config.
+    Don't share or paste the output anywhere public.
+
     If CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET are set in the
     environment, CF-Access-* headers are appended automatically — for
     brokers fronted by a Cloudflare tunnel with a service-token Access
@@ -456,7 +452,7 @@ def _show_mcp_config(  # noqa: PLR0913 — display function needs all params
     """
     headers = [
         ("X-App-Id", app_key),
-        ("X-Broker-Key", _mask_secret(broker_key)),
+        ("X-Broker-Key", broker_key),
         *_get_cf_access_headers().items(),
     ]
     print(f"{logger_prefix}── {connector_name} ──")
