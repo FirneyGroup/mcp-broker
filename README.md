@@ -192,6 +192,8 @@ Show configuration snippets for your MCP client:
 ./start mcp-config
 ```
 
+If `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` are set in your `.env` (e.g. when the broker is fronted by a Cloudflare tunnel with a service-token Access policy), the output automatically includes the `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers alongside `X-App-Id` and `X-Broker-Key`.
+
 ## Docker
 
 Build and run with Docker Compose:

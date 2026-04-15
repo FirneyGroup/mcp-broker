@@ -48,6 +48,7 @@ _HTTP_UNAUTHORIZED = 401
 _HTTP_NOT_FOUND = 404
 _HTTP_REDIRECT_CODES = (302, 307)
 _BROKER_ROOT = Path(__file__).parent.parent
+_MASK_VISIBLE_CHARS = 4
 
 
 # =============================================================================
@@ -410,6 +411,31 @@ def _select_app_key(clients: dict[str, dict], cli_app: str | None) -> str:
     sys.exit(0)
 
 
+def _mask_secret(value: str) -> str:
+    """Mask a secret for display: ***last4 (or **** if too short to mask safely)."""
+    if len(value) > _MASK_VISIBLE_CHARS:
+        return f"***{value[-_MASK_VISIBLE_CHARS:]}"
+    return "****"
+
+
+def _get_cf_access_headers() -> dict[str, str]:
+    """Return Cloudflare Access service-token headers if both env vars are set.
+
+    Returns an empty dict when CF_ACCESS_CLIENT_ID or CF_ACCESS_CLIENT_SECRET
+    is missing — fail closed, so a partially-configured environment never
+    produces incomplete auth headers in the output. Symmetric with the
+    FG_CHAT_BROKER_KEY env-detection pattern in _find_broker_key_in_env().
+    """
+    cf_id = os.environ.get("CF_ACCESS_CLIENT_ID", "")
+    cf_secret = os.environ.get("CF_ACCESS_CLIENT_SECRET", "")
+    if not cf_id or not cf_secret:
+        return {}
+    return {
+        "CF-Access-Client-Id": cf_id,
+        "CF-Access-Client-Secret": _mask_secret(cf_secret),
+    }
+
+
 def _show_mcp_config(  # noqa: PLR0913 — display function needs all params
     broker_url: str,
     connector_name: str,
@@ -422,20 +448,25 @@ def _show_mcp_config(  # noqa: PLR0913 — display function needs all params
     Output is JSON-like and directly usable by Claude Desktop, Claude Code,
     Cursor, Cline, and any other MCP client that accepts streamable-http
     servers. ADK users can translate to McpServerConfig(...) trivially.
+
+    If CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET are set in the
+    environment, CF-Access-* headers are appended automatically — for
+    brokers fronted by a Cloudflare tunnel with a service-token Access
+    policy.
     """
-    _MASK_VISIBLE_CHARS = 4
-    masked_key = (
-        f"***{broker_key[-_MASK_VISIBLE_CHARS:]}"
-        if len(broker_key) > _MASK_VISIBLE_CHARS
-        else "****"
-    )
+    headers = [
+        ("X-App-Id", app_key),
+        ("X-Broker-Key", _mask_secret(broker_key)),
+        *_get_cf_access_headers().items(),
+    ]
     print(f"{logger_prefix}── {connector_name} ──")
     print(f'  "{connector_name}": {{')
     print(f'    "transport": "{transport}",')
     print(f'    "url": "{broker_url}/proxy/{connector_name}/mcp",')
     print('    "headers": {')
-    print(f'      "X-App-Id": "{app_key}",')
-    print(f'      "X-Broker-Key": "{masked_key}"')
+    for i, (header_name, header_value) in enumerate(headers):
+        suffix = "," if i < len(headers) - 1 else ""
+        print(f'      "{header_name}": "{header_value}"{suffix}')
     print("    }")
     print("  }\n")
 
