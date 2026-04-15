@@ -8,8 +8,8 @@ on import so it cannot be activated unedited.
 Flavour: Discovery — remote MCP server supporting RFC 8414 + RFC 7591.
 When to use: a `curl {base}/.well-known/oauth-authorization-server` returns
     200 with a `registration_endpoint` and dynamic registration works.
-    Operators run `./start connect {name} --app-key {key}` and the broker
-    mints per-app credentials automatically — no client_id/secret in settings.
+    Operators run `./start connect` (interactive) and the broker mints per-app
+    credentials automatically — no client_id/secret in settings.
 Reference example: src/connectors/notion/adapter.py
 """
 

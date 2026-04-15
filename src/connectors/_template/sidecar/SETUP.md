@@ -31,7 +31,7 @@ Pick once and stick with it. Changing later requires re-consenting every app.
            client_id: ${FILL_ME_IN_CLIENT_ID}
            client_secret: ${FILL_ME_IN_CLIENT_SECRET}
    ```
-5. Run `./start connect FILL_ME_IN --app-key {key}` to complete OAuth.
+5. Run `./start connect` to complete OAuth (interactive — select FILL_ME_IN from the menu). For a non-default app, add `--app {client_id:app_id}`.
 
 ## Sidecar-Managed Auth (auth_mode="sidecar")
 

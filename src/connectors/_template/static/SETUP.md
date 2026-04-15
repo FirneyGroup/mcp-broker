@@ -36,7 +36,7 @@ Replace this entire file when you copy the template. Operators read this to regi
            client_secret: ${FILL_ME_IN_CLIENT_SECRET}
    ```
 
-3. Connect: `./start connect FILL_ME_IN --app-key {key}`
+3. Connect: `./start connect` (interactive — picks up your default app, shows a connector menu, opens the browser for OAuth). For a non-default app, add `--app {client_id:app_id}`.
 
 ## Provider Quirks
 

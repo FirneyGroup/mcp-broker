@@ -55,12 +55,12 @@ The broker has four connector flavours, all subclassing `BaseConnector`. Flavour
 |---------|---------|----------|
 | **Static** | `mcp_url` set, `mcp_oauth_url` unset | Proxy forwards to `mcp_url` with `Authorization: Bearer {token}` injected |
 | **Discovery** | `mcp_oauth_url` set | Same as Static, but authorize/token URLs discovered at first connect via RFC 8414; client credentials minted via RFC 7591 |
-| **Sidecar** | `mcp_url` points at Docker-internal hostname (e.g. `http://workspace-mcp:8000/mcp`) | Static path if `auth_mode="broker"`; if `auth_mode="sidecar"` the broker proxies without token injection |
+| **Sidecar** | Deployment convention: `mcp_url` resolves to a Docker service on `firney-net`. Not a distinct dispatch path — the code picks based on `auth_mode`, not on the hostname | `auth_mode="broker"` → Static dispatch (broker injects tokens). `auth_mode="sidecar"` (→ `meta.is_sidecar_managed`) → upstream forward with no `Authorization` header |
 | **Native** | `mcp_url` is `None` (→ `meta.is_native == True`) | Broker serves MCP in-process via `NativeConnector.handle_mcp_request`; tool handlers receive `access_token` as a keyword argument |
 
-**Registration.** `BaseConnector.__init_subclass__` validates URL fields, then calls `ConnectorRegistry.auto_register(cls)` which instantiates the class (one instance per connector name) and stores it. Activation is gated by `settings.yaml`'s `broker.connectors` list — a class whose name isn't listed is registered but inert.
+**Registration.** Connectors are loaded at startup by `_load_connectors` in `src/broker/main.py`, which iterates `settings.broker.connectors` and calls `importlib.import_module("connectors.{name}.adapter")` for each entry. The import triggers `BaseConnector.__init_subclass__`, which validates URL fields and calls `ConnectorRegistry.auto_register(cls)` to instantiate and store the class (one instance per connector name). A class whose name isn't in the `connectors` list is never imported — templates and half-written connectors stay dormant.
 
-**Dispatch.** `/proxy/{name}/mcp` looks up the connector via `ConnectorRegistry.get(name)`, then branches: `isinstance(NativeConnector)` → `handle_mcp_request()`; otherwise → httpx streaming forward with `build_auth_header(access_token)` applied.
+**Dispatch.** The route `/proxy/{connector_name}/{path:path}` (in `src/broker/main.py`) looks up the connector via `ConnectorRegistry.get(name)`, then branches in `src/broker/services/proxy.py`: `isinstance(connector, NativeConnector)` → `handle_mcp_request()`; otherwise → httpx streaming forward to `meta.mcp_url` with `build_auth_header(access_token)` applied. Typical MCP clients POST to `/proxy/{name}/mcp`, but the `{path:path}` catch-all lets the proxy forward any subpath the upstream exposes.
 
 **Extension points on `BaseConnector`** — override only to handle provider deviations from standard OAuth 2.1:
 
@@ -71,12 +71,14 @@ The broker has four connector flavours, all subclassing `BaseConnector`. Flavour
 
 **Data contracts** (see `src/broker/models/connector_config.py`):
 
-- `ConnectorMeta` — frozen class variable. One per connector class.
+- `ConnectorMeta` — frozen class variable. One per connector class. Fields beyond the flavour-determining ones worth knowing: `mcp_transport` (`"streamable_http"` default; set to `"sse"` for SSE-only upstreams like HubSpot), `supports_pkce` (default True; if the upstream does not support PKCE S256, the broker cannot connect to it), `allowed_mcp_methods` (JSON-RPC allowlist — override if an upstream exposes methods beyond the standard MCP set).
 - `AppConnectorCredentials` — per-app `client_id`/`client_secret` loaded from `settings.yaml`'s `apps` section at request time.
 - `DynamicRegistration` — persisted RFC 7591 registration result (Discovery flavour only). Stored encrypted alongside tokens.
 - `NativeToolMeta` — JSON Schema wrapper for each `@native_tool`-decorated method. Becomes the `tools/list` response.
 
 ## Connector Rules (MUST)
+
+Flavour is determined by `ConnectorMeta` field values per the Architecture table above — not by directory structure. A connector with `mcp_oauth_url` set is Discovery regardless of which other fields it populates; evaluate Discovery rules against it, not Static rules. Same logic for Native (`mcp_url is None`) and Sidecar (`auth_mode="sidecar"` disables token injection).
 
 ### All flavours
 
@@ -106,7 +108,7 @@ The broker has four connector flavours, all subclassing `BaseConnector`. Flavour
 - Native connectors MUST subclass `NativeConnector` (not `BaseConnector` directly) and MUST leave `mcp_url` unset. **Rationale:** `NativeConnector` wires up the `@native_tool` decorator collection and JSON-RPC dispatch. Subclassing `BaseConnector` directly skips both and the connector has no tools. `mcp_url is None` is what makes the proxy route dispatch in-process.
 - Every tool method MUST be decorated with `@native_tool(NativeToolMeta(...))` and MUST be `async def name(self, *, access_token: str, ...) -> list[dict[str, Any]]`. **Rationale:** `_dispatch_tool` invokes handlers with `access_token` as a keyword argument and expects MCP content blocks back. A positional `access_token`, a missing decorator, or a sync function all silently de-register the tool.
 - Synchronous SDK calls inside tool methods MUST be wrapped in `asyncio.get_running_loop().run_in_executor(...)`. **Rationale:** the proxy path is async; a blocking SDK call stalls the entire event loop, freezing every concurrent proxy request across every connector. See `src/connectors/twitter/adapter.py` for the pattern.
-- Tool input schemas (`NativeToolMeta.input_schema`) MUST have `"type": "object"` at the top level and a `"required"` list for mandatory parameters. **Rationale:** MCP `tools/list` delivers this schema to LLMs verbatim; a malformed schema degrades tool-selection accuracy upstream.
+- Tool input schemas (`NativeToolMeta.input_schema`) MUST have `"type": "object"` at the top level. Include a `"required"` list when the tool has mandatory parameters; omit it for tools with only optional or no parameters. **Rationale:** MCP `tools/list` delivers this schema to LLMs verbatim; a malformed top-level shape degrades tool-selection accuracy. `required` is only meaningful when something is actually required (see `src/connectors/twitter/adapter.py:56` — `get_me` has no required fields and correctly omits the list).
 - Tool handlers MUST NOT log, persist, or include `access_token` in their return value. **Rationale:** tokens belong to the broker's in-memory flow only. A handler leaking the token into logs or MCP responses breaks the security model.
 
 ## Provider Onboarding
@@ -141,6 +143,8 @@ Use this algorithm when adding a connector for a new OAuth provider. Each step h
    - Token-exchange auth method — body (`client_secret_post`, default) or HTTP Basic Auth (`client_secret_basic`, requires `build_token_request_auth` override).
    - Scopes — minimum necessary for the tools you expose. Document any privileged scope in `SETUP.md` with justification.
    - Refresh-token support — if the provider doesn't issue refresh tokens, OAuth sessions are short-lived. Document in `SETUP.md`.
+   - MCP transport — default `mcp_transport="streamable_http"`. Set to `"sse"` if the provider serves only Server-Sent Events (HubSpot does; check provider docs).
+   - Non-standard JSON-RPC methods — default `allowed_mcp_methods` covers the MCP standard. If the upstream exposes provider-specific methods you need to call, override `allowed_mcp_methods` in `ConnectorMeta` to extend the allowlist.
 
 4. **For Native, determine the tool surface and SDK contract from provider docs:**
    - Which operations map to tools (one tool per operation; keep handlers small).

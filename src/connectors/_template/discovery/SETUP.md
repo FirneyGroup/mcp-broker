@@ -31,7 +31,7 @@ If any fail, use the Static template instead.
 
    No `apps` entry needed — credentials are minted dynamically.
 
-2. Connect: `./start connect FILL_ME_IN --app-key {key}`
+2. Connect: `./start connect` (interactive — select FILL_ME_IN from the connector menu). For a non-default app, add `--app {client_id:app_id}`.
 
 ## Required Scopes
 
