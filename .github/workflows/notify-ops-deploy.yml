@@ -1,0 +1,68 @@
+name: Notify ops repo to redeploy
+
+# Fires a repository_dispatch event at FirneyGroup/firney-mcp-broker-ops
+# whenever changes land on this repo's main branch that affect the runtime
+# image. The ops repo's deploy.yml has a matching `repository_dispatch:
+# types: [broker-updated]` trigger that picks this up and redeploys.
+#
+# This workflow is a no-op for forks: it requires the BROKER_OPS_DISPATCH_TOKEN
+# secret, which only exists in Firney's deployment of this repo. If the secret
+# isn't set the dispatch step is skipped with a warning in the run log.
+#
+# To activate (one-time setup in this repo):
+#   1. Create a fine-grained PAT with `Actions: read and write` on
+#      FirneyGroup/firney-mcp-broker-ops.
+#   2. Add it as a repository secret named BROKER_OPS_DISPATCH_TOKEN here.
+#   3. Push any change matching the path filters below to verify the
+#      dispatch fires and the ops repo's Deploy MCP Broker workflow runs.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/notify-ops-deploy.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: notify-ops-deploy
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check dispatch secret is configured
+        id: check
+        env:
+          HAS_TOKEN: ${{ secrets.BROKER_OPS_DISPATCH_TOKEN != '' }}
+        run: |
+          if [ "${HAS_TOKEN}" != "true" ]; then
+            echo "::warning::BROKER_OPS_DISPATCH_TOKEN secret is not set; skipping dispatch."
+            echo "::warning::Forks of this repo can ignore this. To enable in the canonical repo, follow the setup notes at the top of this file."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Dispatch broker-updated event
+        if: steps.check.outputs.skip != 'true'
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.BROKER_OPS_DISPATCH_TOKEN }}
+          repository: FirneyGroup/firney-mcp-broker-ops
+          event-type: broker-updated
+          client-payload: |
+            {
+              "broker_ref": "${{ github.sha }}",
+              "broker_short_sha": "${{ github.sha }}",
+              "triggered_by": "${{ github.actor }}",
+              "commit_message": ${{ toJSON(github.event.head_commit.message) }}
+            }
