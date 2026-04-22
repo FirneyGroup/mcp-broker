@@ -136,28 +136,99 @@ class BrokerSettings(BaseModel):
 # =============================================================================
 
 
+class SettingsError(Exception):
+    """Settings cannot be loaded — missing env vars or malformed settings.yaml.
+
+    Startup catches this and emits a clean banner instead of a Python traceback.
+    """
+
+
 def _resolve_env_var_references(config_value: Any) -> Any:
-    """Recursively resolve ${VAR_NAME} references from environment."""
+    """Resolve ${VAR_NAME} references. Collects ALL misses and reports them together."""
+    missing: list[tuple[str, tuple[str, ...]]] = []
+    resolved = _resolve_recursive(config_value, path=(), missing=missing)
+    if missing:
+        raise SettingsError(_format_missing_vars(missing))
+    return resolved
+
+
+def _resolve_recursive(
+    config_value: Any,
+    *,
+    path: tuple[str, ...],
+    missing: list[tuple[str, tuple[str, ...]]],
+) -> Any:
+    """Walk the settings tree, substitute ${VAR} values, append misses to `missing`."""
     if isinstance(config_value, dict):
-        return {k: _resolve_env_var_references(v) for k, v in config_value.items()}
+        return {
+            key: _resolve_recursive(value, path=(*path, key), missing=missing)
+            for key, value in config_value.items()
+        }
     if isinstance(config_value, list):
-        return [_resolve_env_var_references(entry) for entry in config_value]
+        return [
+            _resolve_recursive(entry, path=(*path, f"[{i}]"), missing=missing)
+            for i, entry in enumerate(config_value)
+        ]
     if isinstance(config_value, str):
-        match = _ENV_VAR_PATTERN.match(config_value)
-        if match:
-            var_name = match.group(1)
-            value = os.environ.get(var_name)
-            if value is None:
-                raise KeyError(
-                    f"Environment variable '{var_name}' not set (required by settings.yaml)"
-                )
-            return value
-        if _PARTIAL_ENV_VAR_PATTERN.search(config_value):
-            raise ValueError(
-                f"Embedded ${{VAR}} references are not supported: '{config_value}'. "
-                f"Use a standalone ${{VAR}} or set the full value directly."
-            )
+        return _resolve_string_value(config_value, path=path, missing=missing)
     return config_value
+
+
+def _resolve_string_value(
+    config_value: str,
+    *,
+    path: tuple[str, ...],
+    missing: list[tuple[str, tuple[str, ...]]],
+) -> str:
+    """Substitute a single ${VAR} string, or raise on embedded references."""
+    match = _ENV_VAR_PATTERN.match(config_value)
+    if match:
+        var_name = match.group(1)
+        value = os.environ.get(var_name)
+        if value is None:
+            missing.append((var_name, path))
+            return ""  # placeholder; caller raises SettingsError before this is used
+        return value
+    if _PARTIAL_ENV_VAR_PATTERN.search(config_value):
+        raise SettingsError(
+            f"Embedded ${{VAR}} references are not supported: '{config_value}'. "
+            f"Use a standalone ${{VAR}} or set the full value directly."
+        )
+    return config_value
+
+
+def _format_missing_vars(missing: list[tuple[str, tuple[str, ...]]]) -> str:
+    """Human-readable error listing every missing env var + its settings.yaml path."""
+    # Group by env var name — one var may be referenced in multiple places.
+    by_var: dict[str, list[tuple[str, ...]]] = {}
+    for var_name, path in missing:
+        by_var.setdefault(var_name, []).append(path)
+    body = [
+        line
+        for var_name in sorted(by_var)
+        for line in _format_var_block(var_name, by_var[var_name])
+    ]
+    return "\n".join(
+        [
+            "",
+            "Broker cannot start — required environment variables not set:",
+            "",
+            *body,
+            "",
+            "Fix: add the variable(s) to .env, or remove the referencing block",
+            "     from settings.yaml if the integration isn't needed.",
+            "",
+        ]
+    )
+
+
+def _format_var_block(var_name: str, paths: list[tuple[str, ...]]) -> list[str]:
+    """Render one missing-var entry: the var name followed by each yaml path it occurs at."""
+    lines = [f"  {var_name}"]
+    for path in paths:
+        yaml_path = ".".join(path) if path else "(root)"
+        lines.append(f"      settings.yaml: {yaml_path}")
+    return lines
 
 
 # =============================================================================

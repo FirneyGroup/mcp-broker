@@ -153,10 +153,14 @@ async def lifespan(app: FastAPI):  # noqa: PLR0915 — startup sequence, all ste
         _client_registry, \
         _connect_token_store
 
-    # 1. Load settings
+    # 1. Load settings. Validation already ran synchronously in broker/__main__.py
+    #    before uvicorn started, so a failure here means either (a) settings.yaml
+    #    was edited during --reload into a broken state, or (b) someone imported
+    #    this app directly bypassing the entrypoint. Either way, let the error
+    #    propagate — uvicorn will log it and restart the worker.
     _settings = load_settings()
 
-    # 2. Configure logging
+    # 2. Configure logging from settings
     logging.basicConfig(
         level=getattr(logging, _settings.broker.log_level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
