@@ -44,8 +44,9 @@ admin_api() {
 case "${1:-help}" in
     start)
         ensure_venv
-        exec uvicorn broker.main:app --reload --reload-dir "$DIR/src" \
-            --host "${BROKER_HOST:-0.0.0.0}" --port "${BROKER_PORT:-8002}"
+        # Delegate to broker/__main__.py — validates settings sync before
+        # handing off to uvicorn, so config errors never reach async code.
+        exec python -m broker
         ;;
     test)
         ensure_venv

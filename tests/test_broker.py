@@ -595,6 +595,64 @@ class TestConfig:
 
 
 # =============================================================================
+# SETTINGS — env var resolution
+# =============================================================================
+
+
+class TestSettingsEnvResolution:
+    """_resolve_env_var_references collects all misses and raises SettingsError."""
+
+    def test_resolves_set_vars(self, monkeypatch) -> None:
+        from broker.config import _resolve_env_var_references
+
+        monkeypatch.setenv("TEST_FOO", "resolved")
+        resolved = _resolve_env_var_references({"a": "${TEST_FOO}"})
+        assert resolved == {"a": "resolved"}
+
+    def test_collects_all_missing_vars(self, monkeypatch) -> None:
+        """Missing vars are reported together, not one-at-a-time."""
+        from broker.config import SettingsError, _resolve_env_var_references
+
+        monkeypatch.delenv("NOPE_ONE", raising=False)
+        monkeypatch.delenv("NOPE_TWO", raising=False)
+        with pytest.raises(SettingsError) as exc_info:
+            _resolve_env_var_references(
+                {"apps": {"app1": {"slack": {"client_id": "${NOPE_ONE}"}}}, "top": "${NOPE_TWO}"}
+            )
+        message = str(exc_info.value)
+        assert "NOPE_ONE" in message
+        assert "NOPE_TWO" in message
+
+    def test_error_includes_yaml_path(self, monkeypatch) -> None:
+        from broker.config import SettingsError, _resolve_env_var_references
+
+        monkeypatch.delenv("NOPE_SLACK", raising=False)
+        with pytest.raises(SettingsError) as exc_info:
+            _resolve_env_var_references(
+                {"apps": {"acme": {"chat": {"slack": {"client_id": "${NOPE_SLACK}"}}}}}
+            )
+        message = str(exc_info.value)
+        assert "apps.acme.chat.slack.client_id" in message
+
+    def test_groups_multiple_references_to_same_var(self, monkeypatch) -> None:
+        """One var referenced in two places should show both paths under the var."""
+        from broker.config import SettingsError, _resolve_env_var_references
+
+        monkeypatch.delenv("SHARED_KEY", raising=False)
+        with pytest.raises(SettingsError) as exc_info:
+            _resolve_env_var_references({"a": "${SHARED_KEY}", "b": "${SHARED_KEY}"})
+        message = str(exc_info.value)
+        assert message.count("SHARED_KEY") == 1  # header only — paths don't repeat the name
+        assert "a" in message and "b" in message
+
+    def test_partial_embed_still_errors(self) -> None:
+        from broker.config import SettingsError, _resolve_env_var_references
+
+        with pytest.raises(SettingsError, match="Embedded"):
+            _resolve_env_var_references({"a": "prefix-${VAR}-suffix"})
+
+
+# =============================================================================
 # CONNECTOR META — DISCOVERY PROPERTY
 # =============================================================================
 

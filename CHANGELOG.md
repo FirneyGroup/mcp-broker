@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **Slack connector** (Native) — bot-identity messaging via Slack OAuth v2.
+- **Broker module entrypoint** (`python -m broker`) — validates settings before uvicorn boots, so config errors exit cleanly instead of propagating from the async lifespan.
+
+### Changed
+
+- **Grouped config errors** — missing environment variables are reported together with their `settings.yaml` path, instead of failing on the first miss.
+
 ## [0.1.0] — 2026-04-14
 
 Initial public release.

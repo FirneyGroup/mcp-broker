@@ -37,7 +37,8 @@ cp .env.example .env
    uv run pytest tests/ -v
    ```
 5. Commit in [Conventional Commits](https://www.conventionalcommits.org/) format — `<type>(<scope>): <description>`. One logical change per commit. See [AGENTS.md](AGENTS.md#commit-messages-must) for the allowed types, scopes, and the `!` marker for breaking changes. Do not reference AI assistants or Claude in commit messages.
-6. Open a PR using the pull-request template. Fill every section — "not applicable" is a valid answer, empty is not.
+6. Update `CHANGELOG.md` under `[Unreleased]` with a one-line bullet per user-visible change. Describe the impact, not the implementation — scope lists, cache internals, and refactor rationale belong in code docstrings or [AGENTS.md](AGENTS.md), not the changelog.
+7. Open a PR using the pull-request template. Fill every section — "not applicable" is a valid answer, empty is not.
 
 CI runs linting and the full test suite on every PR. PRs must be green before review.
 
