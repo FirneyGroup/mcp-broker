@@ -223,7 +223,7 @@ Configuration is split between `settings.yaml` (structure) and `.env` (secrets).
 | `BROKER_ADMIN_KEY` | Bootstrap secret for admin API (`X-Admin-Key` header) |
 | `BROKER_ENCRYPTION_KEY` | MultiFernet key for encrypting tokens at rest |
 | `BROKER_STATE_SECRET` | HMAC secret for signing OAuth state parameters |
-| `{CONNECTOR}_CLIENT_ID` | OAuth client ID (static connectors only, e.g. `HUBSPOT_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_ID`, `LINKEDIN_CLIENT_ID`, `REDDIT_CLIENT_ID`, `TWITTER_CLIENT_ID`) |
+| `{CONNECTOR}_CLIENT_ID` | OAuth client ID (static connectors only, e.g. `HUBSPOT_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_ID`, `LINKEDIN_CLIENT_ID`, `REDDIT_CLIENT_ID`, `SLACK_CLIENT_ID`, `TWITTER_CLIENT_ID`) |
 | `{CONNECTOR}_CLIENT_SECRET` | OAuth client secret (matching pairs for each static connector above) |
 
 See `.env.example` for the full list of supported connector env vars.
