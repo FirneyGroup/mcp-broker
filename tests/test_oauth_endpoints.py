@@ -1,0 +1,865 @@
+"""Tests for the OAuth 2.1 AS endpoints (DCR, authorize, token, revoke).
+
+Tests drive ``OAuthServerEndpoints`` directly via ``MagicMock``-shaped requests
+to keep the test surface independent of the bearer-middleware wiring (that
+lives in T03 / ``test_middleware_bearer.py``). Real ``SQLiteInboundAuthStore``
+backs every test so the audit + atomic-rotation semantics are exercised end to
+end on the actual schema.
+
+Generic identifiers throughout — `acme:claude_ai`, `broker.example.com`,
+`alice@example.com` — per the framework's anti-PII fixture rule.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import json
+import sqlite3
+from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from broker.api.oauth_server import (
+    OAuthServerEndpoints,
+    _DCRRateLimiter,
+    _kinds_from_hint,
+    _scope_is_subset,
+)
+from broker.config import OAuthInboundConfig
+from broker.services.inbound_auth_store import SQLiteInboundAuthStore
+
+# === CONSTANTS / FIXTURES ===
+
+GENERIC_APP_KEY = "acme:claude_ai"
+GENERIC_REDIRECT_URI = "https://claude.ai/api/mcp/auth_callback"
+GENERIC_PUBLIC_URL = "https://broker.example.com/"
+GENERIC_RESOURCE = "https://broker.example.com/proxy/notion"
+GENERIC_SCOPE = "mcp:proxy:notion mcp:status"
+GENERIC_CLIENT_IP = "203.0.113.10"
+
+# 64-char base64url string — PKCE S256 challenge for `_VALID_VERIFIER`.
+_VALID_VERIFIER = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ012345"
+
+
+def _challenge_for(verifier: str) -> str:
+    """RFC 7636 §4.2 — base64url(sha256(verifier)) with padding stripped."""
+    return (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    )
+
+
+def _make_config(**overrides: Any) -> OAuthInboundConfig:
+    """Construct an enabled `OAuthInboundConfig` with permissive defaults."""
+    defaults: dict[str, Any] = {
+        "enabled": True,
+        "app_key": GENERIC_APP_KEY,
+        "db_path": "unused-overwritten-per-test.db",
+        "access_token_ttl_seconds": 3600,
+        "refresh_token_ttl_seconds": 2592000,
+        "code_ttl_seconds": 60,
+        "dcr_rate_limit_per_ip": 10,
+        "dcr_rate_limit_window_seconds": 900,
+    }
+    defaults.update(overrides)
+    return OAuthInboundConfig(**defaults)
+
+
+@pytest.fixture
+async def store(tmp_path: Path) -> SQLiteInboundAuthStore:
+    """Fresh SQLite-backed store per test."""
+    initialized = SQLiteInboundAuthStore(str(tmp_path / "inbound_oauth.db"))
+    await initialized.setup()
+    return initialized
+
+
+@pytest.fixture
+def connector_names() -> list[str]:
+    return ["notion", "hubspot"]
+
+
+@pytest.fixture
+def endpoints(store: SQLiteInboundAuthStore, connector_names: list[str]) -> OAuthServerEndpoints:
+    return OAuthServerEndpoints(
+        inbound_auth_store=store,
+        config=_make_config(),
+        connector_names_provider=lambda: connector_names,
+        public_url=GENERIC_PUBLIC_URL,
+    )
+
+
+# === REQUEST FAKES ===
+
+
+def _request_with_json(body: dict[str, Any], client_ip: str = GENERIC_CLIENT_IP):
+    """Build a ``Request``-like mock for JSON-body endpoints."""
+    request = MagicMock()
+    request.json = AsyncMock(return_value=body)
+    request.headers = {"x-forwarded-for": client_ip}
+    request.query_params = {}
+    request.client.host = client_ip
+    return request
+
+
+def _request_with_form(form: dict[str, str], headers: dict[str, str] | None = None):
+    """Build a ``Request``-like mock for form-body endpoints (`/token`, `/revoke`)."""
+    request = MagicMock()
+    request.form = AsyncMock(return_value=form)
+    request.headers = headers or {}
+    request.query_params = {}
+    request.client.host = GENERIC_CLIENT_IP
+    return request
+
+
+def _request_with_query(query: dict[str, str]):
+    """Build a ``Request``-like mock for GET /authorize."""
+    request = MagicMock()
+    request.query_params = query
+    request.headers = {}
+    request.client.host = GENERIC_CLIENT_IP
+    return request
+
+
+def _registration_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "client_name": "Acme Claude",
+        "redirect_uris": [GENERIC_REDIRECT_URI],
+        "token_endpoint_auth_method": "none",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _response_body(response: Any) -> dict[str, Any]:
+    """Decode ``JSONResponse.body`` (bytes) → dict for assertions."""
+    return json.loads(response.body)
+
+
+# =============================================================================
+# DCR (POST /oauth/register)
+# =============================================================================
+
+
+class TestDCR:
+    async def test_public_client_201(self, endpoints: OAuthServerEndpoints) -> None:
+        request = _request_with_json(_registration_payload())
+        response = await endpoints.register(request)
+        assert response.status_code == 201
+        body = _response_body(response)
+        assert body["client_id"].startswith("mcp_client_")
+        assert "client_secret" not in body
+
+    async def test_confidential_client_returns_secret_once(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        request = _request_with_json(
+            _registration_payload(token_endpoint_auth_method="client_secret_basic")
+        )
+        response = await endpoints.register(request)
+        body = _response_body(response)
+        assert response.status_code == 201
+        assert body["client_secret"]
+        assert body["token_endpoint_auth_method"] == "client_secret_basic"
+
+    async def test_rate_limit_returns_429_after_cap(
+        self, store: SQLiteInboundAuthStore, connector_names: list[str]
+    ) -> None:
+        tight = OAuthServerEndpoints(
+            inbound_auth_store=store,
+            config=_make_config(dcr_rate_limit_per_ip=2),
+            connector_names_provider=lambda: connector_names,
+            public_url=GENERIC_PUBLIC_URL,
+        )
+        first = await tight.register(_request_with_json(_registration_payload()))
+        second = await tight.register(_request_with_json(_registration_payload()))
+        third = await tight.register(_request_with_json(_registration_payload()))
+        assert first.status_code == 201
+        assert second.status_code == 201
+        assert third.status_code == 429
+        assert _response_body(third)["error"] == "invalid_request"
+
+    async def test_disabled_returns_404(
+        self, store: SQLiteInboundAuthStore, connector_names: list[str]
+    ) -> None:
+        disabled = OAuthServerEndpoints(
+            inbound_auth_store=store,
+            config=OAuthInboundConfig(enabled=False),
+            connector_names_provider=lambda: connector_names,
+            public_url=GENERIC_PUBLIC_URL,
+        )
+        response = await disabled.register(_request_with_json(_registration_payload()))
+        assert response.status_code == 404
+
+    async def test_non_allowlisted_redirect_400(self, endpoints: OAuthServerEndpoints) -> None:
+        request = _request_with_json(
+            _registration_payload(redirect_uris=["https://attacker.example/cb"])
+        )
+        response = await endpoints.register(request)
+        assert response.status_code == 400
+        assert _response_body(response)["error"] == "invalid_redirect_uri"
+
+    async def test_fragment_in_redirect_400(self, endpoints: OAuthServerEndpoints) -> None:
+        request = _request_with_json(
+            _registration_payload(redirect_uris=[f"{GENERIC_REDIRECT_URI}#fragment"])
+        )
+        response = await endpoints.register(request)
+        assert response.status_code == 400
+        assert _response_body(response)["error"] == "invalid_redirect_uri"
+
+    async def test_invalid_json_body_400(self, endpoints: OAuthServerEndpoints) -> None:
+        request = MagicMock()
+        request.json = AsyncMock(side_effect=ValueError("bad json"))
+        request.headers = {}
+        request.client.host = GENERIC_CLIENT_IP
+        response = await endpoints.register(request)
+        assert response.status_code == 400
+
+
+# =============================================================================
+# AUTHORIZE (GET /oauth/authorize)
+# =============================================================================
+
+
+async def _register_public_client(endpoints: OAuthServerEndpoints) -> str:
+    """Helper — register a public client and return the ``client_id``."""
+    response = await endpoints.register(_request_with_json(_registration_payload()))
+    return _response_body(response)["client_id"]
+
+
+def _authorize_params(client_id: str, **overrides: str) -> dict[str, str]:
+    base = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": GENERIC_REDIRECT_URI,
+        "code_challenge": _challenge_for(_VALID_VERIFIER),
+        "code_challenge_method": "S256",
+        "state": "client-state-abc",
+        "scope": "mcp:proxy:notion",
+        "resource": GENERIC_RESOURCE,
+    }
+    base.update(overrides)
+    return base
+
+
+class TestAuthorizeGet:
+    async def test_valid_renders_consent_with_security_headers(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        client_id = await _register_public_client(endpoints)
+        response = await endpoints.authorize_get(_request_with_query(_authorize_params(client_id)))
+        assert response.status_code == 200
+        assert response.headers["X-Frame-Options"] == "DENY"
+        assert "frame-ancestors 'none'" in response.headers["Content-Security-Policy"]
+        body = response.body.decode()
+        assert "Approve" in body and "Deny" in body
+        # html.escape applied to dynamic values
+        assert "Acme Claude" in body
+
+    async def test_unknown_client_id_400_html(self, endpoints: OAuthServerEndpoints) -> None:
+        response = await endpoints.authorize_get(
+            _request_with_query(_authorize_params("mcp_client_unknown"))
+        )
+        assert response.status_code == 400
+
+    async def test_wrong_redirect_400_html(self, endpoints: OAuthServerEndpoints) -> None:
+        client_id = await _register_public_client(endpoints)
+        response = await endpoints.authorize_get(
+            _request_with_query(
+                _authorize_params(
+                    client_id, redirect_uri="https://claude.com/api/mcp/auth_callback"
+                )
+            )
+        )
+        # claude.com is allowlisted but NOT registered for this DCR'd client
+        assert response.status_code == 400
+
+    async def test_missing_code_challenge_post_redirect(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        client_id = await _register_public_client(endpoints)
+        params = _authorize_params(client_id)
+        del params["code_challenge"]
+        response = await endpoints.authorize_get(_request_with_query(params))
+        assert response.status_code == 302
+        assert "error=invalid_request" in response.headers["location"]
+
+    async def test_plain_challenge_method_post_redirect(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        client_id = await _register_public_client(endpoints)
+        response = await endpoints.authorize_get(
+            _request_with_query(_authorize_params(client_id, code_challenge_method="plain"))
+        )
+        assert response.status_code == 302
+        assert "error=invalid_request" in response.headers["location"]
+
+    async def test_unknown_resource_post_redirect(self, endpoints: OAuthServerEndpoints) -> None:
+        client_id = await _register_public_client(endpoints)
+        response = await endpoints.authorize_get(
+            _request_with_query(
+                _authorize_params(
+                    client_id, resource="https://broker.example.com/proxy/unknown_connector"
+                )
+            )
+        )
+        assert response.status_code == 302
+        assert "error=invalid_target" in response.headers["location"]
+
+    async def test_fragment_in_resource_post_redirect(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        client_id = await _register_public_client(endpoints)
+        response = await endpoints.authorize_get(
+            _request_with_query(_authorize_params(client_id, resource=f"{GENERIC_RESOURCE}#frag"))
+        )
+        # Fragment → normalize_resource raises → invalid_request post-redirect (not 500).
+        assert response.status_code == 302
+        assert "error=invalid_request" in response.headers["location"]
+
+    async def test_scope_widening_outside_connector_rejected(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        client_id = await _register_public_client(endpoints)
+        response = await endpoints.authorize_get(
+            _request_with_query(_authorize_params(client_id, scope="mcp:proxy:hubspot"))
+        )
+        assert response.status_code == 302
+        assert "error=invalid_scope" in response.headers["location"]
+
+
+# =============================================================================
+# AUTHORIZE (POST /oauth/authorize)
+# =============================================================================
+
+
+class TestAuthorizePost:
+    async def test_approve_mints_code_and_redirects(
+        self, endpoints: OAuthServerEndpoints, store: SQLiteInboundAuthStore
+    ) -> None:
+        client_id = await _register_public_client(endpoints)
+        params = _authorize_params(client_id) | {"action": "approve"}
+        response = await endpoints.authorize_post(_request_with_form(params))
+        assert response.status_code == 302
+        assert response.headers["location"].startswith(GENERIC_REDIRECT_URI + "?code=")
+        assert "state=client-state-abc" in response.headers["location"]
+        # Code persisted in oauth_codes
+        conn = sqlite3.connect(store._db_path)
+        try:
+            row = conn.execute("SELECT client_id, app_key FROM oauth_codes").fetchone()
+        finally:
+            conn.close()
+        assert row[0] == client_id
+        assert row[1] == GENERIC_APP_KEY
+
+    async def test_deny_redirects_with_access_denied(self, endpoints: OAuthServerEndpoints) -> None:
+        client_id = await _register_public_client(endpoints)
+        params = _authorize_params(client_id) | {"action": "deny"}
+        response = await endpoints.authorize_post(_request_with_form(params))
+        assert response.status_code == 302
+        assert "error=access_denied" in response.headers["location"]
+
+
+# =============================================================================
+# TOKEN (authorization_code)
+# =============================================================================
+
+
+async def _approve_to_get_code(
+    endpoints: OAuthServerEndpoints,
+    *,
+    resource: str = GENERIC_RESOURCE,
+    scope: str = "mcp:proxy:notion",
+) -> tuple[str, str]:
+    """Helper — register, approve a code, and return (client_id, raw_code)."""
+    client_id = await _register_public_client(endpoints)
+    params = _authorize_params(client_id, resource=resource, scope=scope) | {"action": "approve"}
+    response = await endpoints.authorize_post(_request_with_form(params))
+    location = response.headers["location"]
+    code = location.split("code=", 1)[1].split("&", 1)[0]
+    return client_id, code
+
+
+class TestTokenAuthCode:
+    async def test_happy_path(self, endpoints: OAuthServerEndpoints) -> None:
+        client_id, code = await _approve_to_get_code(endpoints)
+        token_request = _request_with_form(
+            {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": GENERIC_REDIRECT_URI,
+                "code_verifier": _VALID_VERIFIER,
+                "client_id": client_id,
+                "resource": GENERIC_RESOURCE,
+            }
+        )
+        response = await endpoints.token(token_request)
+        assert response.status_code == 200
+        body = _response_body(response)
+        assert body["access_token"].startswith("mcp_at_")
+        assert body["refresh_token"].startswith("mcp_rt_")
+        assert body["token_type"] == "Bearer"
+        assert body["expires_in"] == 3600
+
+    async def test_used_code_invalid_grant(self, endpoints: OAuthServerEndpoints) -> None:
+        client_id, code = await _approve_to_get_code(endpoints)
+        form = {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": GENERIC_REDIRECT_URI,
+            "code_verifier": _VALID_VERIFIER,
+            "client_id": client_id,
+            "resource": GENERIC_RESOURCE,
+        }
+        first = await endpoints.token(_request_with_form(dict(form)))
+        assert first.status_code == 200
+        replay = await endpoints.token(_request_with_form(dict(form)))
+        assert replay.status_code == 400
+        assert _response_body(replay)["error"] == "invalid_grant"
+
+    async def test_pkce_verifier_mismatch_invalid_grant(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        client_id, code = await _approve_to_get_code(endpoints)
+        response = await endpoints.token(
+            _request_with_form(
+                {
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": GENERIC_REDIRECT_URI,
+                    "code_verifier": "wrong-verifier-of-sufficient-length-aaaaaaa",
+                    "client_id": client_id,
+                    "resource": GENERIC_RESOURCE,
+                }
+            )
+        )
+        assert response.status_code == 400
+        assert _response_body(response)["error"] == "invalid_grant"
+
+    async def test_redirect_uri_mismatch_invalid_grant(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        client_id, code = await _approve_to_get_code(endpoints)
+        response = await endpoints.token(
+            _request_with_form(
+                {
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": "https://claude.com/api/mcp/auth_callback",
+                    "code_verifier": _VALID_VERIFIER,
+                    "client_id": client_id,
+                    "resource": GENERIC_RESOURCE,
+                }
+            )
+        )
+        assert response.status_code == 400
+        assert _response_body(response)["error"] == "invalid_grant"
+
+    async def test_resource_trailing_slash_normalizes(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        client_id, code = await _approve_to_get_code(endpoints)
+        # Stored as `https://broker.example.com/proxy/notion`; client now sends
+        # the trailing-slash variant per WHATWG normalization (claude-code#52871).
+        response = await endpoints.token(
+            _request_with_form(
+                {
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": GENERIC_REDIRECT_URI,
+                    "code_verifier": _VALID_VERIFIER,
+                    "client_id": client_id,
+                    "resource": GENERIC_RESOURCE + "/",
+                }
+            )
+        )
+        assert response.status_code == 200
+
+    async def test_resource_for_wrong_connector_invalid_target(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        client_id, code = await _approve_to_get_code(endpoints)
+        response = await endpoints.token(
+            _request_with_form(
+                {
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": GENERIC_REDIRECT_URI,
+                    "code_verifier": _VALID_VERIFIER,
+                    "client_id": client_id,
+                    "resource": "https://broker.example.com/proxy/hubspot",
+                }
+            )
+        )
+        assert response.status_code == 400
+        assert _response_body(response)["error"] == "invalid_target"
+
+    async def test_unsupported_grant_type(self, endpoints: OAuthServerEndpoints) -> None:
+        client_id = await _register_public_client(endpoints)
+        response = await endpoints.token(
+            _request_with_form({"grant_type": "password", "client_id": client_id})
+        )
+        assert response.status_code == 400
+        assert _response_body(response)["error"] == "unsupported_grant_type"
+
+
+# =============================================================================
+# TOKEN (refresh_token)
+# =============================================================================
+
+
+async def _mint_initial_pair(
+    endpoints: OAuthServerEndpoints,
+) -> tuple[str, str, str]:
+    """Helper — auth_code flow → return (client_id, access_token, refresh_token)."""
+    client_id, code = await _approve_to_get_code(endpoints)
+    response = await endpoints.token(
+        _request_with_form(
+            {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": GENERIC_REDIRECT_URI,
+                "code_verifier": _VALID_VERIFIER,
+                "client_id": client_id,
+                "resource": GENERIC_RESOURCE,
+            }
+        )
+    )
+    body = _response_body(response)
+    return client_id, body["access_token"], body["refresh_token"]
+
+
+class TestTokenRefresh:
+    async def test_happy_path_rotates(self, endpoints: OAuthServerEndpoints) -> None:
+        client_id, _, refresh = await _mint_initial_pair(endpoints)
+        response = await endpoints.token(
+            _request_with_form(
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh,
+                    "client_id": client_id,
+                }
+            )
+        )
+        assert response.status_code == 200
+        body = _response_body(response)
+        assert body["access_token"].startswith("mcp_at_")
+        assert body["refresh_token"].startswith("mcp_rt_")
+        # New refresh differs from the old one.
+        assert body["refresh_token"] != refresh
+
+    async def test_replay_triggers_family_revoke(
+        self, endpoints: OAuthServerEndpoints, store: SQLiteInboundAuthStore
+    ) -> None:
+        client_id, _, refresh = await _mint_initial_pair(endpoints)
+        form = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": client_id,
+        }
+        first = await endpoints.token(_request_with_form(dict(form)))
+        assert first.status_code == 200
+        replay = await endpoints.token(_request_with_form(dict(form)))
+        assert replay.status_code == 400
+        assert _response_body(replay)["error"] == "invalid_grant"
+        # Family must be empty after replay-revoke.
+        conn = sqlite3.connect(store._db_path)
+        try:
+            family_count = conn.execute("SELECT COUNT(*) FROM inbound_tokens").fetchone()[0]
+        finally:
+            conn.close()
+        assert family_count == 0
+
+    async def test_scope_widening_rejected(self, endpoints: OAuthServerEndpoints) -> None:
+        client_id, _, refresh = await _mint_initial_pair(endpoints)
+        response = await endpoints.token(
+            _request_with_form(
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh,
+                    "client_id": client_id,
+                    "scope": "mcp:proxy:notion mcp:status mcp:proxy:hubspot",
+                }
+            )
+        )
+        assert response.status_code == 400
+        assert _response_body(response)["error"] == "invalid_scope"
+
+    async def test_unknown_refresh_invalid_grant(self, endpoints: OAuthServerEndpoints) -> None:
+        client_id = await _register_public_client(endpoints)
+        response = await endpoints.token(
+            _request_with_form(
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": "mcp_rt_does_not_exist",
+                    "client_id": client_id,
+                }
+            )
+        )
+        assert response.status_code == 400
+        assert _response_body(response)["error"] == "invalid_grant"
+
+
+# =============================================================================
+# REVOKE
+# =============================================================================
+
+
+class TestRevoke:
+    async def test_access_token_silent_200(
+        self, endpoints: OAuthServerEndpoints, store: SQLiteInboundAuthStore
+    ) -> None:
+        client_id, access, _ = await _mint_initial_pair(endpoints)
+        response = await endpoints.revoke(
+            _request_with_form(
+                {"token": access, "client_id": client_id, "token_type_hint": "access_token"}
+            )
+        )
+        assert response.status_code == 200
+        # Access row should be gone.
+        conn = sqlite3.connect(store._db_path)
+        try:
+            access_count = conn.execute(
+                "SELECT COUNT(*) FROM inbound_tokens WHERE token_kind = 'access'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert access_count == 0
+
+    async def test_refresh_revoke_cascades_family(
+        self, endpoints: OAuthServerEndpoints, store: SQLiteInboundAuthStore
+    ) -> None:
+        client_id, _, refresh = await _mint_initial_pair(endpoints)
+        response = await endpoints.revoke(
+            _request_with_form(
+                {"token": refresh, "client_id": client_id, "token_type_hint": "refresh_token"}
+            )
+        )
+        assert response.status_code == 200
+        conn = sqlite3.connect(store._db_path)
+        try:
+            total = conn.execute("SELECT COUNT(*) FROM inbound_tokens").fetchone()[0]
+        finally:
+            conn.close()
+        assert total == 0
+
+    async def test_non_existent_token_silent_200(self, endpoints: OAuthServerEndpoints) -> None:
+        client_id = await _register_public_client(endpoints)
+        response = await endpoints.revoke(
+            _request_with_form({"token": "mcp_at_unknown", "client_id": client_id})
+        )
+        assert response.status_code == 200
+
+    async def test_non_owner_silent_200(
+        self, endpoints: OAuthServerEndpoints, store: SQLiteInboundAuthStore
+    ) -> None:
+        client_id_owner, access, _ = await _mint_initial_pair(endpoints)
+        other_client_id = await _register_public_client(endpoints)
+        response = await endpoints.revoke(
+            _request_with_form({"token": access, "client_id": other_client_id})
+        )
+        assert response.status_code == 200
+        # Original token NOT revoked — non-owner attempt silently no-ops.
+        conn = sqlite3.connect(store._db_path)
+        try:
+            access_count = conn.execute(
+                "SELECT COUNT(*) FROM inbound_tokens WHERE token_kind = 'access'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert access_count == 1
+        del client_id_owner  # silence unused-binding hint
+
+    async def test_invalid_client_silent_200(self, endpoints: OAuthServerEndpoints) -> None:
+        """RFC 7009 §2.2 — invalid client auth must NOT leak via 401."""
+        response = await endpoints.revoke(
+            _request_with_form({"token": "mcp_at_anything", "client_id": "mcp_client_unknown"})
+        )
+        assert response.status_code == 200
+
+
+# =============================================================================
+# DISABLED OAUTH
+# =============================================================================
+
+
+class TestDisabled:
+    async def test_all_endpoints_404_when_disabled(
+        self, store: SQLiteInboundAuthStore, connector_names: list[str]
+    ) -> None:
+        disabled = OAuthServerEndpoints(
+            inbound_auth_store=store,
+            config=OAuthInboundConfig(enabled=False),
+            connector_names_provider=lambda: connector_names,
+            public_url=GENERIC_PUBLIC_URL,
+        )
+        assert (await disabled.register(_request_with_json({}))).status_code == 404
+        assert (await disabled.authorize_get(_request_with_query({}))).status_code == 404
+        assert (await disabled.authorize_post(_request_with_form({}))).status_code == 404
+        assert (await disabled.token(_request_with_form({}))).status_code == 404
+        assert (await disabled.revoke(_request_with_form({}))).status_code == 404
+
+
+# =============================================================================
+# UNIT TESTS (pure helpers)
+# =============================================================================
+
+
+class TestRateLimiter:
+    def test_under_cap_allows(self) -> None:
+        limiter = _DCRRateLimiter(max_per_window=3, window_seconds=10)
+        assert limiter.allow("client-a")
+        assert limiter.allow("client-a")
+        assert limiter.allow("client-a")
+        assert not limiter.allow("client-a")
+
+    def test_separate_ips_independent(self) -> None:
+        limiter = _DCRRateLimiter(max_per_window=1, window_seconds=10)
+        assert limiter.allow("client-a")
+        assert limiter.allow("client-b")
+        assert not limiter.allow("client-a")
+
+
+class TestScopeSubset:
+    def test_subset_passes(self) -> None:
+        assert _scope_is_subset("a", "a b")
+
+    def test_widening_blocked(self) -> None:
+        assert not _scope_is_subset("a c", "a b")
+
+    def test_equal_passes(self) -> None:
+        assert _scope_is_subset("a b", "a b")
+
+
+class TestKindsFromHint:
+    def test_access_hint(self) -> None:
+        assert _kinds_from_hint("access_token") == ("access",)
+
+    def test_refresh_hint(self) -> None:
+        assert _kinds_from_hint("refresh_token") == ("refresh",)
+
+    def test_unknown_hint_tries_both(self) -> None:
+        assert _kinds_from_hint("") == ("access", "refresh")
+        assert _kinds_from_hint("nonsense") == ("access", "refresh")
+
+
+# =============================================================================
+# CONFIG VALIDATION (BrokerSettings.oauth cross-field validator)
+# =============================================================================
+
+
+class TestConfigCrossFieldValidator:
+    def test_app_key_missing_when_enabled_raises(self) -> None:
+        from pydantic import ValidationError
+
+        from broker.config import (
+            BrokerAppConfig,
+            BrokerConfig,
+            BrokerSettings,
+        )
+
+        with pytest.raises(ValidationError):
+            BrokerSettings(
+                broker=BrokerConfig(
+                    admin_key="test-admin-key-long",
+                    encryption_keys=["k"],
+                    state_secret="test-state-secret-key",
+                    oauth=OAuthInboundConfig(enabled=True),
+                ),
+                clients={"acme": {"claude_ai": BrokerAppConfig()}},
+            )
+
+    def test_app_key_not_in_clients_raises(self) -> None:
+        from pydantic import ValidationError
+
+        from broker.config import (
+            BrokerAppConfig,
+            BrokerConfig,
+            BrokerSettings,
+        )
+
+        with pytest.raises(ValidationError):
+            BrokerSettings(
+                broker=BrokerConfig(
+                    admin_key="test-admin-key-long",
+                    encryption_keys=["k"],
+                    state_secret="test-state-secret-key",
+                    oauth=OAuthInboundConfig(enabled=True, app_key="acme:nonexistent"),
+                ),
+                clients={"acme": {"claude_ai": BrokerAppConfig()}},
+            )
+
+    def test_valid_app_key_passes(self) -> None:
+        from broker.config import (
+            BrokerAppConfig,
+            BrokerConfig,
+            BrokerSettings,
+        )
+
+        settings = BrokerSettings(
+            broker=BrokerConfig(
+                admin_key="test-admin-key-long",
+                encryption_keys=["k"],
+                state_secret="test-state-secret-key",
+                oauth=OAuthInboundConfig(enabled=True, app_key="acme:claude_ai"),
+            ),
+            clients={"acme": {"claude_ai": BrokerAppConfig()}},
+        )
+        assert settings.broker.oauth.enabled
+        assert settings.broker.oauth.app_key == "acme:claude_ai"
+
+    def test_disabled_oauth_skips_validation(self) -> None:
+        from broker.config import BrokerConfig, BrokerSettings
+
+        # No clients section + disabled OAuth — must not raise.
+        settings = BrokerSettings(
+            broker=BrokerConfig(
+                admin_key="test-admin-key-long",
+                encryption_keys=["k"],
+                state_secret="test-state-secret-key",
+            ),
+        )
+        assert not settings.broker.oauth.enabled
+
+    def test_issuer_strips_trailing_slash(self) -> None:
+        from broker.config import BrokerConfig
+
+        config = BrokerConfig(
+            admin_key="test-admin-key-long",
+            encryption_keys=["k"],
+            state_secret="test-state-secret-key",
+            public_url="https://broker.example.com/",
+        )
+        assert config.issuer == "https://broker.example.com"
+
+
+# =============================================================================
+# CONCURRENCY (atomic rotation under load)
+# =============================================================================
+
+
+class TestConcurrentRotation:
+    """Two concurrent /token refresh calls on the same token — exactly one wins."""
+
+    async def test_at_most_one_concurrent_rotation_succeeds(
+        self, endpoints: OAuthServerEndpoints, store: SQLiteInboundAuthStore
+    ) -> None:
+        client_id, _, refresh = await _mint_initial_pair(endpoints)
+        form = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": client_id,
+        }
+        responses = await asyncio.gather(
+            endpoints.token(_request_with_form(dict(form))),
+            endpoints.token(_request_with_form(dict(form))),
+        )
+        status_codes = sorted(r.status_code for r in responses)
+        # At least one must succeed (200); the loser MUST be invalid_grant (400).
+        # Both succeeding would mean replay-resistant rotation is broken.
+        assert 200 in status_codes
+        assert status_codes.count(200) == 1
+        assert status_codes.count(400) == 1
+        del store  # silence unused-binding hint

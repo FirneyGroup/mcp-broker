@@ -6,6 +6,8 @@ Four sections: broker (service settings), store (token storage),
 apps (per-app OAuth credentials), clients (per-app auth + scopes).
 """
 
+from __future__ import annotations
+
 import logging
 import os
 import re
@@ -14,7 +16,7 @@ from typing import Any
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,32 @@ class BrokerAppConfig(BaseModel):
         default_factory=list,
         description="Connectors this app can access (empty = all)",
     )
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class OAuthInboundConfig(BaseModel):
+    """Inbound OAuth 2.1 AS settings for claude.ai-style remote MCP clients.
+
+    Disabled by default — flip ``enabled`` to expose ``/oauth/*`` and
+    ``/.well-known/oauth-*``. The named ``app_key`` MUST already exist in the
+    flattened ``clients`` config (validated cross-field on ``BrokerSettings``).
+    """
+
+    enabled: bool = False
+    app_key: str | None = Field(
+        default=None,
+        description="client_id:app_id all OAuth bearer tokens grant access to",
+    )
+    db_path: str = Field(
+        default="./data/inbound_oauth.db",
+        description="SQLite file for DCR clients, auth codes, and inbound tokens",
+    )
+    access_token_ttl_seconds: int = Field(default=3600, ge=60)
+    refresh_token_ttl_seconds: int = Field(default=30 * 24 * 3600, ge=60)
+    code_ttl_seconds: int = Field(default=60, ge=10, le=600)
+    dcr_rate_limit_per_ip: int = Field(default=10, ge=1)
+    dcr_rate_limit_window_seconds: int = Field(default=900, ge=60)
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -82,9 +110,22 @@ class BrokerConfig(BaseModel):
         le=600,
         description="How often to scan for expiring tokens (max 600s to stay within buffer)",
     )
+    oauth: OAuthInboundConfig = Field(
+        default_factory=OAuthInboundConfig,
+        description="Inbound OAuth 2.1 AS — disabled by default",
+    )
     # extra="ignore" for backwards compat with deployed settings.yaml
     # (e.g. renamed frontend_url → success_redirect_url)
     model_config = ConfigDict(frozen=True, extra="ignore")
+
+    @property
+    def issuer(self) -> str:
+        """RFC 8414 issuer identifier — public_url without the trailing slash.
+
+        Stored separately because ``public_url`` carries a trailing slash for
+        OAuth-callback concatenation; the issuer string must not.
+        """
+        return self.public_url.rstrip("/")
 
 
 class SQLiteStoreConfig(BaseModel):
@@ -129,6 +170,30 @@ class BrokerSettings(BaseModel):
             raise KeyError(
                 f"No credentials for connector '{connector_name}' in app '{app_key}'"
             ) from None
+
+    @model_validator(mode="after")
+    def _validate_oauth_app_key(self) -> BrokerSettings:
+        """Inbound OAuth requires an `app_key` that names a real client/app entry.
+
+        Without this check, a typo in ``broker.oauth.app_key`` would surface as
+        opaque token issuance for an identity that ``BrokerClientRegistry`` cannot
+        resolve — every subsequent bearer call would 401 with no operator hint.
+        """
+        oauth = self.broker.oauth
+        if oauth.enabled and not oauth.app_key:
+            raise ValueError("broker.oauth.enabled=true requires broker.oauth.app_key to be set")
+        if oauth.app_key is None:
+            return self
+        if ":" not in oauth.app_key:
+            raise ValueError(f"broker.oauth.app_key '{oauth.app_key}' must be 'client_id:app_id'")
+        client_id, app_id = oauth.app_key.split(":", 1)
+        try:
+            self.clients[client_id][app_id]
+        except KeyError as exc:
+            raise ValueError(
+                f"broker.oauth.app_key '{oauth.app_key}' not found in clients config"
+            ) from exc
+        return self
 
 
 # =============================================================================

@@ -26,6 +26,7 @@ from starlette.responses import Response
 if TYPE_CHECKING:
     from broker.services.api_key_store import BrokerKeyStore, ConnectTokenStore
     from broker.services.client_registry import BrokerClientRegistry
+    from broker.services.inbound_auth_store import SQLiteInboundAuthStore
     from broker.services.store import TokenStore
 
 # Type for the refresh callback injected from main.py
@@ -77,6 +78,7 @@ class AdminEndpoints:
         connect_token_store: ConnectTokenStore,
         token_store: TokenStore | None = None,
         refresh_callback: RefreshCallback | None = None,
+        inbound_auth_store: SQLiteInboundAuthStore | None = None,
     ) -> None:
         self._key_store = key_store
         self._admin_key = admin_key
@@ -84,6 +86,7 @@ class AdminEndpoints:
         self._connect_token_store = connect_token_store
         self._token_store = token_store
         self._refresh_callback = refresh_callback
+        self._inbound_auth_store = inbound_auth_store
 
     # --- Auth ---
 
@@ -179,7 +182,10 @@ class AdminEndpoints:
 
         Cascades to any stored OAuth tokens for the app so that re-provisioning
         a key under the same app_key cannot silently regain access to
-        previously-linked third-party accounts.
+        previously-linked third-party accounts. Cascade covers BOTH outbound
+        OAuth tokens (``TokenStore``) AND inbound OAuth state (``oauth_codes``
+        + ``inbound_tokens`` via ``SQLiteInboundAuthStore.delete_all_for_app``)
+        per AGENTS.md Known Gotcha #2.
         """
         if not self._verify_admin(request):
             return _json_response(401, {"error": "Unauthorized"})
@@ -191,6 +197,9 @@ class AdminEndpoints:
         tokens_deleted = 0
         if self._token_store is not None:
             tokens_deleted = await self._token_store.delete_all_for_app(app_key)
+
+        if self._inbound_auth_store is not None:
+            await self._inbound_auth_store.delete_all_for_app(app_key)
 
         logger.info("[Admin] Deleted key for app: %s (cascade: %d tokens)", app_key, tokens_deleted)
         return _json_response(
@@ -243,6 +252,7 @@ def create_admin_router(  # noqa: PLR0913 — router factory needs all deps
     connect_token_store: ConnectTokenStore,
     token_store: TokenStore | None = None,
     refresh_callback: RefreshCallback | None = None,
+    inbound_auth_store: SQLiteInboundAuthStore | None = None,
 ) -> APIRouter:
     """Create a FastAPI router with admin endpoints."""
     endpoints = AdminEndpoints(
@@ -252,6 +262,7 @@ def create_admin_router(  # noqa: PLR0913 — router factory needs all deps
         connect_token_store,
         token_store,
         refresh_callback,
+        inbound_auth_store,
     )
     router = APIRouter()
     router.add_api_route("/admin/keys", endpoints.create_key, methods=["POST"])

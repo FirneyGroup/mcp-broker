@@ -8,12 +8,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **Inbound OAuth 2.1 AS for claude.ai-style MCP clients** — opt-in via `broker.oauth.enabled=true` (default `false`). New endpoints:
+  - `POST /oauth/register` — RFC 7591 Dynamic Client Registration with per-IP sliding-window rate limit.
+  - `GET/POST /oauth/authorize` — PKCE S256 + RFC 8707 resource indicators; consent page with `X-Frame-Options: DENY` and `frame-ancestors 'none'` CSP.
+  - `POST /oauth/token` — `authorization_code` + `refresh_token` grants; atomic refresh rotation with family revoke on replay (OAuth 2.1 §4.3.1).
+  - `POST /oauth/revoke` — RFC 7009 silent-success semantics.
+  - `GET /.well-known/oauth-authorization-server` and `GET /.well-known/oauth-protected-resource/{path}` — RFC 8414 + RFC 9728 discovery, cached for 1 hour.
+- **Bearer-token validation on `/proxy/*`** — `Authorization: Bearer mcp_at_...` tokens are validated against the inbound auth store with audience binding to the request connector. SHA-256-hashed at rest; compared via `hmac.compare_digest`.
+- **`broker.oauth` config section** — `enabled`, `app_key`, `db_path`, TTL knobs, DCR rate limit knobs. Cross-field validator rejects an `app_key` that does not exist in `clients`.
+- **Cascade delete** — `DELETE /admin/keys/{app_key}` now also drops inbound OAuth state for the app (DCR codes + access/refresh tokens) so re-provisioning a compromised key cannot silently regain bearer access.
 - **Slack connector** (Native) — bot-identity messaging via Slack OAuth v2.
 - **Broker module entrypoint** (`python -m broker`) — validates settings before uvicorn boots, so config errors exit cleanly instead of propagating from the async lifespan.
 
 ### Changed
 
 - **Grouped config errors** — missing environment variables are reported together with their `settings.yaml` path, instead of failing on the first miss.
+
+### Security
+
+- Inbound bearer tokens, refresh tokens, and DCR client secrets are SHA-256-hashed at rest; raw values surface only at issuance and never again. Token comparison uses `hmac.compare_digest`.
+- Inbound `Authorization: Bearer` header is removed from the request before any downstream handler runs (defense in depth on top of the existing proxy strip list).
+- Refresh-token replay triggers immediate cascade revoke of every token in the family.
 
 ## [0.1.0] — 2026-04-14
 
