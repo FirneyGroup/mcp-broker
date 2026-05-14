@@ -29,6 +29,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Inbound bearer tokens, refresh tokens, and DCR client secrets are SHA-256-hashed at rest; raw values surface only at issuance and never again. Token comparison uses `hmac.compare_digest`.
 - Inbound `Authorization: Bearer` header is removed from the request before any downstream handler runs (defense in depth on top of the existing proxy strip list).
 - Refresh-token replay triggers immediate cascade revoke of every token in the family.
+- DCR rate-limit `X-Forwarded-For` trust is now gated by `broker.oauth.trusted_proxy_ips` (default empty). Previously the DCR rate limiter trusted `X-Forwarded-For` unconditionally, letting a direct-access attacker bypass the per-IP cap by cycling forwarded values. With the gate, XFF is honored only when `request.client.host` is in the configured trusted-proxy allowlist; otherwise the rate-limit key is the immediate client.
 
 ## [0.1.0] — 2026-04-14
 

@@ -19,7 +19,7 @@ from cryptography.fernet import Fernet
 from httpx import Response
 from pydantic import ValidationError
 
-from broker.config import BrokerConfig, BrokerSettings
+from broker.config import BrokerAppConfig, BrokerConfig, BrokerSettings, OAuthInboundConfig
 from broker.connectors.base import BaseConnector
 from broker.connectors.registry import ConnectorRegistry
 from broker.models.connection import AppConnection
@@ -592,6 +592,70 @@ class TestConfig:
 
         with pytest.raises(KeyError):
             settings.get_app_credentials("test_company:chat", "notion")
+
+
+# =============================================================================
+# CONFIG VALIDATION (BrokerSettings.oauth cross-field validator)
+# =============================================================================
+
+
+class TestConfigCrossFieldValidator:
+    def test_app_key_missing_when_enabled_raises(self) -> None:
+        with pytest.raises(ValidationError):
+            BrokerSettings(
+                broker=BrokerConfig(
+                    admin_key="test-admin-key-long",
+                    encryption_keys=["k"],
+                    state_secret="test-state-secret-key",
+                    oauth=OAuthInboundConfig(enabled=True),
+                ),
+                clients={"acme": {"claude_ai": BrokerAppConfig()}},
+            )
+
+    def test_app_key_not_in_clients_raises(self) -> None:
+        with pytest.raises(ValidationError):
+            BrokerSettings(
+                broker=BrokerConfig(
+                    admin_key="test-admin-key-long",
+                    encryption_keys=["k"],
+                    state_secret="test-state-secret-key",
+                    oauth=OAuthInboundConfig(enabled=True, app_key="acme:nonexistent"),
+                ),
+                clients={"acme": {"claude_ai": BrokerAppConfig()}},
+            )
+
+    def test_valid_app_key_passes(self) -> None:
+        settings = BrokerSettings(
+            broker=BrokerConfig(
+                admin_key="test-admin-key-long",
+                encryption_keys=["k"],
+                state_secret="test-state-secret-key",
+                oauth=OAuthInboundConfig(enabled=True, app_key="acme:claude_ai"),
+            ),
+            clients={"acme": {"claude_ai": BrokerAppConfig()}},
+        )
+        assert settings.broker.oauth.enabled
+        assert settings.broker.oauth.app_key == "acme:claude_ai"
+
+    def test_disabled_oauth_skips_validation(self) -> None:
+        # No clients section + disabled OAuth — must not raise.
+        settings = BrokerSettings(
+            broker=BrokerConfig(
+                admin_key="test-admin-key-long",
+                encryption_keys=["k"],
+                state_secret="test-state-secret-key",
+            ),
+        )
+        assert not settings.broker.oauth.enabled
+
+    def test_issuer_strips_trailing_slash(self) -> None:
+        config = BrokerConfig(
+            admin_key="test-admin-key-long",
+            encryption_keys=["k"],
+            state_secret="test-state-secret-key",
+            public_url="https://broker.example.com/",
+        )
+        assert config.issuer == "https://broker.example.com"
 
 
 # =============================================================================

@@ -66,6 +66,12 @@ class OAuthInboundConfig(BaseModel):
     code_ttl_seconds: int = Field(default=60, ge=10, le=600)
     dcr_rate_limit_per_ip: int = Field(default=10, ge=1)
     dcr_rate_limit_window_seconds: int = Field(default=900, ge=60)
+    trusted_proxy_ips: list[str] = Field(
+        default_factory=list,
+        description="IP addresses of trusted reverse proxies. X-Forwarded-For is only "
+        "honored when request.client.host is in this list. Empty (default) "
+        "means XFF is ignored — request.client.host is the rate-limit key.",
+    )
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 

@@ -11,19 +11,17 @@ when ``WEB_CONCURRENCY > 1`` AND ``broker.oauth.enabled`` is true.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import html
-import logging
 import secrets
-import sqlite3
 import time
 from collections.abc import Callable
+from http import HTTPStatus
 from typing import Literal
 from urllib.parse import urlencode
 
 from fastapi import Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from pydantic import BaseModel, ConfigDict
 
 from broker.config import OAuthInboundConfig
 from broker.models.inbound_auth import (
@@ -49,23 +47,15 @@ from broker.services.inbound_oauth_helpers import (
     is_acceptable_redirect_uri,
     normalize_resource,
     parse_basic_auth,
+    sha256_hex,
     verify_pkce_s256,
 )
-
-logger = logging.getLogger(__name__)
-
 
 # === CONSTANTS ===
 
 # 43..128 base64url chars — PKCE S256, RFC 7636 §4.2
 _CODE_CHALLENGE_MIN_LEN = 43
 _CODE_CHALLENGE_MAX_LEN = 128
-
-_HTTP_OK = 200
-_HTTP_CREATED = 201
-_HTTP_BAD_REQUEST = 400
-_HTTP_UNAUTHORIZED = 401
-_HTTP_TOO_MANY = 429
 
 _BEARER_TOKEN_TYPE = "Bearer"  # noqa: S105 -- RFC 6749 §5.1 token_type value, not a credential
 
@@ -159,6 +149,24 @@ class _DCRRateLimiter:
         return True
 
 
+class _NewFamilyContext(BaseModel):
+    """Consumed code + freshly-minted token IDs shared by the two row builders.
+
+    Bundled into one object so ``_new_access_row`` and ``_new_refresh_row`` stay
+    within the 4-arg limit while still receiving every value they need.
+    Internal — not a public model.
+    """
+
+    consumed: OAuthCode
+    client_id: str
+    family_id: str
+    access_hash: str
+    refresh_hash: str
+    now_ts: int
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+
 # === ENDPOINTS ===
 
 
@@ -194,10 +202,10 @@ class OAuthServerEndpoints:
         """RFC 7591 Dynamic Client Registration."""
         if not self._config.enabled:
             return _not_found()
-        client_ip = _client_ip(request)
+        client_ip = self._client_ip(request)
         if not self._dcr_rate_limiter.allow(client_ip):
             return _oauth_error(
-                _HTTP_TOO_MANY, "invalid_request", "registration rate limit exceeded"
+                HTTPStatus.TOO_MANY_REQUESTS, "invalid_request", "registration rate limit exceeded"
             )
 
         registration, error = await _parse_registration_request(request)
@@ -213,7 +221,7 @@ class OAuthServerEndpoints:
             registration, client_ip=client_ip
         )
         return JSONResponse(
-            response_payload.model_dump(exclude_none=True), status_code=_HTTP_CREATED
+            response_payload.model_dump(exclude_none=True), status_code=HTTPStatus.CREATED
         )
 
     # --- /oauth/authorize (GET) ---
@@ -237,7 +245,7 @@ class OAuthServerEndpoints:
             client_id=params["client_id"],
             resource=params["resource"],
             scope=params.get("scope", ""),
-            ip=_client_ip(request),
+            ip=self._client_ip(request),
         )
         return _render_consent(params, client_or_error.client_name)
 
@@ -283,7 +291,9 @@ class OAuthServerEndpoints:
         if grant_type == _GRANT_REFRESH:
             return await self._token_refresh(params, client_or_error)
         return _oauth_error(
-            _HTTP_BAD_REQUEST, "unsupported_grant_type", f"grant_type '{grant_type}' not supported"
+            HTTPStatus.BAD_REQUEST,
+            "unsupported_grant_type",
+            f"grant_type '{grant_type}' not supported",
         )
 
     # --- /oauth/revoke ---
@@ -299,18 +309,18 @@ class OAuthServerEndpoints:
             # RFC 7009 §2.2: invalid clients still get 200 to avoid leaking
             # which client_ids exist. Authentication failures translate to a
             # silent no-op rather than the standard 401.
-            return Response(status_code=_HTTP_OK)
+            return Response(status_code=HTTPStatus.OK)
 
         raw_token = params.get("token", "").strip()
         if not raw_token:
-            return Response(status_code=_HTTP_OK)
-        token_hash = _sha256_hex(raw_token)
+            return Response(status_code=HTTPStatus.OK)
+        token_hash = sha256_hex(raw_token)
         kinds = _kinds_from_hint(params.get("token_type_hint", ""))
         for token_kind in kinds:
             await self._inbound_auth_store.revoke_token(
                 token_hash, client_or_error, kind=token_kind
             )
-        return Response(status_code=_HTTP_OK)
+        return Response(status_code=HTTPStatus.OK)
 
     # --- INTERNAL: validation pipeline ---
 
@@ -349,32 +359,36 @@ class OAuthServerEndpoints:
             return _redirect_with_error(redirect_uri, state, challenge_error)
         if not state:
             return _redirect_with_error(redirect_uri, "", "invalid_request")
-        connector_or_error = self._validate_resource_and_connector(params)
-        if isinstance(connector_or_error, str) and connector_or_error.startswith("__error__:"):
-            return _redirect_with_error(
-                redirect_uri, state, connector_or_error.removeprefix("__error__:")
-            )
-        if not isinstance(connector_or_error, str):
-            return _redirect_with_error(redirect_uri, state, "invalid_target")
-        scope_error = _validate_scope(params.get("scope", ""), connector_or_error)
+        connector_names = self._connector_names_provider()
+        connector, error_code = self._validate_resource_and_connector(
+            params.get("resource", ""), connector_names
+        )
+        if error_code is not None:
+            return _redirect_with_error(redirect_uri, state, error_code)
+        assert connector is not None  # noqa: S101 -- guaranteed by error_code is None
+        scope_error = _validate_scope(params.get("scope", ""), connector)
         if scope_error is not None:
             return _redirect_with_error(redirect_uri, state, scope_error)
-        return connector_or_error
+        return connector
 
-    def _validate_resource_and_connector(self, params: dict[str, str]) -> str:
-        """Return matched connector name OR an `__error__:` sentinel string."""
-        raw_resource = params.get("resource", "")
-        if not raw_resource:
-            return "__error__:invalid_request"
+    def _validate_resource_and_connector(
+        self,
+        resource_param: str,
+        connector_names: list[str],
+    ) -> tuple[str | None, str | None]:
+        """Return ``(connector_name, None)`` on success, or ``(None, error_code)`` on failure.
+
+        ``error_code`` is one of: ``"invalid_request"``, ``"invalid_target"``.
+        Empty/malformed resource → ``invalid_request``; unknown connector → ``invalid_target``.
+        """
         try:
-            normalized = normalize_resource(raw_resource)
+            resource_norm = normalize_resource(resource_param)
         except ValueError:
-            return "__error__:invalid_request"
-        connector_names = self._connector_names_provider()
-        match = connector_from_resource(normalized, self._public_url, connector_names)
-        if match is None:
-            return "__error__:invalid_target"
-        return match
+            return None, "invalid_request"
+        connector = connector_from_resource(resource_norm, self._public_url, connector_names)
+        if connector is None:
+            return None, "invalid_target"
+        return connector, None
 
     # --- INTERNAL: token endpoint helpers ---
 
@@ -389,27 +403,27 @@ class OAuthServerEndpoints:
         body (``client_id`` + ``client_secret``); public clients pass only
         ``client_id``. Mismatched auth method → 401 ``invalid_client``.
         """
-        basic = parse_basic_auth(request.headers.get("authorization", ""))
-        if basic is not None:
-            client_id, supplied_secret = basic
-        else:
-            client_id = params.get("client_id", "")
-            supplied_secret = params.get("client_secret", "")
+        client_id, supplied_secret = _extract_client_credentials(request, params)
         if not client_id:
-            return _oauth_error(_HTTP_UNAUTHORIZED, "invalid_client", "client_id required")
+            return _oauth_error(HTTPStatus.UNAUTHORIZED, "invalid_client", "client_id required")
         client_record = await self._inbound_auth_store.get_client(client_id)
         if client_record is None:
-            return _oauth_error(_HTTP_UNAUTHORIZED, "invalid_client", "client_id not registered")
+            return _oauth_error(
+                HTTPStatus.UNAUTHORIZED, "invalid_client", "client_id not registered"
+            )
         if client_record.token_endpoint_auth_method == _PUBLIC_CLIENT_AUTH_METHOD:
             return client_id
-        # Confidential client — verify secret against stored hash via raw SQL
-        # because the store doesn't expose a hash-comparison method (matches
-        # the pattern in ``SQLiteInboundAuthStore.get_access``).
+        return await self._authenticate_confidential_client(client_id, supplied_secret)
+
+    async def _authenticate_confidential_client(
+        self, client_id: str, supplied_secret: str
+    ) -> str | Response:
+        """Verify a confidential client's secret against the store's stored hash."""
         if not supplied_secret:
-            return _oauth_error(_HTTP_UNAUTHORIZED, "invalid_client", "client_secret required")
-        valid = await _verify_client_secret(self._inbound_auth_store, client_id, supplied_secret)
+            return _oauth_error(HTTPStatus.UNAUTHORIZED, "invalid_client", "client_secret required")
+        valid = await self._inbound_auth_store.verify_client_secret(client_id, supplied_secret)
         if not valid:
-            return _oauth_error(_HTTP_UNAUTHORIZED, "invalid_client", "client_secret mismatch")
+            return _oauth_error(HTTPStatus.UNAUTHORIZED, "invalid_client", "client_secret mismatch")
         return client_id
 
     async def _token_authorization_code(
@@ -418,24 +432,20 @@ class OAuthServerEndpoints:
         client_id: str,
     ) -> Response:
         """RFC 6749 §4.1.3 — exchange auth code for tokens."""
-        code = params.get("code", "")
-        verifier = params.get("code_verifier", "")
-        redirect_uri = params.get("redirect_uri", "")
-        resource = params.get("resource", "")
-        if not code or not verifier or not redirect_uri:
-            return _oauth_error(
-                _HTTP_BAD_REQUEST,
-                "invalid_request",
-                "code, code_verifier, and redirect_uri required",
-            )
-        code_hash = _sha256_hex(code)
+        grant_or_error = _validate_code_grant_params(params)
+        if isinstance(grant_or_error, Response):
+            return grant_or_error
+        code, verifier, redirect_uri, resource = grant_or_error
+        code_hash = sha256_hex(code)
         consumed = await self._inbound_auth_store.consume_code(code_hash, client_id)
         if consumed is None:
-            return _oauth_error(_HTTP_BAD_REQUEST, "invalid_grant", "authorization code invalid")
+            return _oauth_error(
+                HTTPStatus.BAD_REQUEST, "invalid_grant", "authorization code invalid"
+            )
         if consumed.redirect_uri != redirect_uri:
-            return _oauth_error(_HTTP_BAD_REQUEST, "invalid_grant", "redirect_uri mismatch")
+            return _oauth_error(HTTPStatus.BAD_REQUEST, "invalid_grant", "redirect_uri mismatch")
         if not verify_pkce_s256(verifier, consumed.code_challenge):
-            return _oauth_error(_HTTP_BAD_REQUEST, "invalid_grant", "PKCE verification failed")
+            return _oauth_error(HTTPStatus.BAD_REQUEST, "invalid_grant", "PKCE verification failed")
         target_error = _check_resource_against_stored(resource, consumed.resource)
         if target_error is not None:
             return target_error
@@ -450,8 +460,8 @@ class OAuthServerEndpoints:
         """RFC 6749 §6 + OAuth 2.1 §4.3.1 — atomic refresh rotation."""
         refresh_token = params.get("refresh_token", "")
         if not refresh_token:
-            return _oauth_error(_HTTP_BAD_REQUEST, "invalid_request", "refresh_token required")
-        token_hash = _sha256_hex(refresh_token)
+            return _oauth_error(HTTPStatus.BAD_REQUEST, "invalid_request", "refresh_token required")
+        token_hash = sha256_hex(refresh_token)
 
         rotation_or_error = await self._rotate_refresh_with_scope_check(
             params, client_id, token_hash
@@ -463,35 +473,39 @@ class OAuthServerEndpoints:
         )
 
     async def _rotate_refresh_with_scope_check(
-        self,
-        params: dict[str, str],
-        client_id: str,
-        token_hash: str,
+        self, params: dict[str, str], client_id: str, token_hash: str
     ) -> RotatedTokenPair | Response:
         """Look up the prior token, enforce scope ⊆, then rotate atomically.
 
-        The store doesn't expose a refresh-row read (rotation is its public
-        API), so we read directly via ``_fetch_refresh_row``. Reading first
-        lets us reject scope widening with an explicit ``invalid_scope`` rather
-        than letting the rotation succeed with the widened scope.
+        Reading the prior row first lets us reject scope widening with an
+        explicit ``invalid_scope`` rather than letting the rotation succeed
+        with the widened scope.
         """
-        prior_row = await _fetch_refresh_row(self._inbound_auth_store, token_hash)
+        prior_row = await self._inbound_auth_store.get_refresh_row(token_hash)
         if prior_row is None:
             # Unknown OR already used — both surface as invalid_grant per RFC 6749 §5.2.
-            return _oauth_error(_HTTP_BAD_REQUEST, "invalid_grant", "refresh_token invalid")
-        requested_scope = params.get("scope") or prior_row.scope
-        if not _scope_is_subset(requested_scope, prior_row.scope):
-            return _oauth_error(_HTTP_BAD_REQUEST, "invalid_scope", "scope widening rejected")
-        rotation_request = RefreshRotationRequest(
-            token_hash=token_hash,
-            client_id=client_id,
-            resource=prior_row.resource,
-            scope=requested_scope,
-        )
+            return _oauth_error(HTTPStatus.BAD_REQUEST, "invalid_grant", "refresh_token invalid")
+        scope_or_error = _resolve_rotation_scope(params.get("scope"), prior_row.scope)
+        if isinstance(scope_or_error, Response):
+            return scope_or_error
+        rotation_request = self._build_rotation_request(prior_row, client_id, scope_or_error)
         try:
             return await self._inbound_auth_store.rotate_refresh(rotation_request)
         except InvalidGrantError as exc:
-            return _oauth_error(_HTTP_BAD_REQUEST, "invalid_grant", str(exc))
+            return _oauth_error(HTTPStatus.BAD_REQUEST, "invalid_grant", str(exc))
+
+    def _build_rotation_request(
+        self, prior_row: InboundToken, client_id: str, scope: str
+    ) -> RefreshRotationRequest:
+        """Bundle rotation inputs + config-driven TTLs into the store contract."""
+        return RefreshRotationRequest(
+            token_hash=prior_row.token_hash,
+            client_id=client_id,
+            resource=prior_row.resource,
+            scope=scope,
+            access_ttl_seconds=self._config.access_token_ttl_seconds,
+            refresh_ttl_seconds=self._config.refresh_token_ttl_seconds,
+        )
 
     # --- INTERNAL: mint code + initial token pair ---
 
@@ -501,7 +515,17 @@ class OAuthServerEndpoints:
     ) -> Response:
         """Persist a freshly-minted auth code and redirect to claude.ai callback."""
         raw_code = secrets.token_urlsafe(32)
-        code_hash = _sha256_hex(raw_code)
+        code_hash = sha256_hex(raw_code)
+        await self._persist_code(code_hash, params)
+        callback = (
+            params["redirect_uri"]
+            + "?"
+            + urlencode({"code": raw_code, "state": params.get("state", "")})
+        )
+        return RedirectResponse(callback, status_code=HTTPStatus.FOUND)
+
+    async def _persist_code(self, code_hash: str, params: dict[str, str]) -> None:
+        """Build the OAuthCode row, write it to the store, and emit an audit event."""
         # Storage keeps the RAW resource string the client sent (RFC 8707
         # normalization-vs-storage policy documented in normalize_resource).
         oauth_code = OAuthCode(
@@ -520,12 +544,6 @@ class OAuthServerEndpoints:
             app_key=oauth_code.app_key,
             code_hash_prefix=hash_prefix(code_hash),
         )
-        callback = (
-            params["redirect_uri"]
-            + "?"
-            + urlencode({"code": raw_code, "state": params.get("state", "")})
-        )
-        return RedirectResponse(callback, status_code=302)
 
     async def _mint_initial_pair(
         self,
@@ -533,65 +551,88 @@ class OAuthServerEndpoints:
         client_id: str,
     ) -> RotatedTokenPair:
         """Mint and persist the first (access, refresh) pair for an auth code grant."""
-        family_id = generate_family_id()
+        pair = self._build_token_pair(consumed, client_id)
+        await self._inbound_auth_store.create_token_pair(pair)
+        return pair
+
+    def _build_token_pair(self, consumed: OAuthCode, client_id: str) -> RotatedTokenPair:
+        """Construct a fresh access+refresh pair in a new token family.
+
+        Tokens are generated here (raw + hash); only the hashes plus metadata
+        reach the database via ``create_token_pair``. The raw strings travel
+        on the returned ``RotatedTokenPair`` so the caller can return them once.
+        """
         raw_access, access_hash = generate_access_token()
         raw_refresh, refresh_hash = generate_refresh_token()
-        now_ts = int(time.time())
-        access_row = InboundToken(
-            token_hash=access_hash,
-            token_kind="access",  # noqa: S106 -- discriminator literal, not a credential
-            parent_refresh_hash=refresh_hash,
-            family_id=family_id,
+        ctx = _NewFamilyContext(
+            consumed=consumed,
             client_id=client_id,
-            app_key=consumed.app_key,
-            resource=consumed.resource,
-            scope=consumed.scope,
-            expires_at=now_ts + self._config.access_token_ttl_seconds,
-            issued_at=now_ts,
+            family_id=generate_family_id(),
+            access_hash=access_hash,
+            refresh_hash=refresh_hash,
+            now_ts=int(time.time()),
         )
-        refresh_row = InboundToken(
-            token_hash=refresh_hash,
-            token_kind="refresh",  # noqa: S106 -- discriminator literal, not a credential
-            family_id=family_id,
-            client_id=client_id,
-            app_key=consumed.app_key,
-            resource=consumed.resource,
-            scope=consumed.scope,
-            expires_at=now_ts + self._config.refresh_token_ttl_seconds,
-            issued_at=now_ts,
-        )
-        pair = RotatedTokenPair(
-            access=access_row,
-            refresh=refresh_row,
+        return RotatedTokenPair(
+            access=self._new_access_row(ctx),
+            refresh=self._new_refresh_row(ctx),
             raw_access_token=raw_access,
             raw_refresh_token=raw_refresh,
         )
-        await self._inbound_auth_store.create_token_pair(pair)
-        return pair
+
+    def _new_access_row(self, ctx: _NewFamilyContext) -> InboundToken:
+        """Build the access-token row for a new family. TTL from config."""
+        return InboundToken(
+            token_hash=ctx.access_hash,
+            token_kind="access",  # noqa: S106 -- discriminator literal, not a credential
+            parent_refresh_hash=ctx.refresh_hash,
+            family_id=ctx.family_id,
+            client_id=ctx.client_id,
+            app_key=ctx.consumed.app_key,
+            resource=ctx.consumed.resource,
+            scope=ctx.consumed.scope,
+            expires_at=ctx.now_ts + self._config.access_token_ttl_seconds,
+            issued_at=ctx.now_ts,
+        )
+
+    def _new_refresh_row(self, ctx: _NewFamilyContext) -> InboundToken:
+        """Build the refresh-token row for a new family. TTL from config."""
+        return InboundToken(
+            token_hash=ctx.refresh_hash,
+            token_kind="refresh",  # noqa: S106 -- discriminator literal, not a credential
+            family_id=ctx.family_id,
+            client_id=ctx.client_id,
+            app_key=ctx.consumed.app_key,
+            resource=ctx.consumed.resource,
+            scope=ctx.consumed.scope,
+            expires_at=ctx.now_ts + self._config.refresh_token_ttl_seconds,
+            issued_at=ctx.now_ts,
+        )
+
+    # --- INTERNAL: rate-limit key ---
+
+    def _client_ip(self, request: Request) -> str:
+        """Resolve the rate-limit key for a request.
+
+        Trusts ``X-Forwarded-For`` only when the immediate client is in the
+        configured ``trusted_proxy_ips`` list. Otherwise uses
+        ``request.client.host`` directly. This prevents direct-access attackers
+        from cycling fake XFF values to bypass DCR rate limiting.
+        """
+        immediate_ip = request.client.host if request.client else ""
+        if immediate_ip in self._config.trusted_proxy_ips:
+            forwarded = request.headers.get("x-forwarded-for", "")
+            if forwarded:
+                return forwarded.split(",", 1)[0].strip()
+        return immediate_ip or "unknown"
 
 
 # === MODULE-LEVEL HELPERS ===
 
 
-def _sha256_hex(value: str) -> str:
-    """SHA-256 hex digest — mirrors ``inbound_auth_store._sha256_hex`` for parity."""
-    return hashlib.sha256(value.encode()).hexdigest()
-
-
-def _client_ip(request: Request) -> str:
-    """Best-effort client IP. Trust ``X-Forwarded-For`` only when the broker is
-    deployed behind a known proxy — for the rate limiter this is "good enough"
-    (the failure mode is over-counting from shared NATs, not bypass)."""
-    forwarded = request.headers.get("x-forwarded-for", "")
-    if forwarded:
-        return forwarded.split(",", 1)[0].strip()
-    return request.client.host if request.client else "unknown"
-
-
 def _not_found() -> Response:
     """404 used when ``broker.oauth.enabled=false`` — keeps the OAuth surface
     invisible to clients that probe without checking ``.well-known/`` first."""
-    return JSONResponse({"error": "not_found"}, status_code=404)
+    return JSONResponse({"error": "not_found"}, status_code=HTTPStatus.NOT_FOUND)
 
 
 def _oauth_error(status_code: int, code: str, description: str) -> Response:
@@ -605,13 +646,13 @@ def _bad_request_html(description: str) -> Response:
         "<!DOCTYPE html><html><body><h1>Authorization request rejected</h1>"
         f"<p>{html.escape(description)}</p></body></html>"
     )
-    return HTMLResponse(body, status_code=_HTTP_BAD_REQUEST, headers=_CONSENT_HEADERS)
+    return HTMLResponse(body, status_code=HTTPStatus.BAD_REQUEST, headers=_CONSENT_HEADERS)
 
 
 def _redirect_with_error(redirect_uri: str, state: str, error: str) -> Response:
     """Post-redirect errors flow through the redirect URI per RFC 6749 §4.1.2.1."""
     query = urlencode({"error": error, "state": state} if state else {"error": error})
-    return RedirectResponse(f"{redirect_uri}?{query}", status_code=302)
+    return RedirectResponse(f"{redirect_uri}?{query}", status_code=HTTPStatus.FOUND)
 
 
 async def _parse_registration_request(
@@ -621,12 +662,14 @@ async def _parse_registration_request(
     try:
         raw = await request.json()
     except (ValueError, UnicodeDecodeError):
-        return None, _oauth_error(_HTTP_BAD_REQUEST, "invalid_request", "request body must be JSON")
+        return None, _oauth_error(
+            HTTPStatus.BAD_REQUEST, "invalid_request", "request body must be JSON"
+        )
     try:
         return RegistrationRequest(**raw), None
     except (TypeError, ValueError) as exc:
         return None, _oauth_error(
-            _HTTP_BAD_REQUEST, "invalid_request", f"invalid registration: {exc}"
+            HTTPStatus.BAD_REQUEST, "invalid_request", f"invalid registration: {exc}"
         )
 
 
@@ -635,13 +678,13 @@ def _validate_registration_redirects(redirect_uris: list[str]) -> Response | Non
     for uri in redirect_uris:
         if "#" in uri:
             return _oauth_error(
-                _HTTP_BAD_REQUEST,
+                HTTPStatus.BAD_REQUEST,
                 "invalid_redirect_uri",
                 "redirect_uri must not contain a fragment",
             )
         if not is_acceptable_redirect_uri(uri):
             return _oauth_error(
-                _HTTP_BAD_REQUEST,
+                HTTPStatus.BAD_REQUEST,
                 "invalid_redirect_uri",
                 f"redirect_uri '{uri}' not allowed (claude.ai callbacks only in v1)",
             )
@@ -657,6 +700,40 @@ def _validate_pkce(params: dict[str, str]) -> str | None:
     if not _CODE_CHALLENGE_MIN_LEN <= len(challenge) <= _CODE_CHALLENGE_MAX_LEN:
         return "invalid_request"
     return None
+
+
+def _extract_client_credentials(request: Request, params: dict[str, str]) -> tuple[str, str]:
+    """Pull ``(client_id, client_secret)`` from Basic auth header or POST body.
+
+    RFC 6749 §2.3.1 allows either form; Basic header wins when present. Returns
+    empty strings when neither carries a value — caller surfaces the right
+    OAuth error.
+    """
+    basic = parse_basic_auth(request.headers.get("authorization", ""))
+    if basic is not None:
+        return basic
+    return params.get("client_id", ""), params.get("client_secret", "")
+
+
+def _validate_code_grant_params(
+    params: dict[str, str],
+) -> tuple[str, str, str, str] | Response:
+    """Extract ``(code, verifier, redirect_uri, resource)`` from the /token form.
+
+    Returns an ``invalid_request`` error response when any of code, code_verifier,
+    or redirect_uri are missing — these three are mandatory at exchange time.
+    """
+    code = params.get("code", "")
+    verifier = params.get("code_verifier", "")
+    redirect_uri = params.get("redirect_uri", "")
+    resource = params.get("resource", "")
+    if not code or not verifier or not redirect_uri:
+        return _oauth_error(
+            HTTPStatus.BAD_REQUEST,
+            "invalid_request",
+            "code, code_verifier, and redirect_uri required",
+        )
+    return code, verifier, redirect_uri, resource
 
 
 def _validate_scope(scope: str, connector_name: str) -> str | None:
@@ -693,6 +770,18 @@ def _scope_is_subset(requested: str, granted: str) -> bool:
     return requested_set.issubset(granted_set)
 
 
+def _resolve_rotation_scope(requested_scope: str | None, granted_scope: str) -> str | Response:
+    """Narrow scope to the requested subset of the prior grant, or reject widening.
+
+    Returns the effective scope string on success, or an ``invalid_scope`` error
+    response when the requested scope is not a subset of the granted scope.
+    """
+    effective_scope = requested_scope or granted_scope
+    if not _scope_is_subset(effective_scope, granted_scope):
+        return _oauth_error(HTTPStatus.BAD_REQUEST, "invalid_scope", "scope widening rejected")
+    return effective_scope
+
+
 def _check_resource_against_stored(
     requested_resource: str,
     stored_resource: str,
@@ -706,9 +795,11 @@ def _check_resource_against_stored(
         requested_norm = normalize_resource(requested_resource)
         stored_norm = normalize_resource(stored_resource)
     except ValueError:
-        return _oauth_error(_HTTP_BAD_REQUEST, "invalid_target", "resource normalization failed")
+        return _oauth_error(
+            HTTPStatus.BAD_REQUEST, "invalid_target", "resource normalization failed"
+        )
     if requested_norm != stored_norm:
-        return _oauth_error(_HTTP_BAD_REQUEST, "invalid_target", "resource mismatch")
+        return _oauth_error(HTTPStatus.BAD_REQUEST, "invalid_target", "resource mismatch")
     return None
 
 
@@ -739,62 +830,4 @@ def _token_json(
         refresh_token=pair.raw_refresh_token,
         scope=scope,
     )
-    return JSONResponse(payload.model_dump(exclude_none=True), status_code=_HTTP_OK)
-
-
-async def _verify_client_secret(
-    store: SQLiteInboundAuthStore,
-    client_id: str,
-    supplied_secret: str,
-) -> bool:
-    """Constant-time compare of supplied secret against the stored SHA-256 hash."""
-    conn = sqlite3.connect(store._db_path)  # noqa: SLF001 -- private path access mirrors store internals
-    try:
-        row = conn.execute(
-            "SELECT client_secret_hash FROM oauth_clients WHERE client_id = ?", (client_id,)
-        ).fetchone()
-    finally:
-        conn.close()
-    if not row or row[0] is None:
-        return False
-    return hmac.compare_digest(row[0], _sha256_hex(supplied_secret))
-
-
-async def _fetch_refresh_row(
-    store: SQLiteInboundAuthStore,
-    token_hash: str,
-) -> InboundToken | None:
-    """Look up a refresh row by hash regardless of ``used_at`` state.
-
-    Used at /token refresh to read prior scope BEFORE calling ``rotate_refresh``
-    so we can reject scope widening with a precise ``invalid_scope`` error.
-    The replay branch needs this read to RETURN the row (with ``used_at`` set)
-    so that the subsequent rotation call can detect replay and revoke the
-    family — filtering on ``used_at IS NULL`` here would mask replay attempts.
-    """
-    conn = sqlite3.connect(store._db_path)  # noqa: SLF001 -- private path access mirrors store internals
-    try:
-        row = conn.execute(
-            "SELECT token_hash, token_kind, parent_refresh_hash, family_id, client_id, "
-            "app_key, resource, scope, expires_at, issued_at, used_at "
-            "FROM inbound_tokens "
-            "WHERE token_kind = 'refresh' AND token_hash = ?",
-            (token_hash,),
-        ).fetchone()
-    finally:
-        conn.close()
-    if not row:
-        return None
-    return InboundToken(
-        token_hash=row[0],
-        token_kind=row[1],
-        parent_refresh_hash=row[2],
-        family_id=row[3],
-        client_id=row[4],
-        app_key=row[5],
-        resource=row[6],
-        scope=row[7],
-        expires_at=row[8],
-        issued_at=row[9],
-        used_at=row[10],
-    )
+    return JSONResponse(payload.model_dump(exclude_none=True), status_code=HTTPStatus.OK)

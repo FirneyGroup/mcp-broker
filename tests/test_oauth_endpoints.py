@@ -114,6 +114,22 @@ def _request_with_form(form: dict[str, str], headers: dict[str, str] | None = No
     return request
 
 
+def _request_with_json_explicit_ips(
+    body: dict[str, Any], immediate_ip: str, forwarded_for: str | None
+):
+    """Build a JSON-body request mock with separate ``client.host`` and XFF values.
+
+    Lets a test verify how ``_client_ip`` resolves the rate-limit key when the
+    proxy IP and the forwarded IP differ.
+    """
+    request = MagicMock()
+    request.json = AsyncMock(return_value=body)
+    request.headers = {"x-forwarded-for": forwarded_for} if forwarded_for else {}
+    request.query_params = {}
+    request.client.host = immediate_ip
+    return request
+
+
 def _request_with_query(query: dict[str, str]):
     """Build a ``Request``-like mock for GET /authorize."""
     request = MagicMock()
@@ -655,7 +671,7 @@ class TestRevoke:
     async def test_non_owner_silent_200(
         self, endpoints: OAuthServerEndpoints, store: SQLiteInboundAuthStore
     ) -> None:
-        client_id_owner, access, _ = await _mint_initial_pair(endpoints)
+        _, access, _ = await _mint_initial_pair(endpoints)
         other_client_id = await _register_public_client(endpoints)
         response = await endpoints.revoke(
             _request_with_form({"token": access, "client_id": other_client_id})
@@ -670,7 +686,6 @@ class TestRevoke:
         finally:
             conn.close()
         assert access_count == 1
-        del client_id_owner  # silence unused-binding hint
 
     async def test_invalid_client_silent_200(self, endpoints: OAuthServerEndpoints) -> None:
         """RFC 7009 §2.2 — invalid client auth must NOT leak via 401."""
@@ -722,6 +737,126 @@ class TestRateLimiter:
         assert not limiter.allow("client-a")
 
 
+class TestXForwardedForGate:
+    """X-Forwarded-For is honored only when the immediate client is a trusted proxy."""
+
+    async def test_xff_trusted_proxy_honored(
+        self, store: SQLiteInboundAuthStore, connector_names: list[str]
+    ) -> None:
+        # cap=1: a trusted proxy delivering two requests with different XFF
+        # values should NOT trip the limiter, because the rate-limit key is the
+        # forwarded IP, not the proxy IP.
+        endpoints = OAuthServerEndpoints(
+            inbound_auth_store=store,
+            config=_make_config(dcr_rate_limit_per_ip=1, trusted_proxy_ips=["10.0.0.1"]),
+            connector_names_provider=lambda: connector_names,
+            public_url=GENERIC_PUBLIC_URL,
+        )
+        first = await endpoints.register(
+            _request_with_json_explicit_ips(
+                _registration_payload(), immediate_ip="10.0.0.1", forwarded_for="1.2.3.4"
+            )
+        )
+        second = await endpoints.register(
+            _request_with_json_explicit_ips(
+                _registration_payload(), immediate_ip="10.0.0.1", forwarded_for="5.6.7.8"
+            )
+        )
+        assert first.status_code == 201
+        assert second.status_code == 201
+
+    async def test_xff_untrusted_proxy_ignored(
+        self, store: SQLiteInboundAuthStore, connector_names: list[str]
+    ) -> None:
+        # Empty trusted_proxy_ips: the limiter MUST key on request.client.host
+        # (203.0.113.10), not the spoofed XFF values. Two requests from the
+        # same direct client hit the cap of 1.
+        endpoints = OAuthServerEndpoints(
+            inbound_auth_store=store,
+            config=_make_config(dcr_rate_limit_per_ip=1),
+            connector_names_provider=lambda: connector_names,
+            public_url=GENERIC_PUBLIC_URL,
+        )
+        first = await endpoints.register(
+            _request_with_json_explicit_ips(
+                _registration_payload(),
+                immediate_ip="203.0.113.10",
+                forwarded_for="1.2.3.4",
+            )
+        )
+        second = await endpoints.register(
+            _request_with_json_explicit_ips(
+                _registration_payload(),
+                immediate_ip="203.0.113.10",
+                forwarded_for="5.6.7.8",
+            )
+        )
+        assert first.status_code == 201
+        assert second.status_code == 429
+
+
+class TestConfidentialClientAuth:
+    """Confidential clients authenticate via Basic header or client_secret form field."""
+
+    async def test_confidential_client_basic_auth_via_token_endpoint(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        # Register a confidential client and capture its raw secret.
+        register_response = await endpoints.register(
+            _request_with_json(
+                _registration_payload(token_endpoint_auth_method="client_secret_basic")
+            )
+        )
+        register_body = _response_body(register_response)
+        client_id = register_body["client_id"]
+        raw_secret = register_body["client_secret"]
+
+        # Drive the full auth_code flow with this confidential client so we
+        # have a real code to exchange (PKCE rules apply regardless of
+        # client_secret usage).
+        params = _authorize_params(client_id) | {"action": "approve"}
+        approve = await endpoints.authorize_post(_request_with_form(params))
+        code = approve.headers["location"].split("code=", 1)[1].split("&", 1)[0]
+
+        basic_header = base64.b64encode(f"{client_id}:{raw_secret}".encode()).decode()
+        token_response = await endpoints.token(
+            _request_with_form(
+                {
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": GENERIC_REDIRECT_URI,
+                    "code_verifier": _VALID_VERIFIER,
+                    "resource": GENERIC_RESOURCE,
+                },
+                headers={"authorization": f"Basic {basic_header}"},
+            )
+        )
+        assert token_response.status_code == 200
+        assert _response_body(token_response)["access_token"].startswith("mcp_at_")
+
+    async def test_confidential_client_wrong_secret_fails(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        register_response = await endpoints.register(
+            _request_with_json(
+                _registration_payload(token_endpoint_auth_method="client_secret_basic")
+            )
+        )
+        client_id = _response_body(register_response)["client_id"]
+
+        bad_header = base64.b64encode(f"{client_id}:wrong-secret".encode()).decode()
+        # Grant params don't need to be real — the auth check runs before grant
+        # dispatch and short-circuits on the bad secret.
+        response = await endpoints.token(
+            _request_with_form(
+                {"grant_type": "authorization_code"},
+                headers={"authorization": f"Basic {bad_header}"},
+            )
+        )
+        assert response.status_code == 401
+        assert _response_body(response)["error"] == "invalid_client"
+
+
 class TestScopeSubset:
     def test_subset_passes(self) -> None:
         assert _scope_is_subset("a", "a b")
@@ -746,96 +881,6 @@ class TestKindsFromHint:
 
 
 # =============================================================================
-# CONFIG VALIDATION (BrokerSettings.oauth cross-field validator)
-# =============================================================================
-
-
-class TestConfigCrossFieldValidator:
-    def test_app_key_missing_when_enabled_raises(self) -> None:
-        from pydantic import ValidationError
-
-        from broker.config import (
-            BrokerAppConfig,
-            BrokerConfig,
-            BrokerSettings,
-        )
-
-        with pytest.raises(ValidationError):
-            BrokerSettings(
-                broker=BrokerConfig(
-                    admin_key="test-admin-key-long",
-                    encryption_keys=["k"],
-                    state_secret="test-state-secret-key",
-                    oauth=OAuthInboundConfig(enabled=True),
-                ),
-                clients={"acme": {"claude_ai": BrokerAppConfig()}},
-            )
-
-    def test_app_key_not_in_clients_raises(self) -> None:
-        from pydantic import ValidationError
-
-        from broker.config import (
-            BrokerAppConfig,
-            BrokerConfig,
-            BrokerSettings,
-        )
-
-        with pytest.raises(ValidationError):
-            BrokerSettings(
-                broker=BrokerConfig(
-                    admin_key="test-admin-key-long",
-                    encryption_keys=["k"],
-                    state_secret="test-state-secret-key",
-                    oauth=OAuthInboundConfig(enabled=True, app_key="acme:nonexistent"),
-                ),
-                clients={"acme": {"claude_ai": BrokerAppConfig()}},
-            )
-
-    def test_valid_app_key_passes(self) -> None:
-        from broker.config import (
-            BrokerAppConfig,
-            BrokerConfig,
-            BrokerSettings,
-        )
-
-        settings = BrokerSettings(
-            broker=BrokerConfig(
-                admin_key="test-admin-key-long",
-                encryption_keys=["k"],
-                state_secret="test-state-secret-key",
-                oauth=OAuthInboundConfig(enabled=True, app_key="acme:claude_ai"),
-            ),
-            clients={"acme": {"claude_ai": BrokerAppConfig()}},
-        )
-        assert settings.broker.oauth.enabled
-        assert settings.broker.oauth.app_key == "acme:claude_ai"
-
-    def test_disabled_oauth_skips_validation(self) -> None:
-        from broker.config import BrokerConfig, BrokerSettings
-
-        # No clients section + disabled OAuth — must not raise.
-        settings = BrokerSettings(
-            broker=BrokerConfig(
-                admin_key="test-admin-key-long",
-                encryption_keys=["k"],
-                state_secret="test-state-secret-key",
-            ),
-        )
-        assert not settings.broker.oauth.enabled
-
-    def test_issuer_strips_trailing_slash(self) -> None:
-        from broker.config import BrokerConfig
-
-        config = BrokerConfig(
-            admin_key="test-admin-key-long",
-            encryption_keys=["k"],
-            state_secret="test-state-secret-key",
-            public_url="https://broker.example.com/",
-        )
-        assert config.issuer == "https://broker.example.com"
-
-
-# =============================================================================
 # CONCURRENCY (atomic rotation under load)
 # =============================================================================
 
@@ -844,7 +889,7 @@ class TestConcurrentRotation:
     """Two concurrent /token refresh calls on the same token — exactly one wins."""
 
     async def test_at_most_one_concurrent_rotation_succeeds(
-        self, endpoints: OAuthServerEndpoints, store: SQLiteInboundAuthStore
+        self, endpoints: OAuthServerEndpoints
     ) -> None:
         client_id, _, refresh = await _mint_initial_pair(endpoints)
         form = {
@@ -862,4 +907,3 @@ class TestConcurrentRotation:
         assert 200 in status_codes
         assert status_codes.count(200) == 1
         assert status_codes.count(400) == 1
-        del store  # silence unused-binding hint
