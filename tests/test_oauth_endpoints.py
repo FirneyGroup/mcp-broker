@@ -381,6 +381,24 @@ class TestAuthorizePost:
         assert response.status_code == 302
         assert "error=access_denied" in response.headers["location"]
 
+    @pytest.mark.parametrize("bad_action", ["", "surprise", "approve\n", "APPROVE"])
+    async def test_action_must_be_explicit_approve_or_deny(
+        self, endpoints: OAuthServerEndpoints, bad_action: str
+    ) -> None:
+        """Regression: only ``action == "approve"`` mints a code.
+
+        Previously any non-"deny" value (empty, unknown, or case-mismatched)
+        fell through to ``_mint_authorization_code``. PKCE made it
+        unexploitable, but the intent is clearly approve-or-deny and the
+        fallthrough was surprising. The fix rejects unknown values with 400.
+        """
+        client_id = await _register_public_client(endpoints)
+        params = _authorize_params(client_id) | {"action": bad_action}
+        response = await endpoints.authorize_post(_request_with_form(params))
+        assert response.status_code == 400, (
+            f"action={bad_action!r} should have been rejected with 400, got {response.status_code}"
+        )
+
 
 # =============================================================================
 # TOKEN (authorization_code)

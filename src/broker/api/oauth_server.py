@@ -274,11 +274,18 @@ class OAuthServerEndpoints:
         if isinstance(connector_or_error, Response):
             return connector_or_error
 
-        if params.get("action") == "deny":
+        action = params.get("action")
+        if action == "deny":
             audit_log_oauth_event("authorize_deny", client_id=params["client_id"])
             return _redirect_with_error(
                 params["redirect_uri"], params.get("state", ""), "access_denied"
             )
+        # Explicit allowlist: only "approve" mints a code. Empty or unknown
+        # action values previously fell through to mint — harmless under PKCE
+        # (the code is useless without the verifier) but the intent is clearly
+        # approve-or-deny and the fallthrough was surprising.
+        if action != "approve":
+            return _bad_request_html("action must be 'approve' or 'deny'")
 
         return await self._mint_authorization_code(params)
 

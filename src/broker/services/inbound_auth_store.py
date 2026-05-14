@@ -561,10 +561,17 @@ class SQLiteInboundAuthStore:
         )
         if cursor.rowcount == 1:
             return
+        # client_id filter MUST be on the SELECT too, not just the UPDATE.
+        # Without it, a hash match owned by a *different* client whose row
+        # already has used_at != NULL would trigger _revoke_family_on_replay
+        # against the wrong family — a forced-logout attack from any DCR
+        # client that ever obtained another client's prior-generation refresh
+        # token (e.g. via intercepted response logs).
         token_row = conn.execute(
             "SELECT family_id, used_at, expires_at, client_id "
-            "FROM inbound_tokens WHERE token_hash = ? AND token_kind = 'refresh'",
-            (rotation_request.token_hash,),
+            "FROM inbound_tokens WHERE token_hash = ? AND token_kind = 'refresh' "
+            "AND client_id = ?",
+            (rotation_request.token_hash, rotation_request.client_id),
         ).fetchone()
         if token_row and token_row[1] is not None:
             SQLiteInboundAuthStore._revoke_family_on_replay(conn, token_row[0], rotation_request)

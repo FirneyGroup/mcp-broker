@@ -378,6 +378,42 @@ async def test_rotate_refresh_wrong_client_returns_invalid_grant(
         await store.rotate_refresh(rotation_request)
 
 
+async def test_rotate_refresh_cross_client_used_token_does_not_revoke_victim_family(
+    store: SQLiteInboundAuthStore,
+) -> None:
+    """Regression: cross-client hash on a USED refresh must NOT cascade-revoke.
+
+    Original defect: the replay-detection SELECT had no client_id filter. Client
+    A submitting Client B's already-rotated refresh token would:
+      1. UPDATE fail (rowcount=0) — wrong client_id
+      2. SELECT find Client B's row (used_at != NULL)
+      3. Trigger _revoke_family_on_replay against Client B's family
+
+    Forced-logout attack against any DCR client whose prior-generation refresh
+    token leaked. Fix: SELECT filters by client_id too, so a cross-client hash
+    match falls through to "not found" and the victim's family stays intact.
+    """
+    victim_client = generate_client_id()
+    attacker_client = generate_client_id()
+    _, refresh_hash, family_id = await _seed_refresh_pair(store, victim_client)
+
+    # Mark victim's refresh as used by performing a legitimate rotation.
+    await store.rotate_refresh(_rotation_request(refresh_hash, victim_client))
+    family_size_before = _count_family_rows(store._db_path, family_id)
+    assert family_size_before >= 1
+
+    # Attacker submits the victim's used refresh hash with their own client_id.
+    with pytest.raises(InvalidGrantError, match="not found|client mismatch"):
+        await store.rotate_refresh(_rotation_request(refresh_hash, attacker_client))
+
+    # Victim's family MUST be intact — cascade revoke must not have fired.
+    family_size_after = _count_family_rows(store._db_path, family_id)
+    assert family_size_after == family_size_before, (
+        f"Victim's family was cascade-revoked by a cross-client request "
+        f"(before={family_size_before}, after={family_size_after})"
+    )
+
+
 async def test_rotate_refresh_rolls_back_on_mint_failure(
     store: SQLiteInboundAuthStore,
     monkeypatch: pytest.MonkeyPatch,
