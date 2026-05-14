@@ -1,0 +1,26 @@
+# CODEOWNERS — FirneyGroup/mcp-broker
+#
+# Code owners review the listed paths before merge. Combined with branch
+# protection (Settings → Branches → main → "Require review from Code Owners"),
+# this gates changes that could otherwise widen the secret-exposure surface.
+#
+# Last entry per path wins. Use directory-globs (trailing slash) to scope to
+# the dir, file-globs (no slash) to scope to that specific file.
+
+# Workflow files determine what runs in CI and what secrets are injected. A
+# malicious edit here can exfiltrate CLAUDE_CODE_OAUTH_TOKEN or any other
+# repo/org secret. Gate every change.
+/.github/workflows/   @AshleyMaloney
+
+# CODEOWNERS itself — prevent silent removal of the gate.
+/.github/CODEOWNERS   @AshleyMaloney
+
+# Dependency manifests — supply-chain risk. A malicious package addition or
+# version bump can introduce a backdoor that runs in CI with secret access.
+/pyproject.toml       @AshleyMaloney
+/uv.lock              @AshleyMaloney
+
+# Security policy + project invariants — operator-visible documents that
+# downstream users rely on.
+/SECURITY.md          @AshleyMaloney
+/AGENTS.md            @AshleyMaloney
