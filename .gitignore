@@ -13,7 +13,6 @@ data/
 .ruff_cache/
 .venv
 .claude/
-CLAUDE.md
 .gemini/
 GEMINI.md
 docs/
