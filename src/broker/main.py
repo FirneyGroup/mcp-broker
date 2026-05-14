@@ -49,6 +49,7 @@ _key_store: BrokerKeyStore | None = None
 _client_registry: BrokerClientRegistry | None = None
 _connect_token_store: ConnectTokenStore | None = None
 _inbound_auth_store: SQLiteInboundAuthStore | None = None
+_oauth_endpoints: OAuthServerEndpoints | None = None
 
 
 def _get_settings() -> BrokerSettings:
@@ -168,7 +169,8 @@ async def lifespan(app: FastAPI):  # noqa: PLR0915 — startup sequence, all ste
         _key_store, \
         _client_registry, \
         _connect_token_store, \
-        _inbound_auth_store
+        _inbound_auth_store, \
+        _oauth_endpoints
 
     # 1. Load settings. Validation already ran synchronously in broker/__main__.py
     #    before uvicorn started, so a failure here means either (a) settings.yaml
@@ -199,6 +201,15 @@ async def lifespan(app: FastAPI):  # noqa: PLR0915 — startup sequence, all ste
         inbound_store = SQLiteInboundAuthStore(db_path=_settings.broker.oauth.db_path)
         await inbound_store.setup()
         _inbound_auth_store = inbound_store
+        # OAuthServerEndpoints owns the in-memory `_DCRRateLimiter` — it MUST be
+        # a singleton across requests, otherwise the rate-limiter's `_events`
+        # dict resets on every call and the 10/15min/IP cap is unenforceable.
+        _oauth_endpoints = OAuthServerEndpoints(
+            inbound_auth_store=inbound_store,
+            config=_settings.broker.oauth,
+            connector_names_provider=ConnectorRegistry.list_names,
+            public_url=_settings.broker.public_url,
+        )
         logger.info("[Broker] Inbound OAuth enabled (db=%s)", _settings.broker.oauth.db_path)
 
     # 5. Create connect token store (in-memory, single-use tokens for browser OAuth)
@@ -372,21 +383,19 @@ async def admin_refresh_tokens(request: Request):
 
 
 def _get_oauth_endpoints() -> OAuthServerEndpoints:
-    """Lazy-create OAuthServerEndpoints from module-level state.
+    """Return the lifespan-initialized OAuth endpoints.
 
-    Each request goes through this accessor so a flag flip mid-process would
-    pick up the new value — but the middleware reads ``oauth_enabled`` once at
-    import, so a real flip requires a restart.
+    Returns a singleton so the in-memory ``_DCRRateLimiter._events`` dict
+    accumulates state across requests. Constructing a fresh instance per
+    request would reset the counter on every call and silently disable the
+    10/15min/IP rate limit — and silently nullify the ``WEB_CONCURRENCY=1``
+    startup check, which exists precisely because the limiter is in-process.
     """
-    settings = _get_settings()
-    if _inbound_auth_store is None:
-        raise RuntimeError("Inbound auth store not initialized — broker.oauth.enabled may be false")
-    return OAuthServerEndpoints(
-        inbound_auth_store=_inbound_auth_store,
-        config=settings.broker.oauth,
-        connector_names_provider=ConnectorRegistry.list_names,
-        public_url=settings.broker.public_url,
-    )
+    if _oauth_endpoints is None:
+        raise RuntimeError(
+            "OAuthServerEndpoints not initialized — broker.oauth.enabled may be false"
+        )
+    return _oauth_endpoints
 
 
 @app.post("/oauth/register")

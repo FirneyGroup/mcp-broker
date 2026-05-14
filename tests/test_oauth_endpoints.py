@@ -914,3 +914,75 @@ class TestConcurrentRotation:
         assert 200 in status_codes
         assert status_codes.count(200) == 1
         assert status_codes.count(400) == 1
+
+
+# =============================================================================
+# REGRESSION: _get_oauth_endpoints singleton (DCR rate-limit persistence)
+# =============================================================================
+
+
+class TestOAuthEndpointsSingleton:
+    """Regression for the DCR-rate-limiter-reset bug.
+
+    Original defect: ``broker.main._get_oauth_endpoints()`` constructed a fresh
+    ``OAuthServerEndpoints`` on every call, which constructed a fresh
+    ``_DCRRateLimiter`` with ``_events = {}``. The advertised 10/15min/IP
+    cap was therefore never enforced — every request started from zero.
+
+    Fix: the endpoints are initialized once during lifespan and the accessor
+    returns the same instance, so ``_DCRRateLimiter._events`` accumulates
+    state across requests.
+    """
+
+    async def test_factory_returns_same_instance_across_calls(
+        self,
+        store: SQLiteInboundAuthStore,
+        connector_names: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from broker import main as broker_main
+
+        singleton = OAuthServerEndpoints(
+            inbound_auth_store=store,
+            config=_make_config(),
+            connector_names_provider=lambda: connector_names,
+            public_url=GENERIC_PUBLIC_URL,
+        )
+        monkeypatch.setattr(broker_main, "_oauth_endpoints", singleton)
+
+        first = broker_main._get_oauth_endpoints()
+        second = broker_main._get_oauth_endpoints()
+        assert first is second
+        assert first is singleton
+
+    async def test_rate_limiter_state_persists_across_factory_calls(
+        self,
+        store: SQLiteInboundAuthStore,
+        connector_names: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from broker import main as broker_main
+
+        singleton = OAuthServerEndpoints(
+            inbound_auth_store=store,
+            config=_make_config(),
+            connector_names_provider=lambda: connector_names,
+            public_url=GENERIC_PUBLIC_URL,
+        )
+        monkeypatch.setattr(broker_main, "_oauth_endpoints", singleton)
+
+        # Hit the limiter via two separate factory invocations — under the
+        # original bug, each invocation would yield a fresh limiter and the
+        # second call would see an empty `_events` dict for "1.2.3.4".
+        broker_main._get_oauth_endpoints()._dcr_rate_limiter.allow("1.2.3.4")
+        broker_main._get_oauth_endpoints()._dcr_rate_limiter.allow("1.2.3.4")
+        assert len(singleton._dcr_rate_limiter._events["1.2.3.4"]) == 2
+
+    async def test_factory_raises_when_oauth_disabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from broker import main as broker_main
+
+        monkeypatch.setattr(broker_main, "_oauth_endpoints", None)
+        with pytest.raises(RuntimeError, match="OAuthServerEndpoints not initialized"):
+            broker_main._get_oauth_endpoints()
