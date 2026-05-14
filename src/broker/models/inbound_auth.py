@@ -119,12 +119,19 @@ class TokenResponse(BaseModel):
 
 
 class RefreshRotationRequest(BaseModel):
-    """Bundles refresh rotation params to satisfy ruff PLR0913 (max 4 args)."""
+    """Bundles refresh rotation params to satisfy ruff PLR0913 (max 4 args).
+
+    TTLs are supplied per call (sourced from `OAuthInboundConfig`) so the store
+    never hardcodes lifetimes — operator config remains authoritative across
+    every rotation, not just the initial token issue.
+    """
 
     token_hash: str
     client_id: str
     resource: str
     scope: str = Field(..., max_length=SCOPE_MAX_LEN)
+    access_ttl_seconds: int = Field(..., gt=0)
+    refresh_ttl_seconds: int = Field(..., gt=0)
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 

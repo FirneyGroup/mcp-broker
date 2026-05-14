@@ -103,6 +103,8 @@ def _valid_kwargs_for(model_cls: type[BaseModel]) -> dict[str, Any]:
             "client_id": TEST_CLIENT_ID,
             "resource": TEST_RESOURCE_URL,
             "scope": "mcp:read",
+            "access_ttl_seconds": 3600,
+            "refresh_ttl_seconds": 2592000,
         }
     if model_cls is RotatedTokenPair:
         access = _make_inbound_token()
@@ -312,5 +314,7 @@ def test_refresh_rotation_request_valid():
         client_id=TEST_CLIENT_ID,
         resource=TEST_RESOURCE_URL,
         scope="mcp:read",
+        access_ttl_seconds=3600,
+        refresh_ttl_seconds=2592000,
     )
     assert request.client_id == TEST_CLIENT_ID

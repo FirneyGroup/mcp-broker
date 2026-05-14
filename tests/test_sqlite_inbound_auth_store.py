@@ -23,6 +23,7 @@ from broker.models.inbound_auth import (
     RotatedTokenPair,
 )
 from broker.services.inbound_auth_store import (
+    REPLAY_DETECTION_WINDOW_SECONDS,
     InvalidGrantError,
     SQLiteInboundAuthStore,
     generate_access_token,
@@ -79,6 +80,7 @@ async def _seed_refresh_pair(
     client_id: str,
     *,
     refresh_expires_in: int = 2592000,
+    app_key: str = GENERIC_APP_KEY,
 ) -> tuple[str, str, str]:
     """Insert a synthetic (access, refresh) pair and return their hashes + family_id."""
     family_id = generate_family_id()
@@ -90,7 +92,7 @@ async def _seed_refresh_pair(
         token_kind="access",
         family_id=family_id,
         client_id=client_id,
-        app_key=GENERIC_APP_KEY,
+        app_key=app_key,
         resource=GENERIC_RESOURCE,
         scope=GENERIC_SCOPE,
         expires_at=now_ts + 3600,
@@ -101,7 +103,7 @@ async def _seed_refresh_pair(
         token_kind="refresh",
         family_id=family_id,
         client_id=client_id,
-        app_key=GENERIC_APP_KEY,
+        app_key=app_key,
         resource=GENERIC_RESOURCE,
         scope=GENERIC_SCOPE,
         expires_at=now_ts + refresh_expires_in,
@@ -115,6 +117,26 @@ async def _seed_refresh_pair(
     )
     await store.create_token_pair(pair)
     return access_hash, refresh_hash, family_id
+
+
+def _rotation_request(
+    token_hash: str,
+    client_id: str,
+    *,
+    access_ttl: int = 3600,
+    refresh_ttl: int = 2592000,
+    resource: str = GENERIC_RESOURCE,
+    scope: str = GENERIC_SCOPE,
+) -> RefreshRotationRequest:
+    """Build a RefreshRotationRequest with sane defaults for the common case."""
+    return RefreshRotationRequest(
+        token_hash=token_hash,
+        client_id=client_id,
+        resource=resource,
+        scope=scope,
+        access_ttl_seconds=access_ttl,
+        refresh_ttl_seconds=refresh_ttl,
+    )
 
 
 def _count_family_rows(db_path: str, family_id: str) -> int:
@@ -270,18 +292,13 @@ async def test_get_access_does_not_return_refresh_rows(
 async def test_rotate_refresh_happy_path(store: SQLiteInboundAuthStore) -> None:
     client_id = generate_client_id()
     _, refresh_hash, family_id = await _seed_refresh_pair(store, client_id)
-    rotation_request = RefreshRotationRequest(
-        token_hash=refresh_hash,
-        client_id=client_id,
-        resource=GENERIC_RESOURCE,
-        scope=GENERIC_SCOPE,
-    )
+    rotation_request = _rotation_request(refresh_hash, client_id)
     rotated = await store.rotate_refresh(rotation_request)
     assert rotated.access.family_id == family_id
     assert rotated.refresh.family_id == family_id
     assert rotated.refresh.parent_refresh_hash == refresh_hash
     # Old refresh row persists with used_at set (replay detection canary).
-    persisted_refresh = await _read_token(store, refresh_hash)
+    persisted_refresh = _read_token(store, refresh_hash)
     assert persisted_refresh is not None
     assert persisted_refresh["used_at"] is not None
 
@@ -292,12 +309,7 @@ async def test_rotate_refresh_replay_revokes_family(
     """Replaying an already-used refresh wipes the entire family."""
     client_id = generate_client_id()
     _, refresh_hash, family_id = await _seed_refresh_pair(store, client_id)
-    rotation_request = RefreshRotationRequest(
-        token_hash=refresh_hash,
-        client_id=client_id,
-        resource=GENERIC_RESOURCE,
-        scope=GENERIC_SCOPE,
-    )
+    rotation_request = _rotation_request(refresh_hash, client_id)
     await store.rotate_refresh(rotation_request)
     # Family now has: old access + old refresh (used_at set) + new access + new refresh.
     assert _count_family_rows(store._db_path, family_id) == 4
@@ -318,12 +330,7 @@ async def test_rotate_refresh_concurrent_at_most_one_succeeds(
     """
     client_id = generate_client_id()
     _, refresh_hash, family_id = await _seed_refresh_pair(store, client_id)
-    rotation_request = RefreshRotationRequest(
-        token_hash=refresh_hash,
-        client_id=client_id,
-        resource=GENERIC_RESOURCE,
-        scope=GENERIC_SCOPE,
-    )
+    rotation_request = _rotation_request(refresh_hash, client_id)
 
     async def rotate_in_thread() -> RotatedTokenPair:
         # Wrap the (sync-under-the-hood) async method in a thread so the two
@@ -343,12 +350,7 @@ async def test_rotate_refresh_concurrent_at_most_one_succeeds(
 async def test_rotate_refresh_missing_returns_invalid_grant(
     store: SQLiteInboundAuthStore,
 ) -> None:
-    rotation_request = RefreshRotationRequest(
-        token_hash="hash-of-nonexistent-token",
-        client_id=generate_client_id(),
-        resource=GENERIC_RESOURCE,
-        scope=GENERIC_SCOPE,
-    )
+    rotation_request = _rotation_request("hash-of-nonexistent-token", generate_client_id())
     with pytest.raises(InvalidGrantError, match="not found"):
         await store.rotate_refresh(rotation_request)
 
@@ -359,12 +361,7 @@ async def test_rotate_refresh_expired_returns_invalid_grant(
     client_id = generate_client_id()
     # Seed with a refresh that's already expired (negative TTL).
     _, refresh_hash, _ = await _seed_refresh_pair(store, client_id, refresh_expires_in=-10)
-    rotation_request = RefreshRotationRequest(
-        token_hash=refresh_hash,
-        client_id=client_id,
-        resource=GENERIC_RESOURCE,
-        scope=GENERIC_SCOPE,
-    )
+    rotation_request = _rotation_request(refresh_hash, client_id)
     with pytest.raises(InvalidGrantError):
         await store.rotate_refresh(rotation_request)
 
@@ -376,12 +373,7 @@ async def test_rotate_refresh_wrong_client_returns_invalid_grant(
     issued_client_id = generate_client_id()
     other_client_id = generate_client_id()
     _, refresh_hash, _ = await _seed_refresh_pair(store, issued_client_id)
-    rotation_request = RefreshRotationRequest(
-        token_hash=refresh_hash,
-        client_id=other_client_id,
-        resource=GENERIC_RESOURCE,
-        scope=GENERIC_SCOPE,
-    )
+    rotation_request = _rotation_request(refresh_hash, other_client_id)
     with pytest.raises(InvalidGrantError):
         await store.rotate_refresh(rotation_request)
 
@@ -401,16 +393,11 @@ async def test_rotate_refresh_rolls_back_on_mint_failure(
         raise RuntimeError("simulated crash after UPDATE used_at")
 
     monkeypatch.setattr(SQLiteInboundAuthStore, "_mint_replacement_pair", staticmethod(boom))
-    rotation_request = RefreshRotationRequest(
-        token_hash=refresh_hash,
-        client_id=client_id,
-        resource=GENERIC_RESOURCE,
-        scope=GENERIC_SCOPE,
-    )
+    rotation_request = _rotation_request(refresh_hash, client_id)
     with pytest.raises(RuntimeError, match="simulated crash"):
         await store.rotate_refresh(rotation_request)
     # Rollback must have restored used_at to NULL.
-    persisted = await _read_token(store, refresh_hash)
+    persisted = _read_token(store, refresh_hash)
     assert persisted is not None
     assert persisted["used_at"] is None
     # Sanity: retry without the monkeypatch succeeds.
@@ -433,7 +420,7 @@ async def test_revoke_token_access_deletes_only_that_row(
     assert await store.get_access(access_hash) is None
     # Refresh and family intact.
     assert _count_family_rows(store._db_path, family_id) == 1
-    persisted_refresh = await _read_token(store, refresh_hash)
+    persisted_refresh = _read_token(store, refresh_hash)
     assert persisted_refresh is not None
 
 
@@ -485,7 +472,7 @@ async def test_delete_all_for_app_scoped_to_target_app(
     _, _, family_a = await _seed_refresh_pair(store, client_a.client_id)
     # App B uses a different app_key — manually wire a token pair.
     other_app_key = "acme:web"
-    _, _, family_b = await _seed_refresh_pair_with_app(store, generate_client_id(), other_app_key)
+    _, _, family_b = await _seed_refresh_pair(store, generate_client_id(), app_key=other_app_key)
     other_code_hash = _sha256("code-app-b")
     other_code = OAuthCode(
         client_id=client_a.client_id,  # client itself isn't app-bound; this is fine
@@ -564,18 +551,155 @@ async def test_cleanup_expired_deletes_expired_tokens_only(
     assert await store.get_access(expired_access) is None
 
 
+async def test_cleanup_expired_preserves_used_refresh_within_replay_window(
+    store: SQLiteInboundAuthStore,
+) -> None:
+    """Used refresh rows must persist past expiry inside the replay window so
+    replay attempts trigger family revoke instead of falling through as
+    "not found". Without this carve-out, an attacker who waits past the row's
+    natural expiry can hide the replay."""
+    client_id = generate_client_id()
+    _, refresh_hash, family_id = await _seed_refresh_pair(store, client_id)
+    now_ts = int(time.time())
+    # Mark used 1 day ago; expire 1 hour ago — squarely inside the 7-day window.
+    _force_refresh_state(store, refresh_hash, used_at=now_ts - 86400, expires_at=now_ts - 3600)
+    await store.cleanup_expired()
+    persisted = _read_token(store, refresh_hash)
+    assert persisted is not None, "used refresh row was reaped inside replay window"
+    # Replay attempt against the preserved row must now revoke the family.
+    rotation_request = _rotation_request(refresh_hash, client_id)
+    with pytest.raises(InvalidGrantError, match="replay"):
+        await store.rotate_refresh(rotation_request)
+    assert _count_family_rows(store._db_path, family_id) == 0
+
+
+async def test_cleanup_expired_purges_used_refresh_outside_replay_window(
+    store: SQLiteInboundAuthStore,
+) -> None:
+    """Past the 7-day replay window the row is reaped — operators get table
+    growth bounded, and the replay-detection coverage only extends so far."""
+    client_id = generate_client_id()
+    _, refresh_hash, _ = await _seed_refresh_pair(store, client_id)
+    now_ts = int(time.time())
+    outside_window = now_ts - REPLAY_DETECTION_WINDOW_SECONDS - 1
+    _force_refresh_state(store, refresh_hash, used_at=outside_window, expires_at=outside_window)
+    await store.cleanup_expired()
+    assert _read_token(store, refresh_hash) is None
+
+
+async def test_rotate_refresh_uses_provided_ttls(store: SQLiteInboundAuthStore) -> None:
+    """TTLs come from the rotation request — never hardcoded. Operator config
+    must propagate to every rotation, not just the initial issue."""
+    client_id = generate_client_id()
+    _, refresh_hash, _ = await _seed_refresh_pair(store, client_id)
+    custom_access_ttl = 600
+    custom_refresh_ttl = 86400 * 14
+    # Fix `now` so we can assert on expires_at without flakiness.
+    fixed_now = int(time.time())
+    rotation_request = _rotation_request(
+        refresh_hash,
+        client_id,
+        access_ttl=custom_access_ttl,
+        refresh_ttl=custom_refresh_ttl,
+    )
+    rotated = await store.rotate_refresh(rotation_request, now_ts=fixed_now)
+    assert rotated.access.expires_at == fixed_now + custom_access_ttl
+    assert rotated.refresh.expires_at == fixed_now + custom_refresh_ttl
+
+
+# =============================================================================
+# verify_client_secret
+# =============================================================================
+
+
+async def test_verify_client_secret_happy_path(store: SQLiteInboundAuthStore) -> None:
+    registration = await store.create_client(
+        _registration(auth_method="client_secret_basic"), client_ip=None
+    )
+    assert registration.client_secret is not None
+    assert await store.verify_client_secret(registration.client_id, registration.client_secret)
+
+
+async def test_verify_client_secret_wrong_secret(store: SQLiteInboundAuthStore) -> None:
+    registration = await store.create_client(
+        _registration(auth_method="client_secret_basic"), client_ip=None
+    )
+    assert not await store.verify_client_secret(registration.client_id, "not-the-real-secret")
+
+
+async def test_verify_client_secret_public_client_returns_false(
+    store: SQLiteInboundAuthStore,
+) -> None:
+    """Public clients (auth_method='none') have no secret_hash — any supplied secret fails."""
+    registration = await store.create_client(_registration(), client_ip=None)
+    assert not await store.verify_client_secret(registration.client_id, "any-string")
+
+
+async def test_verify_client_secret_unknown_client_returns_false(
+    store: SQLiteInboundAuthStore,
+) -> None:
+    assert not await store.verify_client_secret("mcp_client_does_not_exist", "any-secret")
+
+
+async def test_verify_client_secret_empty_inputs_return_false(
+    store: SQLiteInboundAuthStore,
+) -> None:
+    """Empty inputs short-circuit before the DB lookup."""
+    assert not await store.verify_client_secret("", "anything")
+    assert not await store.verify_client_secret("mcp_client_xyz", "")
+
+
+# =============================================================================
+# get_refresh_row
+# =============================================================================
+
+
+async def test_get_refresh_row_returns_unused(store: SQLiteInboundAuthStore) -> None:
+    client_id = generate_client_id()
+    _, refresh_hash, _ = await _seed_refresh_pair(store, client_id)
+    fetched = await store.get_refresh_row(refresh_hash)
+    assert fetched is not None
+    assert fetched.token_kind == "refresh"
+    assert fetched.used_at is None
+
+
+async def test_get_refresh_row_returns_used(store: SQLiteInboundAuthStore) -> None:
+    """Used refresh rows must remain readable — the /token endpoint needs them
+    to detect replay attempts at the precondition layer."""
+    client_id = generate_client_id()
+    _, refresh_hash, _ = await _seed_refresh_pair(store, client_id)
+    await store.rotate_refresh(_rotation_request(refresh_hash, client_id))
+    fetched = await store.get_refresh_row(refresh_hash)
+    assert fetched is not None
+    assert fetched.used_at is not None
+
+
+async def test_get_refresh_row_unknown_returns_none(store: SQLiteInboundAuthStore) -> None:
+    assert await store.get_refresh_row("hash-of-nonexistent") is None
+
+
+async def test_get_refresh_row_does_not_return_access_rows(
+    store: SQLiteInboundAuthStore,
+) -> None:
+    """The query must filter by token_kind='refresh' to prevent access-token hashes
+    from validating as refresh rows."""
+    client_id = generate_client_id()
+    access_hash, _, _ = await _seed_refresh_pair(store, client_id)
+    assert await store.get_refresh_row(access_hash) is None
+
+
 # =============================================================================
 # HELPERS used only inside tests
 # =============================================================================
 
 
-async def _read_token(store: SQLiteInboundAuthStore, token_hash: str) -> dict[str, object] | None:
+def _read_token(store: SQLiteInboundAuthStore, token_hash: str) -> dict[str, object] | None:
     """Read a token row directly. Returns dict or None. Used for state assertions
     that bypass the store API (verifying rollback, used_at, etc.)."""
     conn = sqlite3.connect(store._db_path)
     try:
         row = conn.execute(
-            "SELECT token_hash, token_kind, used_at, family_id "
+            "SELECT token_hash, token_kind, used_at, family_id, expires_at "
             "FROM inbound_tokens WHERE token_hash = ?",
             (token_hash,),
         ).fetchone()
@@ -583,46 +707,29 @@ async def _read_token(store: SQLiteInboundAuthStore, token_hash: str) -> dict[st
         conn.close()
     if not row:
         return None
-    return {"token_hash": row[0], "token_kind": row[1], "used_at": row[2], "family_id": row[3]}
+    return {
+        "token_hash": row[0],
+        "token_kind": row[1],
+        "used_at": row[2],
+        "family_id": row[3],
+        "expires_at": row[4],
+    }
 
 
-async def _seed_refresh_pair_with_app(
+def _force_refresh_state(
     store: SQLiteInboundAuthStore,
-    client_id: str,
-    app_key: str,
-) -> tuple[str, str, str]:
-    """Variant of _seed_refresh_pair scoped to a different app_key."""
-    family_id = generate_family_id()
-    _, access_hash = generate_access_token()
-    _, refresh_hash = generate_refresh_token()
-    now_ts = int(time.time())
-    access_token_row = InboundToken(
-        token_hash=access_hash,
-        token_kind="access",
-        family_id=family_id,
-        client_id=client_id,
-        app_key=app_key,
-        resource=GENERIC_RESOURCE,
-        scope=GENERIC_SCOPE,
-        expires_at=now_ts + 3600,
-        issued_at=now_ts,
-    )
-    refresh_token_row = InboundToken(
-        token_hash=refresh_hash,
-        token_kind="refresh",
-        family_id=family_id,
-        client_id=client_id,
-        app_key=app_key,
-        resource=GENERIC_RESOURCE,
-        scope=GENERIC_SCOPE,
-        expires_at=now_ts + 2592000,
-        issued_at=now_ts,
-    )
-    pair = RotatedTokenPair(
-        access=access_token_row,
-        refresh=refresh_token_row,
-        raw_access_token="placeholder",
-        raw_refresh_token="placeholder",
-    )
-    await store.create_token_pair(pair)
-    return access_hash, refresh_hash, family_id
+    token_hash: str,
+    *,
+    used_at: int,
+    expires_at: int,
+) -> None:
+    """Bypass the store to set `used_at` and `expires_at` directly for cleanup tests."""
+    conn = sqlite3.connect(store._db_path)
+    try:
+        conn.execute(
+            "UPDATE inbound_tokens SET used_at = ?, expires_at = ? WHERE token_hash = ?",
+            (used_at, expires_at, token_hash),
+        )
+        conn.commit()
+    finally:
+        conn.close()

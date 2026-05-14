@@ -16,16 +16,19 @@ sticky-session routing or a shared backing store.
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import hmac
 import json
 import logging
 import secrets
 import sqlite3
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
+
+from pydantic import BaseModel, ConfigDict
 
 from broker.models.inbound_auth import (
     InboundToken,
@@ -42,6 +45,7 @@ from broker.services.inbound_oauth_helpers import (
     REFRESH_TOKEN_PREFIX,
     audit_log_oauth_event,
     hash_prefix,
+    sha256_hex,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,6 +57,37 @@ ACCESS_TOKEN_BYTES = 32
 REFRESH_TOKEN_BYTES = 32
 CLIENT_ID_BYTES = 32
 FAMILY_ID_BYTES = 16
+
+# Window after a refresh row's `expires_at` during which we retain rows with
+# `used_at NOT NULL` so replay attempts past natural expiry still surface as
+# OAuth 2.1 §4.3.1 replay (family revoke) rather than fall through as "not
+# found". 7 days balances replay-window coverage against table growth.
+REPLAY_DETECTION_WINDOW_SECONDS = 7 * 24 * 3600
+
+# === INTERNAL ARG BUNDLES ===
+
+
+class _ClientInsertContext(BaseModel):
+    """Per-call constants for `_persist_client_row`. Internal — not a public model."""
+
+    client_id: str
+    secret_hash: str | None
+    now_iso: str
+    client_ip: str | None
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class _NewPairContext(BaseModel):
+    """Family + app + freshly-minted hashes shared by `_build_access_row` and
+    `_build_refresh_row`. Internal — not a public model."""
+
+    family_id: str
+    app_key: str
+    access_hash: str
+    refresh_hash: str
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
 
 # === EXCEPTIONS ===
@@ -69,11 +104,6 @@ class InvalidGrantError(RuntimeError):
 # === TOKEN GENERATION HELPERS ===
 
 
-def _sha256_hex(value: str) -> str:
-    """SHA-256 hex digest. Used for every inbound token hash on disk."""
-    return hashlib.sha256(value.encode()).hexdigest()
-
-
 def generate_client_id() -> str:
     """RFC 7591 client_id — prefixed for traceability in logs and ad-hoc SQL."""
     return f"{CLIENT_ID_PREFIX}{secrets.token_urlsafe(CLIENT_ID_BYTES)}"
@@ -82,19 +112,19 @@ def generate_client_id() -> str:
 def generate_client_secret() -> tuple[str, str]:
     """Returns (raw_secret, sha256_hash). Raw shown once at registration."""
     raw_secret = secrets.token_urlsafe(CLIENT_SECRET_BYTES)
-    return raw_secret, _sha256_hex(raw_secret)
+    return raw_secret, sha256_hex(raw_secret)
 
 
 def generate_access_token() -> tuple[str, str]:
     """Returns (raw_token, sha256_hash). Raw given to client; hash stored."""
     raw_token = f"{ACCESS_TOKEN_PREFIX}{secrets.token_urlsafe(ACCESS_TOKEN_BYTES)}"
-    return raw_token, _sha256_hex(raw_token)
+    return raw_token, sha256_hex(raw_token)
 
 
 def generate_refresh_token() -> tuple[str, str]:
     """Returns (raw_token, sha256_hash). Raw given to client; hash stored."""
     raw_token = f"{REFRESH_TOKEN_PREFIX}{secrets.token_urlsafe(REFRESH_TOKEN_BYTES)}"
-    return raw_token, _sha256_hex(raw_token)
+    return raw_token, sha256_hex(raw_token)
 
 
 def generate_family_id() -> str:
@@ -116,20 +146,35 @@ class SQLiteInboundAuthStore:
     """
 
     def __init__(self, db_path: str = "./data/inbound_oauth.db") -> None:
+        """Construct a store rooted at `db_path` (created on first `setup()`)."""
         self._db_path = db_path
+
+    # === CONNECTION HELPER ===
+
+    @contextmanager
+    def _db_conn(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+        """Yield a connection; close on exit.
+
+        `immediate=True` switches to autocommit mode (`isolation_level=None`)
+        for callers that issue explicit `BEGIN IMMEDIATE` — namely
+        `consume_code` and `_rotate_under_lock`. All other callers use the
+        sqlite3 default (deferred) so writes wrap implicitly.
+        """
+        conn = sqlite3.connect(self._db_path, isolation_level=None if immediate else "DEFERRED")
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     # === LIFECYCLE ===
 
     async def setup(self) -> None:
         """Create tables and indexes if missing. Idempotent."""
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self._db_path)
-        try:
+        with self._db_conn() as conn:
             self._create_schema(conn)
             conn.commit()
             logger.info("[InboundAuthStore] Initialized: %s", self._db_path)
-        finally:
-            conn.close()
 
     @staticmethod
     def _create_schema(conn: sqlite3.Connection) -> None:
@@ -189,51 +234,89 @@ class SQLiteInboundAuthStore:
             "CREATE INDEX IF NOT EXISTS idx_inbound_tokens_expires ON inbound_tokens(expires_at)"
         )
 
+    # === ROW → MODEL HELPERS ===
+
+    @staticmethod
+    def _row_to_inbound_token(row: tuple) -> InboundToken:
+        """Unpack the 11-column `inbound_tokens` SELECT into the model."""
+        return InboundToken(
+            token_hash=row[0],
+            token_kind=row[1],
+            parent_refresh_hash=row[2],
+            family_id=row[3],
+            client_id=row[4],
+            app_key=row[5],
+            resource=row[6],
+            scope=row[7],
+            expires_at=row[8],
+            issued_at=row[9],
+            used_at=row[10],
+        )
+
+    @staticmethod
+    def _row_to_oauth_code(row: tuple) -> OAuthCode:
+        """Unpack the 7-column `oauth_codes` SELECT into the model."""
+        return OAuthCode(
+            client_id=row[0],
+            app_key=row[1],
+            redirect_uri=row[2],
+            resource=row[3],
+            scope=row[4],
+            code_challenge=row[5],
+            expires_at=row[6],
+        )
+
+    @staticmethod
+    def _row_to_oauth_client(row: tuple) -> OAuthClient:
+        """Unpack the 8-column `oauth_clients` SELECT into the model."""
+        return OAuthClient(
+            client_id=row[0],
+            token_endpoint_auth_method=row[1],
+            redirect_uris=json.loads(row[2]),
+            grant_types=json.loads(row[3]),
+            response_types=json.loads(row[4]),
+            scope=row[5],
+            client_name=row[6],
+            created_at=row[7],
+        )
+
     # === CLIENTS (DCR) ===
 
     async def create_client(
         self, request: RegistrationRequest, client_ip: str | None
     ) -> RegistrationResponse:
-        """RFC 7591 dynamic client registration.
-
-        Confidential clients (auth method != "none") receive a one-shot
-        client_secret — only the hash is persisted.
-        """
+        """RFC 7591 dynamic client registration. Confidential clients receive a
+        one-shot `client_secret`; only the hash is persisted."""
         client_id = generate_client_id()
         raw_secret, secret_hash = self._mint_secret_if_confidential(
             request.token_endpoint_auth_method
         )
-        now_iso = datetime.now(UTC).isoformat()
-        issued_at = int(time.time())
-        conn = sqlite3.connect(self._db_path)
-        try:
-            conn.execute(
-                "INSERT INTO oauth_clients (client_id, client_secret_hash, "
-                "token_endpoint_auth_method, redirect_uris, grant_types, response_types, "
-                "scope, client_name, created_at, created_ip) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    client_id,
-                    secret_hash,
-                    request.token_endpoint_auth_method,
-                    json.dumps(request.redirect_uris),
-                    json.dumps(request.grant_types),
-                    json.dumps(request.response_types),
-                    request.scope,
-                    request.client_name,
-                    now_iso,
-                    client_ip,
-                ),
-            )
+        insert_context = _ClientInsertContext(
+            client_id=client_id,
+            secret_hash=secret_hash,
+            now_iso=datetime.now(UTC).isoformat(),
+            client_ip=client_ip,
+        )
+        with self._db_conn() as conn:
+            self._persist_client_row(conn, request, insert_context)
             conn.commit()
-        finally:
-            conn.close()
         audit_log_oauth_event(
             "dcr_register",
             client_id=client_id,
             redirect_uris=request.redirect_uris,
             ip=client_ip,
         )
+        return self._build_registration_response(client_id, raw_secret, int(time.time()), request)
+
+    @staticmethod
+    def _build_registration_response(
+        client_id: str,
+        raw_secret: str | None,
+        issued_at: int,
+        request: RegistrationRequest,
+    ) -> RegistrationResponse:
+        """Assemble the RFC 7591 §3.2.1 response. Echoes back the registration
+        metadata so the client can confirm what was persisted."""
         return RegistrationResponse(
             client_id=client_id,
             client_id_issued_at=issued_at,
@@ -248,6 +331,32 @@ class SQLiteInboundAuthStore:
         )
 
     @staticmethod
+    def _persist_client_row(
+        conn: sqlite3.Connection,
+        request: RegistrationRequest,
+        insert_context: _ClientInsertContext,
+    ) -> None:
+        """Single-row insert for `oauth_clients`. JSON-encodes list columns."""
+        conn.execute(
+            "INSERT INTO oauth_clients (client_id, client_secret_hash, "
+            "token_endpoint_auth_method, redirect_uris, grant_types, response_types, "
+            "scope, client_name, created_at, created_ip) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                insert_context.client_id,
+                insert_context.secret_hash,
+                request.token_endpoint_auth_method,
+                json.dumps(request.redirect_uris),
+                json.dumps(request.grant_types),
+                json.dumps(request.response_types),
+                request.scope,
+                request.client_name,
+                insert_context.now_iso,
+                insert_context.client_ip,
+            ),
+        )
+
+    @staticmethod
     def _mint_secret_if_confidential(auth_method: str) -> tuple[str | None, str | None]:
         """Public clients (`none`) get no secret; everyone else gets one + its hash."""
         if auth_method == "none":
@@ -256,36 +365,40 @@ class SQLiteInboundAuthStore:
 
     async def get_client(self, client_id: str) -> OAuthClient | None:
         """Lookup a DCR'd client by id. None on miss."""
-        conn = sqlite3.connect(self._db_path)
-        try:
-            cursor = conn.execute(
+        with self._db_conn() as conn:
+            row = conn.execute(
                 "SELECT client_id, token_endpoint_auth_method, redirect_uris, "
                 "grant_types, response_types, scope, client_name, created_at "
                 "FROM oauth_clients WHERE client_id = ?",
                 (client_id,),
-            )
-            row = cursor.fetchone()
-        finally:
-            conn.close()
+            ).fetchone()
         if not row:
             return None
-        return OAuthClient(
-            client_id=row[0],
-            token_endpoint_auth_method=row[1],
-            redirect_uris=json.loads(row[2]),
-            grant_types=json.loads(row[3]),
-            response_types=json.loads(row[4]),
-            scope=row[5],
-            client_name=row[6],
-            created_at=row[7],
-        )
+        return self._row_to_oauth_client(row)
+
+    async def verify_client_secret(self, client_id: str, supplied_secret: str) -> bool:
+        """Constant-time verify a confidential client's secret.
+
+        Returns False on unknown client_id, public client (no secret_hash), or
+        mismatch. Keeps the sqlite path inside the store rather than leaking
+        `_db_path` to callers that need to authenticate clients.
+        """
+        if not client_id or not supplied_secret:
+            return False
+        with self._db_conn() as conn:
+            row = conn.execute(
+                "SELECT client_secret_hash FROM oauth_clients WHERE client_id = ?",
+                (client_id,),
+            ).fetchone()
+        if not row or row[0] is None:
+            return False
+        return hmac.compare_digest(row[0], sha256_hex(supplied_secret))
 
     # === AUTHORIZATION CODES ===
 
     async def create_code(self, code_hash: str, oauth_code: OAuthCode) -> None:
         """Persist a freshly-minted auth code. PRIMARY KEY collision raises IntegrityError."""
-        conn = sqlite3.connect(self._db_path)
-        try:
+        with self._db_conn() as conn:
             conn.execute(
                 "INSERT INTO oauth_codes (code_hash, client_id, app_key, redirect_uri, "
                 "resource, scope, code_challenge, expires_at) "
@@ -302,8 +415,6 @@ class SQLiteInboundAuthStore:
                 ),
             )
             conn.commit()
-        finally:
-            conn.close()
 
     async def consume_code(self, code_hash: str, client_id: str) -> OAuthCode | None:
         """Atomic SELECT-then-DELETE under BEGIN IMMEDIATE. Single-use.
@@ -313,34 +424,34 @@ class SQLiteInboundAuthStore:
         cannot leak whether the code existed.
         """
         now_ts = int(time.time())
-        conn = sqlite3.connect(self._db_path, isolation_level=None)
+        with self._db_conn(immediate=True) as conn:
+            row = self._consume_code_under_lock(conn, code_hash, client_id, now_ts)
+        return self._row_to_oauth_code(row) if row else None
+
+    @staticmethod
+    def _consume_code_under_lock(
+        conn: sqlite3.Connection,
+        code_hash: str,
+        client_id: str,
+        now_ts: int,
+    ) -> tuple | None:
+        """SELECT-then-DELETE wrapped in BEGIN IMMEDIATE. Returns row or None."""
+        conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                row = conn.execute(
-                    "SELECT client_id, app_key, redirect_uri, resource, scope, "
-                    "code_challenge, expires_at FROM oauth_codes WHERE code_hash = ?",
-                    (code_hash,),
-                ).fetchone()
-                if not row or row[6] < now_ts or row[0] != client_id:
-                    conn.execute("COMMIT")
-                    return None
-                conn.execute("DELETE FROM oauth_codes WHERE code_hash = ?", (code_hash,))
+            row = conn.execute(
+                "SELECT client_id, app_key, redirect_uri, resource, scope, "
+                "code_challenge, expires_at FROM oauth_codes WHERE code_hash = ?",
+                (code_hash,),
+            ).fetchone()
+            if not row or row[6] < now_ts or row[0] != client_id:
                 conn.execute("COMMIT")
-            except Exception:
-                conn.execute("ROLLBACK")
-                raise
-        finally:
-            conn.close()
-        return OAuthCode(
-            client_id=row[0],
-            app_key=row[1],
-            redirect_uri=row[2],
-            resource=row[3],
-            scope=row[4],
-            code_challenge=row[5],
-            expires_at=row[6],
-        )
+                return None
+            conn.execute("DELETE FROM oauth_codes WHERE code_hash = ?", (code_hash,))
+            conn.execute("COMMIT")
+            return row
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     # === TOKENS ===
 
@@ -352,13 +463,10 @@ class SQLiteInboundAuthStore:
         `pair` are intentionally NOT persisted — they exist on the model so
         the caller can return them to the client.
         """
-        conn = sqlite3.connect(self._db_path)
-        try:
+        with self._db_conn() as conn:
             self._insert_token_row(conn, pair.access)
             self._insert_token_row(conn, pair.refresh)
             conn.commit()
-        finally:
-            conn.close()
         audit_log_oauth_event(
             "token_issue",
             client_id=pair.access.client_id,
@@ -397,24 +505,13 @@ class SQLiteInboundAuthStore:
     ) -> RotatedTokenPair:
         """Atomic refresh-token rotation per OAuth 2.1 §4.3.1.
 
-        Concurrency guarantee: under `BEGIN IMMEDIATE`, at most one concurrent
-        caller succeeds in flipping `used_at` from NULL → not-NULL. Losing
-        callers see `used_at NOT NULL` and trigger family revoke (the DELETE +
-        COMMIT happens inside `_mark_refresh_used_or_replay` itself, so the
-        revoke is durable even though the caller still raises).
-
-        Deviation from the plan's pseudocode: we do NOT delete the consumed
-        refresh row on success. Replay detection requires that row to persist
-        (with `used_at` set) until `cleanup_expired` reaps it at its original
-        expiry — otherwise the second caller's UPDATE sees an empty row and
-        falls into the "not found" branch instead of the replay branch.
+        See `_rotate_under_lock` for the BEGIN-IMMEDIATE proof obligation and
+        `cleanup_expired` for why the consumed refresh row is NOT deleted on
+        success (replay detection requires it to persist).
         """
         effective_now = now_ts if now_ts is not None else int(time.time())
-        conn = sqlite3.connect(self._db_path, isolation_level=None)
-        try:
+        with self._db_conn(immediate=True) as conn:
             rotated_pair = self._rotate_under_lock(conn, rotation_request, effective_now)
-        finally:
-            conn.close()
         audit_log_oauth_event(
             "token_refresh_rotate",
             client_id=rotated_pair.access.client_id,
@@ -430,9 +527,9 @@ class SQLiteInboundAuthStore:
         rotation_request: RefreshRotationRequest,
         now_ts: int,
     ) -> RotatedTokenPair:
-        """BEGIN IMMEDIATE + mark-or-replay + mint, with ROLLBACK only on the
-        happy-path branch. The replay branch commits its own DELETE before
-        raising — see `_mark_refresh_used_or_replay`."""
+        """BEGIN IMMEDIATE + mark-or-replay + mint. On replay the inner branch
+        commits its family-revoke DELETE before raising, so the outer
+        rollback-on-exception cannot un-revoke it."""
         conn.execute("BEGIN IMMEDIATE")
         try:
             SQLiteInboundAuthStore._mark_refresh_used_or_replay(conn, rotation_request, now_ts)
@@ -442,9 +539,9 @@ class SQLiteInboundAuthStore:
             conn.execute("COMMIT")
             return rotated_pair
         except Exception:
-            # Best-effort rollback. The replay branch has already committed
-            # its family-revoke DELETE; sqlite raises OperationalError if no
-            # transaction is open — suppress so we propagate the original error.
+            # Best-effort rollback. Replay branch already committed; sqlite
+            # raises OperationalError if no transaction is open — suppress so
+            # we propagate the original error.
             with contextlib.suppress(sqlite3.OperationalError):
                 conn.execute("ROLLBACK")
             raise
@@ -455,12 +552,7 @@ class SQLiteInboundAuthStore:
         rotation_request: RefreshRotationRequest,
         now_ts: int,
     ) -> None:
-        """Conditional UPDATE marks the refresh row used. Loss → replay-or-miss.
-
-        On replay we COMMIT the family-revoke DELETE before raising so the
-        outer ROLLBACK on the exception path cannot un-revoke the family.
-        Per OAuth 2.1 §4.3.1, replay detection must be durable.
-        """
+        """Conditional UPDATE marks the refresh row used. Loss → replay-or-miss."""
         cursor = conn.execute(
             "UPDATE inbound_tokens SET used_at = ? "
             "WHERE token_hash = ? AND token_kind = 'refresh' "
@@ -475,17 +567,30 @@ class SQLiteInboundAuthStore:
             (rotation_request.token_hash,),
         ).fetchone()
         if token_row and token_row[1] is not None:
-            family_id = token_row[0]
-            conn.execute("DELETE FROM inbound_tokens WHERE family_id = ?", (family_id,))
-            conn.execute("COMMIT")
-            audit_log_oauth_event(
-                "token_refresh_replay_revoke",
-                client_id=rotation_request.client_id,
-                family_id=family_id,
-                hash_prefix=hash_prefix(rotation_request.token_hash),
-            )
+            SQLiteInboundAuthStore._revoke_family_on_replay(conn, token_row[0], rotation_request)
             raise InvalidGrantError("refresh replay; family revoked")
         raise InvalidGrantError("refresh not found, expired, or client mismatch")
+
+    @staticmethod
+    def _revoke_family_on_replay(
+        conn: sqlite3.Connection,
+        family_id: str,
+        rotation_request: RefreshRotationRequest,
+    ) -> None:
+        """Cascade-delete the family and COMMIT so revoke is durable.
+
+        Per OAuth 2.1 §4.3.1 replay detection must be durable — committing
+        here ensures the outer rollback (on the raised `InvalidGrantError`)
+        cannot resurrect the revoked family.
+        """
+        conn.execute("DELETE FROM inbound_tokens WHERE family_id = ?", (family_id,))
+        conn.execute("COMMIT")
+        audit_log_oauth_event(
+            "token_refresh_replay_revoke",
+            client_id=rotation_request.client_id,
+            family_id=family_id,
+            hash_prefix=hash_prefix(rotation_request.token_hash),
+        )
 
     @staticmethod
     def _mint_replacement_pair(
@@ -494,39 +599,14 @@ class SQLiteInboundAuthStore:
         now_ts: int,
     ) -> RotatedTokenPair:
         """Mint and insert a fresh (access, refresh) pair in the same family."""
-        # Inherit family_id from the consumed refresh so cascade revoke covers both.
-        existing_row = conn.execute(
-            "SELECT family_id, app_key FROM inbound_tokens WHERE token_hash = ?",
-            (rotation_request.token_hash,),
-        ).fetchone()
-        if not existing_row:  # defensive — _mark_refresh_used_or_replay returned ok
-            raise InvalidGrantError("refresh disappeared mid-rotation")
-        family_id, app_key = existing_row[0], existing_row[1]
-        raw_access, access_hash = generate_access_token()
-        raw_refresh, refresh_hash = generate_refresh_token()
-        access_row = InboundToken(
-            token_hash=access_hash,
-            token_kind="access",  # noqa: S106 -- discriminator literal, not a credential
-            parent_refresh_hash=refresh_hash,
-            family_id=family_id,
-            client_id=rotation_request.client_id,
-            app_key=app_key,
-            resource=rotation_request.resource,
-            scope=rotation_request.scope,
-            expires_at=now_ts + 3600,
-            issued_at=now_ts,
+        raw_access, raw_refresh, pair_context = SQLiteInboundAuthStore._prepare_pair_context(
+            conn, rotation_request.token_hash
         )
-        refresh_row = InboundToken(
-            token_hash=refresh_hash,
-            token_kind="refresh",  # noqa: S106 -- discriminator literal, not a credential
-            parent_refresh_hash=rotation_request.token_hash,
-            family_id=family_id,
-            client_id=rotation_request.client_id,
-            app_key=app_key,
-            resource=rotation_request.resource,
-            scope=rotation_request.scope,
-            expires_at=now_ts + 2592000,
-            issued_at=now_ts,
+        access_row = SQLiteInboundAuthStore._build_access_row(
+            rotation_request, pair_context, now_ts
+        )
+        refresh_row = SQLiteInboundAuthStore._build_refresh_row(
+            rotation_request, pair_context, now_ts
         )
         SQLiteInboundAuthStore._insert_token_row(conn, access_row)
         SQLiteInboundAuthStore._insert_token_row(conn, refresh_row)
@@ -537,38 +617,104 @@ class SQLiteInboundAuthStore:
             raw_refresh_token=raw_refresh,
         )
 
+    @staticmethod
+    def _prepare_pair_context(
+        conn: sqlite3.Connection, parent_token_hash: str
+    ) -> tuple[str, str, _NewPairContext]:
+        """Inherit family + app from the consumed refresh, mint new hashes, return both raws."""
+        existing_row = conn.execute(
+            "SELECT family_id, app_key FROM inbound_tokens WHERE token_hash = ?",
+            (parent_token_hash,),
+        ).fetchone()
+        if not existing_row:  # defensive — _mark_refresh_used_or_replay returned ok
+            raise InvalidGrantError("refresh disappeared mid-rotation")
+        raw_access, access_hash = generate_access_token()
+        raw_refresh, refresh_hash = generate_refresh_token()
+        pair_context = _NewPairContext(
+            family_id=existing_row[0],
+            app_key=existing_row[1],
+            access_hash=access_hash,
+            refresh_hash=refresh_hash,
+        )
+        return raw_access, raw_refresh, pair_context
+
+    @staticmethod
+    def _build_access_row(
+        rotation_request: RefreshRotationRequest,
+        pair_context: _NewPairContext,
+        now_ts: int,
+    ) -> InboundToken:
+        """Construct the new access-token row. TTL comes from the request."""
+        return InboundToken(
+            token_hash=pair_context.access_hash,
+            token_kind="access",  # noqa: S106 -- discriminator literal, not a credential
+            parent_refresh_hash=pair_context.refresh_hash,
+            family_id=pair_context.family_id,
+            client_id=rotation_request.client_id,
+            app_key=pair_context.app_key,
+            resource=rotation_request.resource,
+            scope=rotation_request.scope,
+            expires_at=now_ts + rotation_request.access_ttl_seconds,
+            issued_at=now_ts,
+        )
+
+    @staticmethod
+    def _build_refresh_row(
+        rotation_request: RefreshRotationRequest,
+        pair_context: _NewPairContext,
+        now_ts: int,
+    ) -> InboundToken:
+        """Construct the new refresh-token row. TTL comes from the request."""
+        return InboundToken(
+            token_hash=pair_context.refresh_hash,
+            token_kind="refresh",  # noqa: S106 -- discriminator literal, not a credential
+            parent_refresh_hash=rotation_request.token_hash,
+            family_id=pair_context.family_id,
+            client_id=rotation_request.client_id,
+            app_key=pair_context.app_key,
+            resource=rotation_request.resource,
+            scope=rotation_request.scope,
+            expires_at=now_ts + rotation_request.refresh_ttl_seconds,
+            issued_at=now_ts,
+        )
+
     async def get_access(self, token_hash: str) -> InboundToken | None:
         """Lookup an access token by hash. None on miss; caller checks expiry."""
-        conn = sqlite3.connect(self._db_path)
-        try:
+        with self._db_conn() as conn:
             row = conn.execute(
                 "SELECT token_hash, token_kind, parent_refresh_hash, family_id, "
                 "client_id, app_key, resource, scope, expires_at, issued_at, used_at "
                 "FROM inbound_tokens WHERE token_kind = 'access' AND token_hash = ?",
                 (token_hash,),
             ).fetchone()
-        finally:
-            conn.close()
         if not row:
             return None
-        # Defense-in-depth: the SQL lookup is already a hash-equality check, but
-        # we re-verify with constant-time compare in case a caller ever wires up
-        # a code path that compares hashes in Python.
+        # Defense-in-depth: the SQL lookup is already a hash-equality check,
+        # but we re-verify with constant-time compare in case a caller ever
+        # wires up a code path that compares hashes in Python.
         if not hmac.compare_digest(row[0], token_hash):
             return None
-        return InboundToken(
-            token_hash=row[0],
-            token_kind=row[1],
-            parent_refresh_hash=row[2],
-            family_id=row[3],
-            client_id=row[4],
-            app_key=row[5],
-            resource=row[6],
-            scope=row[7],
-            expires_at=row[8],
-            issued_at=row[9],
-            used_at=row[10],
-        )
+        return self._row_to_inbound_token(row)
+
+    async def get_refresh_row(self, token_hash: str) -> InboundToken | None:
+        """Read a refresh-token row by hash, regardless of used_at state.
+
+        Used by the /token endpoint for the scope-check phase before rotation.
+        The rotate path itself does NOT use this — it goes through
+        `_mark_refresh_used_or_replay` under BEGIN IMMEDIATE. Returning rows
+        with `used_at NOT NULL` is intentional: filtering them out would mask
+        replay attempts at the precondition layer.
+        """
+        with self._db_conn() as conn:
+            row = conn.execute(
+                "SELECT token_hash, token_kind, parent_refresh_hash, family_id, "
+                "client_id, app_key, resource, scope, expires_at, issued_at, used_at "
+                "FROM inbound_tokens WHERE token_hash = ? AND token_kind = 'refresh'",
+                (token_hash,),
+            ).fetchone()
+        if not row:
+            return None
+        return self._row_to_inbound_token(row)
 
     async def revoke_token(
         self,
@@ -578,31 +724,16 @@ class SQLiteInboundAuthStore:
     ) -> None:
         """RFC 7009 §2.2 — silently succeed regardless of existence.
 
-        For `kind="refresh"`, cascade-delete every access token sharing the
-        same `family_id`, so a stolen refresh cannot leave live access tokens.
-        For `kind="access"`, delete only that row. `client_id` scopes the
-        delete: a token revealed to a client can only be revoked by that
-        client.
+        Refresh revoke cascades to the whole family (a stolen refresh cannot
+        leave live access tokens behind). Access revoke deletes only the row.
+        `client_id` scopes the delete to its issuee.
         """
-        conn = sqlite3.connect(self._db_path)
-        try:
+        with self._db_conn() as conn:
             if kind == "refresh":
-                family_row = conn.execute(
-                    "SELECT family_id FROM inbound_tokens "
-                    "WHERE token_hash = ? AND token_kind = 'refresh' AND client_id = ?",
-                    (token_hash, client_id),
-                ).fetchone()
-                if family_row:
-                    conn.execute("DELETE FROM inbound_tokens WHERE family_id = ?", (family_row[0],))
+                self._revoke_refresh_family(conn, token_hash, client_id)
             else:
-                conn.execute(
-                    "DELETE FROM inbound_tokens "
-                    "WHERE token_hash = ? AND token_kind = 'access' AND client_id = ?",
-                    (token_hash, client_id),
-                )
+                self._revoke_access_token(conn, token_hash, client_id)
             conn.commit()
-        finally:
-            conn.close()
         audit_log_oauth_event(
             "token_revoke",
             client_id=client_id,
@@ -610,27 +741,62 @@ class SQLiteInboundAuthStore:
             hash_prefix=hash_prefix(token_hash),
         )
 
+    @staticmethod
+    def _revoke_refresh_family(
+        conn: sqlite3.Connection,
+        token_hash: str,
+        client_id: str,
+    ) -> None:
+        """Resolve the family from the refresh row, then cascade-delete it."""
+        family_row = conn.execute(
+            "SELECT family_id FROM inbound_tokens "
+            "WHERE token_hash = ? AND token_kind = 'refresh' AND client_id = ?",
+            (token_hash, client_id),
+        ).fetchone()
+        if family_row:
+            conn.execute("DELETE FROM inbound_tokens WHERE family_id = ?", (family_row[0],))
+
+    @staticmethod
+    def _revoke_access_token(
+        conn: sqlite3.Connection,
+        token_hash: str,
+        client_id: str,
+    ) -> None:
+        """Delete a single access-token row, scoped to the supplied client."""
+        conn.execute(
+            "DELETE FROM inbound_tokens "
+            "WHERE token_hash = ? AND token_kind = 'access' AND client_id = ?",
+            (token_hash, client_id),
+        )
+
     async def revoke_family(self, family_id: str) -> None:
         """Cascade-delete every token in the family (admin-side revoke path)."""
-        conn = sqlite3.connect(self._db_path)
-        try:
+        with self._db_conn() as conn:
             conn.execute("DELETE FROM inbound_tokens WHERE family_id = ?", (family_id,))
             conn.commit()
-        finally:
-            conn.close()
 
     # === MAINTENANCE ===
 
     async def cleanup_expired(self) -> None:
-        """Reap expired auth codes and tokens. Idempotent."""
+        """Reap expired auth codes and tokens. Idempotent.
+
+        Preserves refresh rows with `used_at NOT NULL` for
+        `REPLAY_DETECTION_WINDOW_SECONDS` past their natural expiry. Without
+        this carve-out, an attacker who steals a refresh and waits for the row
+        to age out would see "not found" on replay instead of triggering
+        family revoke — violating OAuth 2.1 §4.3.1.
+        """
         now_ts = int(time.time())
-        conn = sqlite3.connect(self._db_path)
-        try:
+        replay_cutoff = now_ts - REPLAY_DETECTION_WINDOW_SECONDS
+        with self._db_conn() as conn:
             conn.execute("DELETE FROM oauth_codes WHERE expires_at < ?", (now_ts,))
-            conn.execute("DELETE FROM inbound_tokens WHERE expires_at < ?", (now_ts,))
+            conn.execute(
+                "DELETE FROM inbound_tokens "
+                "WHERE expires_at < ? "
+                "AND NOT (token_kind = 'refresh' AND used_at IS NOT NULL AND used_at > ?)",
+                (now_ts, replay_cutoff),
+            )
             conn.commit()
-        finally:
-            conn.close()
 
     async def delete_all_for_app(self, app_key: str) -> None:
         """Cascade delete when a broker key is revoked (AGENTS.md Known Gotcha #2).
@@ -645,11 +811,8 @@ class SQLiteInboundAuthStore:
         """
         if not app_key:
             return
-        conn = sqlite3.connect(self._db_path)
-        try:
+        with self._db_conn() as conn:
             conn.execute("DELETE FROM oauth_codes WHERE app_key = ?", (app_key,))
             conn.execute("DELETE FROM inbound_tokens WHERE app_key = ?", (app_key,))
             conn.commit()
-        finally:
-            conn.close()
         logger.info("[InboundAuthStore] Cascade-deleted rows for app: %s", app_key)
