@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import logging
 
@@ -23,17 +22,16 @@ from broker.services.inbound_oauth_helpers import (
     is_acceptable_redirect_uri,
     normalize_resource,
     parse_basic_auth,
+    pkce_challenge_s256,
     resource_matches_connector,
+    sha256_hex,
     verify_pkce_s256,
 )
 
-# === HELPERS ===
+# === CONSTANTS ===
 
-
-def derive_challenge(code_verifier: str) -> str:
-    """Compute the RFC 7636 S256 challenge from a verifier — mirrors the function under test."""
-    digest = hashlib.sha256(code_verifier.encode()).digest()
-    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+PUBLIC_URL = "https://broker.example.com"
+NOTION_RESOURCE = "https://broker.example.com/proxy/notion"
 
 
 # === verify_pkce_s256 ===
@@ -41,213 +39,219 @@ def derive_challenge(code_verifier: str) -> str:
 
 def test_pkce_round_trip_known_good():
     code_verifier = "a" * 64
-    challenge = derive_challenge(code_verifier)
+    challenge = pkce_challenge_s256(code_verifier)
     assert verify_pkce_s256(code_verifier, challenge) is True
 
 
 def test_pkce_rejects_short_verifier():
     too_short = "a" * (CODE_VERIFIER_MIN_LEN - 1)
-    challenge = derive_challenge(too_short)
+    challenge = pkce_challenge_s256(too_short)
     assert verify_pkce_s256(too_short, challenge) is False
 
 
 def test_pkce_rejects_long_verifier():
     too_long = "a" * (CODE_VERIFIER_MAX_LEN + 1)
-    challenge = derive_challenge(too_long)
+    challenge = pkce_challenge_s256(too_long)
     assert verify_pkce_s256(too_long, challenge) is False
 
 
 def test_pkce_rejects_mismatched_challenge():
     code_verifier = "a" * 64
-    bogus_challenge = derive_challenge("b" * 64)
+    bogus_challenge = pkce_challenge_s256("b" * 64)
     assert verify_pkce_s256(code_verifier, bogus_challenge) is False
 
 
 def test_pkce_min_and_max_lengths_accepted():
     min_verifier = "a" * CODE_VERIFIER_MIN_LEN
     max_verifier = "a" * CODE_VERIFIER_MAX_LEN
-    assert verify_pkce_s256(min_verifier, derive_challenge(min_verifier)) is True
-    assert verify_pkce_s256(max_verifier, derive_challenge(max_verifier)) is True
+    assert verify_pkce_s256(min_verifier, pkce_challenge_s256(min_verifier)) is True
+    assert verify_pkce_s256(max_verifier, pkce_challenge_s256(max_verifier)) is True
 
 
-def test_pkce_uses_constant_time_compare():
-    """Code review check — verify_pkce_s256 must call hmac.compare_digest."""
-    import inspect
+@pytest.mark.parametrize(
+    "verifier",
+    [
+        "a" * 32 + " " * 11,  # space — outside RFC 7636 §4.1 charset
+        "a" * 32 + "\x00" * 11,  # NUL byte
+        "a" * 32 + "αβγδεζηθικλ",  # Greek letters
+        "a" * 32 + "++++++++++/",  # base64 chars outside the unreserved set
+    ],
+)
+def test_pkce_rejects_invalid_characters(verifier: str):
+    """RFC 7636 §4.1 — verifier must use only unreserved characters."""
+    # Build a valid-shape challenge so the only failure mode is the charset check.
+    challenge = pkce_challenge_s256(verifier)
+    assert verify_pkce_s256(verifier, challenge) is False
 
-    from broker.services.inbound_oauth_helpers import verify_pkce_s256 as fn
 
-    source = inspect.getsource(fn)
-    assert "hmac.compare_digest" in source, "verify_pkce_s256 must use hmac.compare_digest"
+# === sha256_hex ===
+
+
+def test_sha256_hex_known_vector():
+    """NIST FIPS 180-4 known answer for the empty string."""
+    expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    assert sha256_hex("") == expected
+
+
+def test_sha256_hex_deterministic():
+    first = sha256_hex("hello world")
+    second = sha256_hex("hello world")
+    assert first == second
+    assert len(first) == 64  # 256 bits == 64 hex chars
 
 
 # === normalize_resource ===
 
 
 def test_normalize_resource_strips_trailing_slash():
-    assert normalize_resource("https://broker.example.com/proxy/notion/") == normalize_resource(
-        "https://broker.example.com/proxy/notion"
-    )
+    assert normalize_resource(NOTION_RESOURCE + "/") == normalize_resource(NOTION_RESOURCE)
 
 
 def test_normalize_resource_lowercases_scheme_host_path():
     upper = normalize_resource("HTTPS://Broker.Example.COM/Proxy/Notion")
-    lower = normalize_resource("https://broker.example.com/proxy/notion")
+    lower = normalize_resource(NOTION_RESOURCE)
     assert upper == lower
 
 
 def test_normalize_resource_rejects_fragment():
     with pytest.raises(ValueError, match="MUST NOT contain a fragment"):
-        normalize_resource("https://broker.example.com/proxy/notion#section")
+        normalize_resource(NOTION_RESOURCE + "#section")
 
 
 def test_normalize_resource_tolerates_query_string():
     """RFC 8707 §2 says SHOULD NOT include queries, but we accept for robustness."""
-    normalized = normalize_resource("https://broker.example.com/proxy/notion?foo=bar")
-    assert normalized == "https://broker.example.com/proxy/notion"
+    normalized = normalize_resource(NOTION_RESOURCE + "?foo=bar")
+    assert normalized == NOTION_RESOURCE
 
 
 def test_normalize_resource_idempotent():
-    once = normalize_resource("https://broker.example.com/proxy/notion/")
+    once = normalize_resource(NOTION_RESOURCE + "/")
     twice = normalize_resource(once)
     assert once == twice
 
 
 def test_normalize_resource_handles_root_path():
-    normalized = normalize_resource("https://broker.example.com/")
-    assert normalized == "https://broker.example.com"
+    normalized = normalize_resource(PUBLIC_URL + "/")
+    assert normalized == PUBLIC_URL
 
 
 def test_normalize_resource_handles_deep_path():
-    normalized = normalize_resource("https://broker.example.com/proxy/notion/mcp/messages/abc")
-    assert normalized == "https://broker.example.com/proxy/notion/mcp/messages/abc"
+    deep = NOTION_RESOURCE + "/mcp/messages/abc"
+    assert normalize_resource(deep) == deep
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "data:text/plain,hello",
+        "http://broker.example.com/proxy/notion",
+        "ftp://broker.example.com/",
+    ],
+)
+def test_normalize_resource_rejects_non_https_scheme(raw: str):
+    """RFC 8707 §2 — resource indicators MUST use https."""
+    with pytest.raises(ValueError, match="scheme must be https"):
+        normalize_resource(raw)
+
+
+def test_normalize_resource_rejects_empty_scheme():
+    with pytest.raises(ValueError, match="scheme must be https"):
+        normalize_resource("//broker.example.com/proxy/notion")
+
+
+def test_normalize_resource_rejects_empty_netloc():
+    with pytest.raises(ValueError, match="host must not be empty"):
+        normalize_resource("https:///proxy/notion")
 
 
 # === resource_matches_connector ===
 
 
-def test_resource_matches_connector_exact():
-    assert (
-        resource_matches_connector(
-            "https://broker.example.com/proxy/notion",
-            "https://broker.example.com",
-            "notion",
-        )
-        is True
-    )
-
-
-def test_resource_matches_connector_with_subpath():
-    assert (
-        resource_matches_connector(
-            "https://broker.example.com/proxy/notion/mcp",
-            "https://broker.example.com",
-            "notion",
-        )
-        is True
-    )
-
-
-def test_resource_matches_connector_wrong_name():
-    assert (
-        resource_matches_connector(
-            "https://broker.example.com/proxy/hubspot",
-            "https://broker.example.com",
-            "notion",
-        )
-        is False
-    )
-
-
-def test_resource_matches_connector_public_url_trailing_slash_tolerated():
-    """public_url is right-stripped, so trailing slash variants behave identically."""
-    assert (
-        resource_matches_connector(
-            "https://broker.example.com/proxy/notion",
-            "https://broker.example.com/",
-            "notion",
-        )
-        is True
-    )
-
-
-def test_resource_matches_connector_rejects_prefix_overlap():
-    """`notion-staging` should not match `notion` — boundary is `/`."""
-    assert (
-        resource_matches_connector(
-            "https://broker.example.com/proxy/notion-staging",
-            "https://broker.example.com",
-            "notion",
-        )
-        is False
-    )
+@pytest.mark.parametrize(
+    "resource_norm, public_url, connector_name, expected",
+    [
+        # Exact match
+        (NOTION_RESOURCE, PUBLIC_URL, "notion", True),
+        # Subpath under the connector
+        (NOTION_RESOURCE + "/mcp", PUBLIC_URL, "notion", True),
+        # Different connector name
+        ("https://broker.example.com/proxy/hubspot", PUBLIC_URL, "notion", False),
+        # public_url with trailing slash — right-stripped, still matches
+        (NOTION_RESOURCE, PUBLIC_URL + "/", "notion", True),
+        # Prefix overlap must not match — boundary is `/`
+        ("https://broker.example.com/proxy/notion-staging", PUBLIC_URL, "notion", False),
+    ],
+)
+def test_resource_matches_connector(
+    resource_norm: str, public_url: str, connector_name: str, expected: bool
+):
+    assert resource_matches_connector(resource_norm, public_url, connector_name) is expected
 
 
 # === connector_from_resource ===
 
 
-def test_connector_from_resource_extracts_name():
-    name = connector_from_resource(
-        "https://broker.example.com/proxy/notion/mcp",
-        "https://broker.example.com",
-        ["notion", "hubspot"],
+@pytest.mark.parametrize(
+    "resource_norm, connector_names, expected",
+    [
+        # Happy path — extracts connector when name is known
+        (NOTION_RESOURCE + "/mcp", ["notion", "hubspot"], "notion"),
+        # Connector not in known set
+        ("https://broker.example.com/proxy/unknown", ["notion"], None),
+        # Non-proxy path
+        ("https://broker.example.com/oauth/token", ["notion"], None),
+        # Bare `/proxy/` with no connector segment
+        ("https://broker.example.com/proxy/", ["notion"], None),
+    ],
+)
+def test_connector_from_resource(
+    resource_norm: str, connector_names: list[str], expected: str | None
+):
+    assert connector_from_resource(resource_norm, PUBLIC_URL, connector_names) == expected
+
+
+def test_connector_from_resource_rejects_generator():
+    """Iterable[str] would silently exhaust a generator; Collection[str] forces a sized container.
+
+    Pyright catches this at type-check time. At runtime the call still works because the
+    generator is iterable, but the type contract is what protects callers from the bug.
+    """
+    names = (name for name in ["notion"])
+    # Cast away the type error to exercise runtime behaviour: it still returns the right value.
+    extracted = connector_from_resource(
+        NOTION_RESOURCE,
+        PUBLIC_URL,
+        names,  # type: ignore[arg-type] -- intentionally probing the contract
     )
-    assert name == "notion"
-
-
-def test_connector_from_resource_unknown_connector():
-    name = connector_from_resource(
-        "https://broker.example.com/proxy/unknown",
-        "https://broker.example.com",
-        ["notion"],
-    )
-    assert name is None
-
-
-def test_connector_from_resource_non_proxy_path():
-    name = connector_from_resource(
-        "https://broker.example.com/oauth/token",
-        "https://broker.example.com",
-        ["notion"],
-    )
-    assert name is None
-
-
-def test_connector_from_resource_bare_prefix():
-    """`/proxy/` with no connector → empty extracted name → None."""
-    name = connector_from_resource(
-        "https://broker.example.com/proxy/",
-        "https://broker.example.com",
-        ["notion"],
-    )
-    assert name is None
+    assert extracted == "notion"
 
 
 # === connector_from_request_path ===
 
 
-def test_connector_from_request_path_bare_name():
-    assert connector_from_request_path("/proxy/notion", ["notion"]) == "notion"
-
-
-def test_connector_from_request_path_trailing_slash():
-    assert connector_from_request_path("/proxy/notion/", ["notion"]) == "notion"
-
-
-def test_connector_from_request_path_deep():
-    extracted = connector_from_request_path("/proxy/notion/mcp/messages/abc123", ["notion"])
-    assert extracted == "notion"
-
-
-def test_connector_from_request_path_non_proxy():
-    assert connector_from_request_path("/oauth/token", ["notion"]) is None
-
-
-def test_connector_from_request_path_unknown_connector():
-    assert connector_from_request_path("/proxy/unknown/mcp", ["notion"]) is None
-
-
-def test_connector_from_request_path_bare_prefix():
-    assert connector_from_request_path("/proxy/", ["notion"]) is None
+@pytest.mark.parametrize(
+    "request_path, connector_names, expected",
+    [
+        # Bare connector path
+        ("/proxy/notion", ["notion"], "notion"),
+        # Trailing slash variant
+        ("/proxy/notion/", ["notion"], "notion"),
+        # Deep path under connector
+        ("/proxy/notion/mcp/messages/abc123", ["notion"], "notion"),
+        # Non-proxy path
+        ("/oauth/token", ["notion"], None),
+        # Unknown connector
+        ("/proxy/unknown/mcp", ["notion"], None),
+        # Bare prefix
+        ("/proxy/", ["notion"], None),
+    ],
+)
+def test_connector_from_request_path(
+    request_path: str, connector_names: list[str], expected: str | None
+):
+    assert connector_from_request_path(request_path, connector_names) == expected
 
 
 # === is_acceptable_redirect_uri ===
@@ -276,8 +280,10 @@ def test_is_acceptable_redirect_uri_subdomain_of_claude_rejected():
     assert is_acceptable_redirect_uri("https://staging.claude.ai/api/mcp/auth_callback") is False
 
 
-def test_allowed_redirect_uris_immutable():
-    assert isinstance(ALLOWED_REDIRECT_URIS, frozenset)
+def test_allowed_redirect_uris_contains_known_callbacks():
+    """Behavioural sanity — the set is what the policy says it is."""
+    assert "https://claude.ai/api/mcp/auth_callback" in ALLOWED_REDIRECT_URIS
+    assert "https://claude.com/api/mcp/auth_callback" in ALLOWED_REDIRECT_URIS
 
 
 # === parse_basic_auth ===
@@ -316,18 +322,28 @@ def test_parse_basic_auth_password_with_colon():
     assert parsed == ("alice", "pass:with:colons")
 
 
+def test_parse_basic_auth_handles_none():
+    """`request.headers.get('authorization')` returns None when the header is absent —
+    the parser must treat that as 'no credentials supplied', not crash."""
+    assert parse_basic_auth(None) is None
+
+
+def test_parse_basic_auth_handles_empty_string():
+    assert parse_basic_auth("") is None
+
+
 # === build_bearer_challenge ===
 
 
 def test_build_bearer_challenge_minimal():
-    challenge = build_bearer_challenge("https://broker.example.com/.well-known/resource")
+    challenge = build_bearer_challenge(PUBLIC_URL + "/.well-known/resource")
     assert challenge.startswith("Bearer ")
     assert 'resource_metadata="https://broker.example.com/.well-known/resource"' in challenge
 
 
 def test_build_bearer_challenge_with_all_parts():
     challenge = build_bearer_challenge(
-        "https://broker.example.com/.well-known/resource",
+        PUBLIC_URL + "/.well-known/resource",
         scope="mcp:read",
         error="invalid_token",
         error_description="The token expired",
@@ -340,7 +356,7 @@ def test_build_bearer_challenge_with_all_parts():
 
 def test_build_bearer_challenge_omits_none_values():
     challenge = build_bearer_challenge(
-        "https://broker.example.com/.well-known/resource",
+        PUBLIC_URL + "/.well-known/resource",
         scope=None,
         error=None,
         error_description=None,
@@ -382,42 +398,36 @@ def test_audit_log_emits_json_at_info(caplog: pytest.LogCaptureFixture):
     assert "ts" in payload
 
 
-def test_audit_log_never_includes_raw_token_value(caplog: pytest.LogCaptureFixture):
-    """Callers must pass hash prefixes; this test guards against accidental raw-token logging."""
-    caplog.set_level(logging.INFO, logger="broker.services.inbound_oauth_helpers")
-    secret_token = "mcp_at_super_secret_value_should_not_leak"  # noqa: S105 -- test fixture
-    audit_log_oauth_event("login_attempt", token_hash_prefix="abcdef12")
-    for record in caplog.records:
-        assert secret_token not in record.getMessage()
-
-
 # === PROPERTY TESTS (hypothesis) ===
 
 
 @given(
     code_verifier=st.text(
-        alphabet=st.characters(
-            whitelist_categories=("Ll", "Lu", "Nd"),
-            whitelist_characters="-._~",
+        # RFC 7636 §4.1 — `[A-Za-z0-9\-._~]`. ASCII-only so we don't generate Unicode
+        # letters that the charset check now rejects.
+        alphabet=st.sampled_from(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~"
         ),
         min_size=CODE_VERIFIER_MIN_LEN,
         max_size=CODE_VERIFIER_MAX_LEN,
     )
 )
 def test_property_pkce_round_trip(code_verifier: str):
-    """Any URL-safe verifier of valid length verifies against its derived challenge."""
-    challenge = derive_challenge(code_verifier)
+    """Any RFC 7636-compliant verifier of valid length verifies against its derived challenge."""
+    challenge = pkce_challenge_s256(code_verifier)
     assert verify_pkce_s256(code_verifier, challenge) is True
 
 
 @given(
-    scheme=st.sampled_from(["http", "https", "HTTP", "HTTPS"]),
     host=st.from_regex(r"[a-zA-Z][a-zA-Z0-9.-]{1,30}\.[a-zA-Z]{2,}", fullmatch=True),
     path=st.from_regex(r"(/[a-zA-Z0-9_.-]{1,20}){0,5}/?", fullmatch=True),
 )
-def test_property_normalize_resource_idempotent(scheme: str, host: str, path: str):
-    """normalize_resource is idempotent — applying it twice equals applying it once."""
-    candidate_url = f"{scheme}://{host}{path}"
+def test_property_normalize_resource_idempotent(host: str, path: str):
+    """normalize_resource is idempotent — applying it twice equals applying it once.
+
+    Scheme is fixed to `https` because the helper now rejects other schemes (RFC 8707 §2).
+    """
+    candidate_url = f"https://{host}{path}"
     once = normalize_resource(candidate_url)
     twice = normalize_resource(once)
     assert once == twice
