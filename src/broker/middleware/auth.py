@@ -71,6 +71,16 @@ _OAUTH_PUBLIC_PATHS = frozenset(
 # Discovery endpoints — RFC 8414 + RFC 9728 require unauthenticated access.
 _WELLKNOWN_OAUTH_PREFIX = "/.well-known/oauth-"
 
+# Bearer-failure audit reasons. Descriptions are deliberately coarse so an
+# attacker can't distinguish "expired" from "not_found" from the 401 body, but
+# operators get the precise reason from the audit log.
+_BEARER_FAIL_DESCRIPTIONS = {
+    "not_found": "bearer token invalid or expired",
+    "expired": "bearer token invalid or expired",
+    "unknown_connector": "resource not bound to a known connector",
+    "audience_mismatch": "token audience does not match request connector",
+}
+
 
 class BrokerAuthMiddleware(BaseHTTPMiddleware):
     """Validates broker keys and injects BrokerAppIdentity into request.state."""
@@ -221,29 +231,19 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
             return _oauth_store_unavailable()
 
         token_row = await store.get_access(token_hash)
-        if token_row is None or token_row.expires_at <= int(time.time()):
-            return self._bearer_401_for_path(
-                path,
-                error="invalid_token",
-                error_description="bearer token invalid or expired",
-            )
+        if token_row is None:
+            return self._bearer_audit_fail(path, token_hash, "not_found")
+        if token_row.expires_at <= int(time.time()):
+            return self._bearer_audit_fail(path, token_hash, "expired")
 
         connector_name = connector_from_request_path(path, self._get_connector_names())
         if connector_name is None:
-            return self._bearer_401_for_path(
-                path,
-                error="invalid_token",
-                error_description="resource not bound to a known connector",
-            )
+            return self._bearer_audit_fail(path, token_hash, "unknown_connector")
 
         if not resource_matches_connector(
             normalize_resource(token_row.resource), self._public_url, connector_name
         ):
-            return self._bearer_401_for_path(
-                path,
-                error="invalid_token",
-                error_description="token audience does not match request connector",
-            )
+            return self._bearer_audit_fail(path, token_hash, "audience_mismatch")
 
         identity = self._bearer_build_identity(token_row, connector_name, client_registry)
         if isinstance(identity, Response):
@@ -289,6 +289,20 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
             resource_metadata_url=resource_metadata_url,
             error=error,
             error_description=error_description,
+        )
+
+    def _bearer_audit_fail(self, path: str, token_hash: str, reason: str) -> Response:
+        """Emit the plan-mandated `bearer_validate_fail` audit log + build the 401."""
+        audit_log_oauth_event(
+            "bearer_validate_fail",
+            path=path,
+            hash_prefix=hash_prefix(token_hash),
+            reason=reason,
+        )
+        return self._bearer_401_for_path(
+            path,
+            error="invalid_token",
+            error_description=_BEARER_FAIL_DESCRIPTIONS[reason],
         )
 
     def _unauthorized_for_path(self, path: str) -> Response:
