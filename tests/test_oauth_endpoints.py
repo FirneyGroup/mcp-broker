@@ -167,6 +167,10 @@ class TestDCR:
         body = _response_body(response)
         assert body["client_id"].startswith("mcp_client_")
         assert "client_secret" not in body
+        # RFC 7591 §3.2.1: registration response with client_secret MUST be no-store.
+        # Always set so the public-client branch can't diverge under refactor.
+        assert response.headers.get("Cache-Control") == "no-store"
+        assert response.headers.get("Pragma") == "no-cache"
 
     async def test_confidential_client_returns_secret_once(
         self, endpoints: OAuthServerEndpoints
@@ -418,6 +422,9 @@ class TestTokenAuthCode:
         assert body["refresh_token"].startswith("mcp_rt_")
         assert body["token_type"] == "Bearer"
         assert body["expires_in"] == 3600
+        # RFC 6749 §5.1: token endpoint responses MUST NOT be cached.
+        assert response.headers.get("Cache-Control") == "no-store"
+        assert response.headers.get("Pragma") == "no-cache"
 
     async def test_used_code_invalid_grant(self, endpoints: OAuthServerEndpoints) -> None:
         client_id, code = await _approve_to_get_code(endpoints)

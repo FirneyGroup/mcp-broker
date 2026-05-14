@@ -121,6 +121,13 @@ _CONSENT_HEADERS = {
     "Cache-Control": "no-store",
 }
 
+# RFC 6749 §5.1 (token endpoint) and RFC 7591 §3.2.1 (registration response with
+# client_secret) both MUST emit no-store. Pragma included for HTTP/1.0 caches.
+_NO_STORE_HEADERS = {
+    "Cache-Control": "no-store",
+    "Pragma": "no-cache",
+}
+
 
 # === RATE LIMITER ===
 
@@ -221,7 +228,9 @@ class OAuthServerEndpoints:
             registration, client_ip=client_ip
         )
         return JSONResponse(
-            response_payload.model_dump(exclude_none=True), status_code=HTTPStatus.CREATED
+            response_payload.model_dump(exclude_none=True),
+            status_code=HTTPStatus.CREATED,
+            headers=_NO_STORE_HEADERS,
         )
 
     # --- /oauth/authorize (GET) ---
@@ -830,4 +839,8 @@ def _token_json(
         refresh_token=pair.raw_refresh_token,
         scope=scope,
     )
-    return JSONResponse(payload.model_dump(exclude_none=True), status_code=HTTPStatus.OK)
+    return JSONResponse(
+        payload.model_dump(exclude_none=True),
+        status_code=HTTPStatus.OK,
+        headers=_NO_STORE_HEADERS,
+    )
