@@ -371,6 +371,38 @@ class TestBearer401:
         assert response.headers["www-authenticate"].startswith("Bearer ")
         assert "resource_metadata=" in response.headers["www-authenticate"]
 
+    async def test_malformed_resource_returns_401_not_500(
+        self,
+        middleware: BrokerAuthMiddleware,
+        inbound_store: SQLiteInboundAuthStore,
+        key_store: SQLiteBrokerKeyStore,
+        registry: BrokerClientRegistry,
+    ) -> None:
+        """Regression: a stored token with a malformed `resource` value must
+        produce 401 + bearer challenge, not propagate ValueError into a 500.
+
+        `normalize_resource` raises ValueError on fragment / non-https / empty
+        host. Today no write path stores such values, but DB restore from a
+        foreign source or a future bug could. The middleware previously called
+        `normalize_resource` without a try/except — the exception propagated
+        to FastAPI as a 500, no audit event, no WWW-Authenticate.
+        """
+        raw_token = await _seed_access_token(
+            inbound_store,
+            resource="http://broker.example.com/proxy/notion",  # non-https
+        )
+        response = await _verify(
+            middleware,
+            path="/proxy/notion/mcp",
+            bearer=raw_token,
+            key_store=key_store,
+            registry=registry,
+        )
+        assert response.status_code == 401, (
+            f"Malformed resource must collapse to 401 audience_mismatch, got {response.status_code}"
+        )
+        assert response.headers["www-authenticate"].startswith("Bearer ")
+
     async def test_revoked_app_returns_bearer_challenge_not_bare_401(
         self,
         middleware: BrokerAuthMiddleware,

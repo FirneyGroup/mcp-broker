@@ -800,11 +800,19 @@ class SQLiteInboundAuthStore:
     async def cleanup_expired(self) -> None:
         """Reap expired auth codes and tokens. Idempotent.
 
-        Preserves refresh rows with `used_at NOT NULL` for
-        `REPLAY_DETECTION_WINDOW_SECONDS` past their natural expiry. Without
-        this carve-out, an attacker who steals a refresh and waits for the row
-        to age out would see "not found" on replay instead of triggering
-        family revoke — violating OAuth 2.1 §4.3.1.
+        Preserves used refresh rows (`used_at NOT NULL`) for
+        ``REPLAY_DETECTION_WINDOW_SECONDS`` past their ``used_at`` timestamp
+        (NOT past ``expires_at``). Without this carve-out, an attacker who
+        steals a refresh and waits for the row to age out would see "not
+        found" on replay instead of triggering family revoke — violating
+        OAuth 2.1 §4.3.1.
+
+        Note: the retention window is measured from rotation time, not from
+        natural expiry. In practice tokens are rotated near their expiry so
+        the two are close, but for a refresh rotated early in its lifetime
+        the row can age out of the replay window while the family is still
+        live. The legitimate user is unaffected (a replayed old refresh hits
+        "not found" rather than triggering revoke).
         """
         now_ts = int(time.time())
         replay_cutoff = now_ts - REPLAY_DETECTION_WINDOW_SECONDS

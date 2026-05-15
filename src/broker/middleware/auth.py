@@ -243,9 +243,15 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
         if connector_name is None:
             return self._bearer_audit_fail(path, token_hash, "unknown_connector")
 
-        if not resource_matches_connector(
-            normalize_resource(token_row.resource), self._public_url, connector_name
-        ):
+        # `normalize_resource` raises ValueError on fragment / non-https / empty
+        # host. No current write path produces such a stored value, but DB
+        # restore from a foreign source or a future bug could — collapse to the
+        # existing audience_mismatch failure rather than 500.
+        try:
+            resource_norm = normalize_resource(token_row.resource)
+        except ValueError:
+            return self._bearer_audit_fail(path, token_hash, "audience_mismatch")
+        if not resource_matches_connector(resource_norm, self._public_url, connector_name):
             return self._bearer_audit_fail(path, token_hash, "audience_mismatch")
 
         # Revoked-app check lives here (not in _bearer_build_identity) so we can
