@@ -371,6 +371,38 @@ class TestBearer401:
         assert response.headers["www-authenticate"].startswith("Bearer ")
         assert "resource_metadata=" in response.headers["www-authenticate"]
 
+    async def test_revoked_app_returns_bearer_challenge_not_bare_401(
+        self,
+        middleware: BrokerAuthMiddleware,
+        inbound_store: SQLiteInboundAuthStore,
+        key_store: SQLiteBrokerKeyStore,
+    ) -> None:
+        """Regression: when the token's app is revoked between issuance and bearer
+        use, the response MUST include a Bearer challenge and emit a
+        bearer_validate_fail audit event.
+
+        Original defect: `_bearer_build_identity` returned bare `_unauthorized()`
+        for this path — no WWW-Authenticate, no audit log. F3 wired four other
+        failure paths through `_bearer_audit_fail` but missed this fifth. claude.ai
+        clients can't rediscover the AS without the challenge.
+        """
+        raw_token = await _seed_access_token(inbound_store)
+        # Empty registry → token's app_key won't resolve → "revoked app" branch.
+        empty_registry = BrokerClientRegistry({})
+        response = await _verify(
+            middleware,
+            path="/proxy/notion/mcp",
+            bearer=raw_token,
+            key_store=key_store,
+            registry=empty_registry,
+        )
+        assert response.status_code == 401
+        assert response.headers["www-authenticate"].startswith("Bearer ")
+        assert "resource_metadata=" in response.headers["www-authenticate"]
+        # Body description is deliberately coarse (no oracle on app-existence).
+        body = json.loads(response.body)
+        assert body["error_description"] == "bearer token invalid or expired"
+
 
 # =============================================================================
 # FAIL-CLOSED

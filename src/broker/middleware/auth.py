@@ -73,12 +73,15 @@ _WELLKNOWN_OAUTH_PREFIX = "/.well-known/oauth-"
 
 # Bearer-failure audit reasons. Descriptions are deliberately coarse so an
 # attacker can't distinguish "expired" from "not_found" from the 401 body, but
-# operators get the precise reason from the audit log.
+# operators get the precise reason from the audit log. `revoked_app` shares the
+# same coarse description for the same reason — a probe via a deleted app's
+# leaked token must not reveal that the app once existed.
 _BEARER_FAIL_DESCRIPTIONS = {
     "not_found": "bearer token invalid or expired",
     "expired": "bearer token invalid or expired",
     "unknown_connector": "resource not bound to a known connector",
     "audience_mismatch": "token audience does not match request connector",
+    "revoked_app": "bearer token invalid or expired",
 }
 
 
@@ -245,10 +248,14 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
         ):
             return self._bearer_audit_fail(path, token_hash, "audience_mismatch")
 
-        identity = self._bearer_build_identity(token_row, connector_name, client_registry)
-        if isinstance(identity, Response):
-            return identity
+        # Revoked-app check lives here (not in _bearer_build_identity) so we can
+        # route the failure through _bearer_audit_fail with the token_hash in
+        # scope — same audit trail + WWW-Authenticate challenge as the other
+        # bearer failures, instead of a bare 401.
+        if client_registry.get(token_row.app_key) is None:
+            return self._bearer_audit_fail(path, token_hash, "revoked_app")
 
+        identity = self._bearer_build_identity(token_row, connector_name, client_registry)
         _strip_authorization_header(request)
         audit_log_oauth_event(
             "bearer_validate_ok",
@@ -263,14 +270,16 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
         token_row: InboundToken,
         connector_name: str,
         client_registry: BrokerClientRegistry,
-    ) -> BrokerAppIdentity | Response:
-        """Resolve scopes via the client registry; narrow access to the bound connector."""
+    ) -> BrokerAppIdentity:
+        """Resolve scopes via the client registry; narrow access to the bound connector.
+
+        Caller MUST have verified ``client_registry.get(token_row.app_key)`` is
+        non-None — this method assumes the lookup succeeds.
+        """
         from broker.services.api_key_store import BrokerAppIdentity
 
         app_config = client_registry.get(token_row.app_key)
-        if app_config is None:
-            # App was revoked between token issuance and bearer use.
-            return _unauthorized()
+        assert app_config is not None  # noqa: S101 -- caller guarantees per docstring
         return BrokerAppIdentity(
             app_key=token_row.app_key,
             scopes=app_config.scopes,
