@@ -144,9 +144,15 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
             return True
         if path.startswith("/oauth/") and path.endswith("/callback"):
             return True
-        if path in _OAUTH_PUBLIC_PATHS:
+        # AS discovery + DCR/authorize/token/revoke are only exempt when the
+        # OAuth feature is actually enabled. With OAuth disabled the handlers
+        # return 404 (so there is no functional impact today), but keeping the
+        # exemption ungated would silently bypass broker-key auth for any
+        # future route that lands on these paths. AGENTS.md Known Gotcha #3:
+        # exempt-path entries must be as narrow as possible.
+        if self._oauth_enabled and path in _OAUTH_PUBLIC_PATHS:
             return True
-        if path.startswith(_WELLKNOWN_OAUTH_PREFIX):
+        if self._oauth_enabled and path.startswith(_WELLKNOWN_OAUTH_PREFIX):
             return True
         return any(path.startswith(prefix) for prefix in self._exempt_prefixes)
 
