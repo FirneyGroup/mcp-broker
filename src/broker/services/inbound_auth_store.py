@@ -552,7 +552,11 @@ class SQLiteInboundAuthStore:
         rotation_request: RefreshRotationRequest,
         now_ts: int,
     ) -> None:
-        """Conditional UPDATE marks the refresh row used. Loss → replay-or-miss."""
+        """Conditional UPDATE marks the refresh row used; rowcount=0 → replay or miss.
+
+        Both the UPDATE here and the follow-up SELECT in `_classify_refresh_miss`
+        scope by `client_id` — see that helper for the cross-client attack vector.
+        """
         cursor = conn.execute(
             "UPDATE inbound_tokens SET used_at = ? "
             "WHERE token_hash = ? AND token_kind = 'refresh' "
@@ -561,14 +565,23 @@ class SQLiteInboundAuthStore:
         )
         if cursor.rowcount == 1:
             return
-        # client_id filter MUST be on the SELECT too, not just the UPDATE.
-        # Without it, a hash match owned by a *different* client whose row
-        # already has used_at != NULL would trigger _revoke_family_on_replay
-        # against the wrong family — a forced-logout attack from any DCR
-        # client that ever obtained another client's prior-generation refresh
-        # token (e.g. via intercepted response logs).
+        SQLiteInboundAuthStore._classify_refresh_miss(conn, rotation_request)
+
+    @staticmethod
+    def _classify_refresh_miss(
+        conn: sqlite3.Connection,
+        rotation_request: RefreshRotationRequest,
+    ) -> None:
+        """Disambiguate a rowcount=0 UPDATE: replay (used_at set) → family revoke; else not found.
+
+        The SELECT MUST filter by `client_id`. Without it, a hash match owned by a
+        *different* client whose row already has `used_at != NULL` would trigger
+        `_revoke_family_on_replay` against the wrong family — a forced-logout
+        attack from any DCR client that ever obtained another client's prior-
+        generation refresh token (e.g. via intercepted response logs).
+        """
         token_row = conn.execute(
-            "SELECT family_id, used_at, expires_at, client_id "
+            "SELECT family_id, used_at "
             "FROM inbound_tokens WHERE token_hash = ? AND token_kind = 'refresh' "
             "AND client_id = ?",
             (rotation_request.token_hash, rotation_request.client_id),
