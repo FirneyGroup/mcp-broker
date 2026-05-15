@@ -1037,11 +1037,48 @@ class TestOAuthEndpointsSingleton:
         broker_main._get_oauth_endpoints()._dcr_rate_limiter.allow("1.2.3.4")
         assert len(singleton._dcr_rate_limiter._events["1.2.3.4"]) == 2
 
-    async def test_factory_raises_when_oauth_disabled(
+    async def test_factory_returns_none_when_oauth_disabled(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from broker import main as broker_main
 
         monkeypatch.setattr(broker_main, "_oauth_endpoints", None)
-        with pytest.raises(RuntimeError, match="OAuthServerEndpoints not initialized"):
-            broker_main._get_oauth_endpoints()
+        assert broker_main._get_oauth_endpoints() is None
+
+    @pytest.mark.parametrize(
+        "route_name",
+        [
+            "oauth_register",
+            "oauth_authorize_get",
+            "oauth_authorize_post",
+            "oauth_token",
+            "oauth_revoke",
+        ],
+    )
+    async def test_oauth_route_returns_404_not_500_when_disabled(
+        self, monkeypatch: pytest.MonkeyPatch, route_name: str
+    ) -> None:
+        """Regression: every /oauth/* route must return 404 (not 500) when
+        ``broker.oauth.enabled=false``.
+
+        Original defect: ``_get_oauth_endpoints()`` raised RuntimeError when
+        the singleton was None, and FastAPI converted the unhandled exception
+        into a 500. The handler-level ``if not self._config.enabled`` guard
+        was unreachable because the factory blew up first. Misconfigured
+        clients probing the endpoints got 500s + error-level log entries
+        instead of the intended 404.
+
+        Fix: the factory returns None instead of raising, and each route
+        short-circuits to a 404 ``_oauth_disabled_not_found()`` response
+        when the singleton is absent.
+        """
+        from broker import main as broker_main
+
+        monkeypatch.setattr(broker_main, "_oauth_endpoints", None)
+        route_handler = getattr(broker_main, route_name)
+        request = MagicMock()
+        response = await route_handler(request)
+        assert response.status_code == 404
+        # JSONResponse.body is JSON-encoded bytes
+        body = json.loads(response.body)
+        assert body == {"error": "not_found"}

@@ -12,10 +12,11 @@ import importlib
 import logging
 import time
 from contextlib import asynccontextmanager
+from http import HTTPStatus
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from broker.api.admin import AdminEndpoints
 from broker.api.oauth_server import OAuthServerEndpoints
@@ -382,45 +383,72 @@ async def admin_refresh_tokens(request: Request):
 # =============================================================================
 
 
-def _get_oauth_endpoints() -> OAuthServerEndpoints:
-    """Return the lifespan-initialized OAuth endpoints.
+def _get_oauth_endpoints() -> OAuthServerEndpoints | None:
+    """Return the lifespan-initialized OAuth endpoints, or None when disabled.
 
     Returns a singleton so the in-memory ``_DCRRateLimiter._events`` dict
     accumulates state across requests. Constructing a fresh instance per
     request would reset the counter on every call and silently disable the
     10/15min/IP rate limit — and silently nullify the ``WEB_CONCURRENCY=1``
     startup check, which exists precisely because the limiter is in-process.
+
+    Returns ``None`` when ``broker.oauth.enabled=false`` so route handlers
+    can short-circuit to a 404 instead of letting a RuntimeError propagate
+    into a 500.
     """
-    if _oauth_endpoints is None:
-        raise RuntimeError(
-            "OAuthServerEndpoints not initialized — broker.oauth.enabled may be false"
-        )
     return _oauth_endpoints
 
 
 @app.post("/oauth/register")
 async def oauth_register(request: Request):
-    return await _get_oauth_endpoints().register(request)
+    endpoints = _get_oauth_endpoints()
+    if endpoints is None:
+        return _oauth_disabled_not_found()
+    return await endpoints.register(request)
 
 
 @app.get("/oauth/authorize")
 async def oauth_authorize_get(request: Request):
-    return await _get_oauth_endpoints().authorize_get(request)
+    endpoints = _get_oauth_endpoints()
+    if endpoints is None:
+        return _oauth_disabled_not_found()
+    return await endpoints.authorize_get(request)
 
 
 @app.post("/oauth/authorize")
 async def oauth_authorize_post(request: Request):
-    return await _get_oauth_endpoints().authorize_post(request)
+    endpoints = _get_oauth_endpoints()
+    if endpoints is None:
+        return _oauth_disabled_not_found()
+    return await endpoints.authorize_post(request)
 
 
 @app.post("/oauth/token")
 async def oauth_token(request: Request):
-    return await _get_oauth_endpoints().token(request)
+    endpoints = _get_oauth_endpoints()
+    if endpoints is None:
+        return _oauth_disabled_not_found()
+    return await endpoints.token(request)
 
 
 @app.post("/oauth/revoke")
 async def oauth_revoke(request: Request):
-    return await _get_oauth_endpoints().revoke(request)
+    endpoints = _get_oauth_endpoints()
+    if endpoints is None:
+        return _oauth_disabled_not_found()
+    return await endpoints.revoke(request)
+
+
+def _oauth_disabled_not_found() -> JSONResponse:
+    """404 for the five /oauth/* routes when broker.oauth.enabled=false.
+
+    Mirrors the in-handler `_not_found()` shape from oauth_server.py so a
+    misconfigured client sees the same disabled-mode response regardless of
+    whether oauth was disabled at lifespan-init time (this path) or flipped
+    off mid-process (the handler-internal check — currently unreachable but
+    kept as defense in depth).
+    """
+    return JSONResponse({"error": "not_found"}, status_code=HTTPStatus.NOT_FOUND)
 
 
 @app.get("/.well-known/oauth-authorization-server")
