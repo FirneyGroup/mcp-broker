@@ -288,8 +288,6 @@ def test_is_acceptable_redirect_uri_subdomain_rejected():
     )
 
 
-
-
 # === parse_basic_auth ===
 
 
