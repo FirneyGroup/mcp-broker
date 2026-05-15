@@ -11,6 +11,7 @@ when ``WEB_CONCURRENCY > 1`` AND ``broker.oauth.enabled`` is true.
 
 from __future__ import annotations
 
+import contextlib
 import html
 import secrets
 import time
@@ -513,6 +514,18 @@ class OAuthServerEndpoints:
         # the response shape (invalid_scope vs invalid_grant) as a confirmation
         # oracle for whether that hash exists in the store.
         if prior_row is None or prior_row.client_id != client_id:
+            return _oauth_error(HTTPStatus.BAD_REQUEST, "invalid_grant", "refresh_token invalid")
+        # Replay detection must run BEFORE the scope check. `get_refresh_row`
+        # returns rows where `used_at IS NOT NULL` so we can spot replays here;
+        # if the scope check ran first, an attacker replaying a consumed token
+        # with a widened scope would get `invalid_scope` instead of triggering
+        # the family revoke — defeating OAuth 2.1 §4.3.1. Route used tokens
+        # straight to rotate_refresh; its atomic UPDATE detects the replay and
+        # raises InvalidGrantError after revoking the family.
+        if prior_row.used_at is not None:
+            rotation_request = self._build_rotation_request(prior_row, client_id, prior_row.scope)
+            with contextlib.suppress(InvalidGrantError):
+                await self._inbound_auth_store.rotate_refresh(rotation_request)
             return _oauth_error(HTTPStatus.BAD_REQUEST, "invalid_grant", "refresh_token invalid")
         scope_or_error = _resolve_rotation_scope(params.get("scope"), prior_row.scope)
         if isinstance(scope_or_error, Response):

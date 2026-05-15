@@ -633,6 +633,43 @@ class TestTokenRefresh:
         assert response.status_code == 400
         assert _response_body(response)["error"] == "invalid_scope"
 
+    async def test_same_client_replay_with_wide_scope_revokes_family(
+        self, endpoints: OAuthServerEndpoints, store: SQLiteInboundAuthStore
+    ) -> None:
+        """Regression: same-client refresh replay with a widened scope must
+        still trigger family revocation (OAuth 2.1 §4.3.1). The original
+        defect ran the scope check before replay detection, so a replay+widen
+        attack returned `invalid_scope` AND left the family alive — an
+        attacker could probe the scope check, then re-use the family on a
+        subsequent attempt.
+        """
+        client_id, _, refresh = await _mint_initial_pair(endpoints)
+        form = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh,
+            "client_id": client_id,
+        }
+        # First use succeeds.
+        first = await endpoints.token(_request_with_form(dict(form)))
+        assert first.status_code == 200
+        # Replay the consumed refresh, but ask for a wider scope this time.
+        replay = await endpoints.token(
+            _request_with_form({**form, "scope": "mcp:proxy:notion mcp:status mcp:proxy:hubspot"})
+        )
+        assert replay.status_code == 400
+        assert _response_body(replay)["error"] == "invalid_grant", (
+            "Replay-with-widened-scope must return invalid_grant (and revoke "
+            "the family), NOT invalid_scope — otherwise the family stays alive "
+            "and the response leaks scope-check semantics."
+        )
+        # Family must be empty after replay-revoke.
+        conn = sqlite3.connect(store._db_path)
+        try:
+            family_count = conn.execute("SELECT COUNT(*) FROM inbound_tokens").fetchone()[0]
+        finally:
+            conn.close()
+        assert family_count == 0
+
     async def test_unknown_refresh_invalid_grant(self, endpoints: OAuthServerEndpoints) -> None:
         client_id = await _register_public_client(endpoints)
         response = await endpoints.token(
