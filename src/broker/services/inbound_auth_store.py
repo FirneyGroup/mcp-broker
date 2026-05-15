@@ -443,7 +443,7 @@ class SQLiteInboundAuthStore:
                 "code_challenge, expires_at FROM oauth_codes WHERE code_hash = ?",
                 (code_hash,),
             ).fetchone()
-            if not row or row[6] < now_ts or row[0] != client_id:
+            if not row or row[6] <= now_ts or row[0] != client_id:
                 conn.execute("COMMIT")
                 return None
             conn.execute("DELETE FROM oauth_codes WHERE code_hash = ?", (code_hash,))
@@ -817,10 +817,10 @@ class SQLiteInboundAuthStore:
         now_ts = int(time.time())
         replay_cutoff = now_ts - REPLAY_DETECTION_WINDOW_SECONDS
         with self._db_conn() as conn:
-            conn.execute("DELETE FROM oauth_codes WHERE expires_at < ?", (now_ts,))
+            conn.execute("DELETE FROM oauth_codes WHERE expires_at <= ?", (now_ts,))
             conn.execute(
                 "DELETE FROM inbound_tokens "
-                "WHERE expires_at < ? "
+                "WHERE expires_at <= ? "
                 "AND NOT (token_kind = 'refresh' AND used_at IS NOT NULL AND used_at > ?)",
                 (now_ts, replay_cutoff),
             )
