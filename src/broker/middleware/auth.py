@@ -37,6 +37,7 @@ from broker.services.inbound_oauth_helpers import (
     audit_log_oauth_event,
     build_bearer_challenge,
     connector_from_request_path,
+    connector_from_resource,
     hash_prefix,
     normalize_resource,
     resource_matches_connector,
@@ -239,10 +240,6 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
         if token_row.expires_at <= int(time.time()):
             return self._bearer_audit_fail(path, token_hash, "expired")
 
-        connector_name = connector_from_request_path(path, self._get_connector_names())
-        if connector_name is None:
-            return self._bearer_audit_fail(path, token_hash, "unknown_connector")
-
         # `normalize_resource` raises ValueError on fragment / non-https / empty
         # host. No current write path produces such a stored value, but DB
         # restore from a foreign source or a future bug could — collapse to the
@@ -251,7 +248,24 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
             resource_norm = normalize_resource(token_row.resource)
         except ValueError:
             return self._bearer_audit_fail(path, token_hash, "audience_mismatch")
-        if not resource_matches_connector(resource_norm, self._public_url, connector_name):
+
+        connector_name = connector_from_request_path(path, self._get_connector_names())
+        if connector_name is None:
+            # `/status` is app-scoped, not connector-scoped, but every inbound
+            # token has a connector binding via its resource indicator. Resolve
+            # the connector from the token rather than the path so /status
+            # remains usable AND keeps the audience narrowing (a token issued
+            # for /proxy/notion only sees Notion's connection status, not
+            # HubSpot's).
+            if path == "/status":
+                connector_name = connector_from_resource(
+                    resource_norm, self._public_url, self._get_connector_names()
+                )
+                if connector_name is None:
+                    return self._bearer_audit_fail(path, token_hash, "audience_mismatch")
+            else:
+                return self._bearer_audit_fail(path, token_hash, "unknown_connector")
+        elif not resource_matches_connector(resource_norm, self._public_url, connector_name):
             return self._bearer_audit_fail(path, token_hash, "audience_mismatch")
 
         # Revoked-app check lives here (not in _bearer_build_identity) so we can

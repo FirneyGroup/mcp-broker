@@ -273,6 +273,33 @@ class TestBearerHappyPath:
         header_names = {name.lower() for name, _ in request.scope["headers"]}
         assert b"authorization" not in header_names
 
+    async def test_valid_bearer_on_status_path_returns_identity(
+        self,
+        middleware: BrokerAuthMiddleware,
+        inbound_store: SQLiteInboundAuthStore,
+        key_store: SQLiteBrokerKeyStore,
+        registry: BrokerClientRegistry,
+    ) -> None:
+        """`/status` is app-scoped; bearer must validate via the token's resource
+        binding rather than the request path. Regression for the bug where bearer
+        auth always 401'd on /status because connector_from_request_path returned
+        None (the path doesn't start with /proxy/) — leaving `mcp:status` scope
+        unreachable despite being advertised in scopes_supported.
+        """
+        raw_token = await _seed_access_token(inbound_store)
+        identity = await _verify(
+            middleware,
+            path="/status",
+            bearer=raw_token,
+            key_store=key_store,
+            registry=registry,
+        )
+        assert isinstance(identity, BrokerAppIdentity)
+        assert identity.app_key == APP_KEY
+        # Audience narrowing preserved: token was bound to /proxy/notion, so
+        # /status calls see only Notion's connection — never HubSpot's.
+        assert identity.allowed_connectors == ["notion"]
+
 
 # =============================================================================
 # BEARER 401 CASES
