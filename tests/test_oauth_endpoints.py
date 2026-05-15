@@ -642,6 +642,47 @@ class TestTokenRefresh:
         assert response.status_code == 400
         assert _response_body(response)["error"] == "invalid_grant"
 
+    async def test_cross_client_with_wide_scope_returns_invalid_grant_not_invalid_scope(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        """Regression: cross-client refresh attempt must NOT leak whether the
+        token_hash exists via the scope-check response shape.
+
+        Original defect: `_rotate_refresh_with_scope_check` looked the prior
+        refresh up by hash alone (no client_id filter), then ran the scope
+        check against the *victim's* scope. An attacker submitting
+        `{their_client_id, victim_token_hash, deliberately_wide_scope}` would
+        get `invalid_scope` (confirming the hash exists) versus `invalid_grant`
+        (confirming the hash doesn't exist).
+
+        Fix: client_id mismatch returns the same `invalid_grant` as "not found".
+        """
+        # Victim mints a real refresh token bound to their own client_id.
+        victim_client_id, _, victim_refresh = await _mint_initial_pair(endpoints)
+        # Attacker registers their own DCR client.
+        attacker_client_id = await _register_public_client(endpoints)
+        assert attacker_client_id != victim_client_id
+
+        # Attacker submits victim's refresh token + a scope WIDER than what
+        # victim was granted. Under the bug, the response would distinguish
+        # the two failure modes.
+        response = await endpoints.token(
+            _request_with_form(
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": victim_refresh,
+                    "client_id": attacker_client_id,
+                    "scope": "mcp:proxy:notion mcp:proxy:hubspot mcp:status",
+                }
+            )
+        )
+        assert response.status_code == 400
+        assert _response_body(response)["error"] == "invalid_grant", (
+            "Cross-client request must return invalid_grant (matching the "
+            "not-found shape), NOT invalid_scope — otherwise the response "
+            "leaks whether the token_hash exists."
+        )
+
 
 # =============================================================================
 # REVOKE

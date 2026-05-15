@@ -498,8 +498,11 @@ class OAuthServerEndpoints:
         with the widened scope.
         """
         prior_row = await self._inbound_auth_store.get_refresh_row(token_hash)
-        if prior_row is None:
-            # Unknown OR already used — both surface as invalid_grant per RFC 6749 §5.2.
+        # client_id mismatch must return the SAME error as "not found" so an
+        # attacker who happens to know another client's token_hash cannot use
+        # the response shape (invalid_scope vs invalid_grant) as a confirmation
+        # oracle for whether that hash exists in the store.
+        if prior_row is None or prior_row.client_id != client_id:
             return _oauth_error(HTTPStatus.BAD_REQUEST, "invalid_grant", "refresh_token invalid")
         scope_or_error = _resolve_rotation_scope(params.get("scope"), prior_row.scope)
         if isinstance(scope_or_error, Response):
