@@ -269,24 +269,26 @@ class OAuthServerEndpoints:
         client_or_error = await self._resolve_pre_redirect(params)
         if isinstance(client_or_error, Response):
             return client_or_error
-
         connector_or_error = self._resolve_post_redirect_target(params, client_or_error)
         if isinstance(connector_or_error, Response):
             return connector_or_error
+        return await self._dispatch_consent_action(params)
 
+    async def _dispatch_consent_action(self, params: dict[str, str]) -> Response:
+        """Route the consent form's `action`: approve mints a code, deny redirects with
+        `access_denied`, anything else returns 400.
+
+        Strict allowlist on purpose: empty/unknown values previously fell through to
+        mint (harmless under PKCE, but the approve-or-deny intent is now codified).
+        """
         action = params.get("action")
         if action == "deny":
             audit_log_oauth_event("authorize_deny", client_id=params["client_id"])
             return _redirect_with_error(
                 params["redirect_uri"], params.get("state", ""), "access_denied"
             )
-        # Explicit allowlist: only "approve" mints a code. Empty or unknown
-        # action values previously fell through to mint — harmless under PKCE
-        # (the code is useless without the verifier) but the intent is clearly
-        # approve-or-deny and the fallthrough was surprising.
         if action != "approve":
             return _bad_request_html("action must be 'approve' or 'deny'")
-
         return await self._mint_authorization_code(params)
 
     # --- /oauth/token ---
