@@ -272,10 +272,15 @@ class TestAuthorizeGet:
         response = await endpoints.authorize_get(_request_with_query(_authorize_params(client_id)))
         assert response.status_code == 200
         assert response.headers["X-Frame-Options"] == "DENY"
-        assert "frame-ancestors 'none'" in response.headers["Content-Security-Policy"]
+        csp = response.headers["Content-Security-Policy"]
+        assert "frame-ancestors 'none'" in csp
+        # No form-action directive: server-side enforcement at /oauth/authorize
+        # POST is the redirect_uri boundary; duplicating the allowlist into CSP
+        # form-action couples two security layers AND blocks the POST→302 chain
+        # to the client callback (regression for the consent-submission bug).
+        assert "form-action" not in csp
         body = response.body.decode()
         assert "Approve" in body and "Deny" in body
-        # html.escape applied to dynamic values
         assert "Acme Claude" in body
 
     async def test_unknown_client_id_400_html(self, endpoints: OAuthServerEndpoints) -> None:

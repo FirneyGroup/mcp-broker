@@ -72,8 +72,30 @@ class OAuthInboundConfig(BaseModel):
         "honored when request.client.host is in this list. Empty (default) "
         "means XFF is ignored — request.client.host is the rate-limit key.",
     )
+    allowed_redirect_uris: list[str] = Field(
+        default_factory=lambda: [
+            "https://claude.ai/api/mcp/auth_callback",
+            "https://claude.com/api/mcp/auth_callback",
+        ],
+        description="Exact-match allowlist for OAuth client redirect_uris. With no "
+        "identity layer at /oauth/authorize this list IS the security boundary — "
+        "DCR rejects unknown URIs and /authorize byte-matches against the client's "
+        "registered subset of this list. Defaults cover claude.ai web; add entries "
+        "to support other remote MCP clients (Cursor, Windsurf, custom).",
+    )
 
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+    @field_validator("allowed_redirect_uris")
+    @classmethod
+    def _require_https(cls, uris: list[str]) -> list[str]:
+        for uri in uris:
+            if not uri.startswith("https://"):
+                raise ValueError(
+                    f"allowed_redirect_uris entry '{uri}' must use https:// "
+                    "(loopback HTTP is a v1.5 item — not yet supported)"
+                )
+        return uris
 
 
 class BrokerConfig(BaseModel):

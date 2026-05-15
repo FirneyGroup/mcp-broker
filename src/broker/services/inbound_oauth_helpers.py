@@ -17,7 +17,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -33,13 +33,6 @@ CODE_VERIFIER_MAX_LEN = 128
 
 # RFC 7636 §4.1 — code_verifier = high-entropy 43-128 chars from this set.
 PKCE_VERIFIER_CHARSET = re.compile(r"^[A-Za-z0-9\-._~]+$")
-
-ALLOWED_REDIRECT_URIS = frozenset(
-    [
-        "https://claude.ai/api/mcp/auth_callback",
-        "https://claude.com/api/mcp/auth_callback",
-    ]
-)
 
 HASH_PREFIX_LEN = 8  # how many chars of a token hash to include in audit logs
 
@@ -156,14 +149,15 @@ def connector_from_request_path(
 # === REDIRECT URI VALIDATION ===
 
 
-def is_acceptable_redirect_uri(uri: str) -> bool:
-    """Strict allowlist for v1: only claude.ai's known callback URIs.
+def is_acceptable_redirect_uri(uri: str, allowlist: Iterable[str]) -> bool:
+    """Exact-match check against the operator-configured allowlist.
 
-    Loopback (Claude Code, Desktop) and arbitrary HTTPS support are v1.5; behind
-    config flags then. For v1 the allowlist IS the security boundary, so we keep
-    it tight.
+    With no identity layer at ``/oauth/authorize`` the allowlist is the security
+    boundary — a stolen DCR registration with an attacker-controlled callback
+    would otherwise exfiltrate codes. Operators declare which MCP clients they
+    trust via ``broker.oauth.allowed_redirect_uris`` in ``settings.yaml``.
     """
-    return uri in ALLOWED_REDIRECT_URIS
+    return uri in allowlist
 
 
 # === BASIC AUTH PARSING ===

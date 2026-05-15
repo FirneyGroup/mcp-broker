@@ -11,7 +11,6 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from broker.services.inbound_oauth_helpers import (
-    ALLOWED_REDIRECT_URIS,
     CODE_VERIFIER_MAX_LEN,
     CODE_VERIFIER_MIN_LEN,
     audit_log_oauth_event,
@@ -256,34 +255,39 @@ def test_connector_from_request_path(
 
 # === is_acceptable_redirect_uri ===
 
-
-def test_is_acceptable_redirect_uri_claude_ai():
-    assert is_acceptable_redirect_uri("https://claude.ai/api/mcp/auth_callback") is True
-
-
-def test_is_acceptable_redirect_uri_claude_com():
-    assert is_acceptable_redirect_uri("https://claude.com/api/mcp/auth_callback") is True
+_TEST_ALLOWLIST = (
+    "https://claude.ai/api/mcp/auth_callback",
+    "https://claude.com/api/mcp/auth_callback",
+)
 
 
-def test_is_acceptable_redirect_uri_arbitrary_https_rejected():
-    assert is_acceptable_redirect_uri("https://evil.example.com/callback") is False
+def test_is_acceptable_redirect_uri_exact_match():
+    assert (
+        is_acceptable_redirect_uri("https://claude.ai/api/mcp/auth_callback", _TEST_ALLOWLIST)
+        is True
+    )
+    assert (
+        is_acceptable_redirect_uri("https://claude.com/api/mcp/auth_callback", _TEST_ALLOWLIST)
+        is True
+    )
 
 
-def test_is_acceptable_redirect_uri_loopback_rejected():
-    """v1 strict allowlist — loopback support is v1.5."""
-    assert is_acceptable_redirect_uri("http://127.0.0.1:8080/callback") is False
-    assert is_acceptable_redirect_uri("http://localhost:8080/callback") is False
+def test_is_acceptable_redirect_uri_off_allowlist_rejected():
+    """Empty allowlist + arbitrary URI both reject — the function is exact-match only."""
+    assert is_acceptable_redirect_uri("https://evil.example.com/callback", _TEST_ALLOWLIST) is False
+    assert is_acceptable_redirect_uri("https://anything.test/cb", ()) is False
 
 
-def test_is_acceptable_redirect_uri_subdomain_of_claude_rejected():
+def test_is_acceptable_redirect_uri_subdomain_rejected():
     """Allowlist is exact — subdomains do not match."""
-    assert is_acceptable_redirect_uri("https://staging.claude.ai/api/mcp/auth_callback") is False
+    assert (
+        is_acceptable_redirect_uri(
+            "https://staging.claude.ai/api/mcp/auth_callback", _TEST_ALLOWLIST
+        )
+        is False
+    )
 
 
-def test_allowed_redirect_uris_contains_known_callbacks():
-    """Behavioural sanity — the set is what the policy says it is."""
-    assert "https://claude.ai/api/mcp/auth_callback" in ALLOWED_REDIRECT_URIS
-    assert "https://claude.com/api/mcp/auth_callback" in ALLOWED_REDIRECT_URIS
 
 
 # === parse_basic_auth ===

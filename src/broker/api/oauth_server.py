@@ -113,11 +113,17 @@ broker to:</p>
 </html>
 """
 
-# Consent page headers — defense-in-depth against clickjacking. CSP is the
-# load-bearing one; X-Frame-Options exists for older browser shims.
+# Consent page headers. `frame-ancestors 'none'` + `X-Frame-Options: DENY`
+# block clickjacking. We deliberately do NOT set `form-action` — the
+# server-side redirect_uri allowlist enforced at /oauth/authorize POST is the
+# real security boundary, and form-action would mean every operator-added
+# entry in `broker.oauth.allowed_redirect_uris` had to be duplicated into the
+# CSP origin list (CSP3 checks form-action across the entire redirect chain,
+# including the 302 to the client callback). Server-side enforcement covers
+# the same threat without that coupling.
 _CONSENT_HEADERS = {
     "X-Frame-Options": "DENY",
-    "Content-Security-Policy": "frame-ancestors 'none'; form-action 'self'",
+    "Content-Security-Policy": "frame-ancestors 'none'",
     "Cache-Control": "no-store",
 }
 
@@ -220,7 +226,9 @@ class OAuthServerEndpoints:
             return error
         assert registration is not None  # noqa: S101 -- guaranteed by error short-circuit above
 
-        redirect_error = _validate_registration_redirects(registration.redirect_uris)
+        redirect_error = _validate_registration_redirects(
+            registration.redirect_uris, self._config.allowed_redirect_uris
+        )
         if redirect_error is not None:
             return redirect_error
 
@@ -358,7 +366,7 @@ class OAuthServerEndpoints:
             return _bad_request_html("client_id not registered")
         redirect_uri = params.get("redirect_uri", "")
         if redirect_uri not in client_record.redirect_uris or not is_acceptable_redirect_uri(
-            redirect_uri
+            redirect_uri, self._config.allowed_redirect_uris
         ):
             return _bad_request_html("redirect_uri not registered for this client")
         return client_record
@@ -694,7 +702,9 @@ async def _parse_registration_request(
         )
 
 
-def _validate_registration_redirects(redirect_uris: list[str]) -> Response | None:
+def _validate_registration_redirects(
+    redirect_uris: list[str], allowlist: list[str]
+) -> Response | None:
     """Reject fragments (RFC 7591 §2) and anything outside the v1 allowlist."""
     for uri in redirect_uris:
         if "#" in uri:
@@ -703,11 +713,11 @@ def _validate_registration_redirects(redirect_uris: list[str]) -> Response | Non
                 "invalid_redirect_uri",
                 "redirect_uri must not contain a fragment",
             )
-        if not is_acceptable_redirect_uri(uri):
+        if not is_acceptable_redirect_uri(uri, allowlist):
             return _oauth_error(
                 HTTPStatus.BAD_REQUEST,
                 "invalid_redirect_uri",
-                f"redirect_uri '{uri}' not allowed (claude.ai callbacks only in v1)",
+                f"redirect_uri '{uri}' not in broker.oauth.allowed_redirect_uris",
             )
     return None
 

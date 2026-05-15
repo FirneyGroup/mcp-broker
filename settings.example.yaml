@@ -29,6 +29,13 @@ broker:
   #   code_ttl_seconds: 60
   #   dcr_rate_limit_per_ip: 10
   #   dcr_rate_limit_window_seconds: 900     # 15 min
+  #   # Exact-match allowlist of accepted client redirect_uris. With no identity
+  #   # layer at /oauth/authorize, this list IS the security boundary. Default
+  #   # covers claude.ai web; add entries for other remote MCP clients you trust
+  #   # (Cursor, Windsurf, custom). HTTPS-only — loopback is a v1.5 item.
+  #   allowed_redirect_uris:
+  #     - https://claude.ai/api/mcp/auth_callback
+  #     - https://claude.com/api/mcp/auth_callback
 
 store:
   backend: sqlite
