@@ -509,6 +509,42 @@ class TestProxyAuth:
         result = _extract_app_key(request)
         assert result == "app:test"
 
+    def test_upstream_not_connected_returns_distinguishable_503(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Bearer-valid + missing-outbound-OAuth returns 503 with structured body.
+
+        Regression: previously returned bare 401 which collided semantically with
+        inbound-bearer failures and gave the operator no actionable signal.
+        """
+        import json
+        import logging
+
+        from broker.services.proxy import _upstream_not_connected_response
+
+        connector = MagicMock()
+        connector.meta.display_name = "Notion"
+
+        with caplog.at_level(logging.WARNING, logger="broker.services.proxy"):
+            response = _upstream_not_connected_response("notion", connector, "acme:claude_ai")
+
+        assert response.status_code == 503
+        body = json.loads(response.body)
+        assert body == {
+            "error": "upstream_not_connected",
+            "error_description": (
+                "Broker has no Notion access token for app_key acme:claude_ai. "
+                "The inbound bearer is valid; the outbound OAuth connection "
+                "has not been completed."
+            ),
+            "connector": "notion",
+            "app_key": "acme:claude_ai",
+            "next_step": "Complete outbound connect at /oauth/notion/connect?app_key=acme:claude_ai",
+        }
+        warn_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("upstream_not_connected" in r.getMessage() for r in warn_records)
+        assert any("acme:claude_ai" in r.getMessage() for r in warn_records)
+
 
 # =============================================================================
 # MODELS
