@@ -22,6 +22,7 @@ from broker.api.admin import AdminEndpoints
 from broker.api.oauth_server import OAuthServerEndpoints
 from broker.api.wellknown import (
     handle_authorization_server_metadata,
+    handle_broker_protected_resource_metadata,
     handle_protected_resource_metadata,
 )
 from broker.config import BrokerSettings, load_settings
@@ -458,6 +459,22 @@ async def wellknown_oauth_as():
     if it can't read the metadata."""
     settings = _get_settings()
     return handle_authorization_server_metadata(
+        settings.broker.public_url, ConnectorRegistry.list_names()
+    )
+
+
+@app.get("/.well-known/oauth-protected-resource")
+async def wellknown_oauth_pr_broker():
+    """RFC 9728 PRM for the broker as a whole.
+
+    Returned when a bearer challenge fires on a non-connector-scoped path
+    (e.g. ``/status``). The path-parameterized handler below requires at least
+    one segment, so this bare route covers the no-suffix case; without it the
+    ``WWW-Authenticate: Bearer resource_metadata="..."`` URL would 404 and
+    break MCP-client discovery bootstrap.
+    """
+    settings = _get_settings()
+    return handle_broker_protected_resource_metadata(
         settings.broker.public_url, ConnectorRegistry.list_names()
     )
 

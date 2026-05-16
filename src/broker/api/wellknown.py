@@ -41,7 +41,11 @@ def build_authorization_server_metadata(
             "client_secret_basic",
             "client_secret_post",
         ],
-        "revocation_endpoint_auth_methods_supported": ["none", "client_secret_basic"],
+        "revocation_endpoint_auth_methods_supported": [
+            "none",
+            "client_secret_basic",
+            "client_secret_post",
+        ],
         "scopes_supported": scopes,
     }
 
@@ -57,6 +61,27 @@ def build_protected_resource_metadata(
         "resource": f"{issuer}/{resource_path.rstrip('/')}",
         "authorization_servers": [issuer],
         "scopes_supported": [f"mcp:proxy:{connector_name}", "mcp:status"],
+        "bearer_methods_supported": ["header"],
+    }
+
+
+def build_broker_protected_resource_metadata(
+    public_url: str,
+    connector_names: list[str],
+) -> dict[str, Any]:
+    """RFC 9728 PRM for the broker as a whole.
+
+    Returned when a bearer challenge fires on a non-connector-scoped path
+    (notably ``/status``, which is app-scoped). The client uses this PRM to
+    discover the AS, then resolves per-connector resources from the AS
+    metadata's ``scopes_supported`` list.
+    """
+    issuer = public_url.rstrip("/")
+    scopes = ["mcp:status"] + [f"mcp:proxy:{name}" for name in connector_names]
+    return {
+        "resource": issuer,
+        "authorization_servers": [issuer],
+        "scopes_supported": scopes,
         "bearer_methods_supported": ["header"],
     }
 
@@ -89,4 +114,13 @@ def handle_protected_resource_metadata(
     if extracted_name not in connector_names:
         raise HTTPException(status_code=404, detail="unknown_connector")
     payload = build_protected_resource_metadata(public_url, path, extracted_name)
+    return JSONResponse(payload, headers=dict(_DISCOVERY_CACHE_HEADER))
+
+
+def handle_broker_protected_resource_metadata(
+    public_url: str,
+    connector_names: list[str],
+) -> JSONResponse:
+    """Return broker-level PRM for non-connector-scoped paths (e.g. ``/status``)."""
+    payload = build_broker_protected_resource_metadata(public_url, connector_names)
     return JSONResponse(payload, headers=dict(_DISCOVERY_CACHE_HEADER))

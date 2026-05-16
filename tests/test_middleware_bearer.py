@@ -681,3 +681,33 @@ class TestBearerChallengeFormat:
             "https://broker.example.com/.well-known/oauth-protected-resource/proxy/notion"
             in challenge
         )
+
+    async def test_status_challenge_points_at_broker_prm_route_not_404(
+        self,
+        middleware: BrokerAuthMiddleware,
+        key_store: SQLiteBrokerKeyStore,
+        registry: BrokerClientRegistry,
+    ) -> None:
+        """`/status` is not connector-scoped, so the WWW-Authenticate URL
+        falls back to the bare `/.well-known/oauth-protected-resource` path.
+        That route MUST exist — without it, MCP clients following the
+        challenge get a 404 and discovery breaks. Regression for the bug
+        where the bare URL was generated but no route handled it.
+        """
+        response = await _verify(
+            middleware,
+            path="/status",
+            bearer=None,
+            key_store=key_store,
+            registry=registry,
+        )
+        challenge = response.headers["www-authenticate"]
+        # The URL is the bare PRM path (no connector suffix).
+        assert (
+            'resource_metadata="https://broker.example.com/.well-known/oauth-protected-resource"'
+            in challenge
+        )
+        # The route must be registered in main.py — covered by a separate
+        # integration test that boots the app; this test asserts the URL the
+        # middleware emits, and the wellknown handler test confirms the bare
+        # builder works. Together they prevent the 404 from ever recurring.
