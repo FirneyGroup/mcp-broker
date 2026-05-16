@@ -965,6 +965,87 @@ class TestConfidentialClientAuth:
         assert _response_body(response)["error"] == "invalid_client"
 
 
+class TestRegisteredAuthMethodEnforcement:
+    """The DCR-registered ``token_endpoint_auth_method`` must be enforced at /token.
+
+    Regression: previously the registered method was persisted and echoed back
+    in the registration response but never checked during token exchange. A
+    client registered as ``client_secret_basic`` could authenticate via body
+    credentials and vice versa, divergent from the AS metadata's per-method
+    declaration. With enforcement, each client must use the exact method it
+    registered with.
+    """
+
+    async def test_basic_client_rejected_when_sending_post_credentials(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        register_response = await endpoints.register(
+            _request_with_json(
+                _registration_payload(token_endpoint_auth_method="client_secret_basic")
+            )
+        )
+        body = _response_body(register_response)
+        client_id = body["client_id"]
+        raw_secret = body["client_secret"]
+
+        # Send the secret via POST body, not the Authorization header.
+        token_response = await endpoints.token(
+            _request_with_form(
+                {
+                    "grant_type": "authorization_code",
+                    "client_id": client_id,
+                    "client_secret": raw_secret,
+                }
+            )
+        )
+        assert token_response.status_code == 401
+        body = _response_body(token_response)
+        assert body["error"] == "invalid_client"
+        assert "client_secret_basic" in body["error_description"]
+
+    async def test_post_client_rejected_when_sending_basic_credentials(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        register_response = await endpoints.register(
+            _request_with_json(
+                _registration_payload(token_endpoint_auth_method="client_secret_post")
+            )
+        )
+        body = _response_body(register_response)
+        client_id = body["client_id"]
+        raw_secret = body["client_secret"]
+
+        basic_header = base64.b64encode(f"{client_id}:{raw_secret}".encode()).decode()
+        token_response = await endpoints.token(
+            _request_with_form(
+                {"grant_type": "authorization_code"},
+                headers={"authorization": f"Basic {basic_header}"},
+            )
+        )
+        assert token_response.status_code == 401
+        body = _response_body(token_response)
+        assert body["error"] == "invalid_client"
+        assert "client_secret_post" in body["error_description"]
+
+    async def test_public_client_rejected_when_sending_client_secret(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        client_id = await _register_public_client(endpoints)
+        token_response = await endpoints.token(
+            _request_with_form(
+                {
+                    "grant_type": "authorization_code",
+                    "client_id": client_id,
+                    "client_secret": "should-not-be-here",
+                }
+            )
+        )
+        assert token_response.status_code == 401
+        body = _response_body(token_response)
+        assert body["error"] == "invalid_client"
+        assert "public client" in body["error_description"]
+
+
 class TestScopeSubset:
     def test_subset_passes(self) -> None:
         assert _scope_is_subset("a", "a b")

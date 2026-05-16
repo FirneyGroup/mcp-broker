@@ -426,11 +426,15 @@ class OAuthServerEndpoints:
     ) -> str | Response:
         """Return the authenticated ``client_id`` or an error ``Response``.
 
-        Confidential clients MUST authenticate via Basic auth header or POST
-        body (``client_id`` + ``client_secret``); public clients pass only
-        ``client_id``. Mismatched auth method → 401 ``invalid_client``.
+        Enforces that the client's registered ``token_endpoint_auth_method``
+        matches how the credentials arrived: a client registered as
+        ``client_secret_basic`` may not authenticate via body credentials and
+        a client registered as ``client_secret_post`` may not authenticate via
+        the ``Authorization: Basic`` header. Without this guard the registered
+        method is decorative and the client can pick whichever it likes per
+        request — diverging from the AS metadata's per-method declaration.
         """
-        client_id, supplied_secret = _extract_client_credentials(request, params)
+        client_id, supplied_secret, source = _extract_client_credentials(request, params)
         if not client_id:
             return _oauth_error(HTTPStatus.UNAUTHORIZED, "invalid_client", "client_id required")
         client_record = await self._inbound_auth_store.get_client(client_id)
@@ -438,6 +442,9 @@ class OAuthServerEndpoints:
             return _oauth_error(
                 HTTPStatus.UNAUTHORIZED, "invalid_client", "client_id not registered"
             )
+        method_error = _enforce_registered_auth_method(client_record, source)
+        if method_error is not None:
+            return method_error
         if client_record.token_endpoint_auth_method == _PUBLIC_CLIENT_AUTH_METHOD:
             return client_id
         return await self._authenticate_confidential_client(client_id, supplied_secret)
@@ -746,17 +753,61 @@ def _validate_pkce(params: dict[str, str]) -> str | None:
     return None
 
 
-def _extract_client_credentials(request: Request, params: dict[str, str]) -> tuple[str, str]:
-    """Pull ``(client_id, client_secret)`` from Basic auth header or POST body.
+def _enforce_registered_auth_method(
+    client_record: OAuthClient, source: Literal["basic", "post", "none"]
+) -> Response | None:
+    """Reject when credentials arrived via a method the client didn't register for.
 
-    RFC 6749 §2.3.1 allows either form; Basic header wins when present. Returns
-    empty strings when neither carries a value — caller surfaces the right
-    OAuth error.
+    Public clients (``"none"``) MUST NOT carry a client_secret; confidential
+    clients MUST present it via the exact method they registered with. Returns
+    ``invalid_client`` for any mismatch; returns ``None`` to accept.
+    """
+    registered = client_record.token_endpoint_auth_method
+    if registered == _PUBLIC_CLIENT_AUTH_METHOD:
+        if source != "none":
+            return _oauth_error(
+                HTTPStatus.UNAUTHORIZED,
+                "invalid_client",
+                "public client must not send a client_secret",
+            )
+        return None
+    if registered == "client_secret_basic" and source != "basic":
+        return _oauth_error(
+            HTTPStatus.UNAUTHORIZED,
+            "invalid_client",
+            "client registered for client_secret_basic must use the Authorization header",
+        )
+    if registered == "client_secret_post" and source != "post":
+        return _oauth_error(
+            HTTPStatus.UNAUTHORIZED,
+            "invalid_client",
+            "client registered for client_secret_post must use form-body credentials",
+        )
+    return None
+
+
+def _extract_client_credentials(
+    request: Request, params: dict[str, str]
+) -> tuple[str, str, Literal["basic", "post", "none"]]:
+    """Pull ``(client_id, client_secret, source)`` from Basic auth header or POST body.
+
+    The ``source`` lets the caller enforce the client's registered
+    ``token_endpoint_auth_method``: a client that registered as
+    ``client_secret_basic`` MUST present credentials via Basic auth and vice
+    versa. RFC 6749 §2.3.1 allows either form on the wire but RFC 7591 §2.3
+    binds each client to one method at registration time.
+
+    Returns empty strings + ``source="none"`` when neither carries a value —
+    caller surfaces the right OAuth error.
     """
     basic = parse_basic_auth(request.headers.get("authorization", ""))
     if basic is not None:
-        return basic
-    return params.get("client_id", ""), params.get("client_secret", "")
+        return basic[0], basic[1], "basic"
+    body_id = params.get("client_id", "")
+    body_secret = params.get("client_secret", "")
+    if body_secret:
+        return body_id, body_secret, "post"
+    return body_id, body_secret, "none"
 
 
 def _validate_code_grant_params(
