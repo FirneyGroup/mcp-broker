@@ -965,6 +965,69 @@ class TestConfidentialClientAuth:
         assert _response_body(response)["error"] == "invalid_client"
 
 
+class TestRegisteredGrantTypeEnforcement:
+    """The DCR-registered ``grant_types`` must be enforced at /token.
+
+    Regression: previously stored at DCR but ignored at token dispatch. A
+    client registered for ``["authorization_code"]`` could still call /token
+    with ``grant_type=refresh_token`` and succeed. Empty ``grant_types=[]``
+    was also accepted at registration and silently bypassed.
+    """
+
+    async def test_empty_grant_types_rejected_at_registration(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        response = await endpoints.register(
+            _request_with_json(_registration_payload(grant_types=[]))
+        )
+        # Pydantic validation failure at registration — empty list is invalid.
+        assert response.status_code == 400
+
+    async def test_client_without_refresh_grant_rejected_on_refresh_call(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        register_response = await endpoints.register(
+            _request_with_json(_registration_payload(grant_types=["authorization_code"]))
+        )
+        client_id = _response_body(register_response)["client_id"]
+
+        # Even with a bogus refresh_token, the grant_types check fires before
+        # the token-validation logic — the client never registered for refresh.
+        response = await endpoints.token(
+            _request_with_form(
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": "mcp_rt_irrelevant",
+                    "client_id": client_id,
+                }
+            )
+        )
+        assert response.status_code == 400
+        body = _response_body(response)
+        assert body["error"] == "unauthorized_client"
+        assert "grant_type=refresh_token" in body["error_description"]
+
+    async def test_client_without_auth_code_grant_rejected_on_auth_code_call(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        register_response = await endpoints.register(
+            _request_with_json(_registration_payload(grant_types=["refresh_token"]))
+        )
+        client_id = _response_body(register_response)["client_id"]
+
+        response = await endpoints.token(
+            _request_with_form(
+                {
+                    "grant_type": "authorization_code",
+                    "code": "irrelevant",
+                    "client_id": client_id,
+                }
+            )
+        )
+        assert response.status_code == 400
+        assert _response_body(response)["error"] == "unauthorized_client"
+
+
 class TestRegisteredAuthMethodEnforcement:
     """The DCR-registered ``token_endpoint_auth_method`` must be enforced at /token.
 

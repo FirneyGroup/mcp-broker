@@ -27,7 +27,14 @@ class RegistrationRequest(BaseModel):
         "none"  # noqa: S105 -- RFC 7591 auth method enum value, not a credential
     )
     grant_types: list[Literal["authorization_code", "refresh_token"]] = Field(
-        default_factory=lambda: ["authorization_code", "refresh_token"]
+        default_factory=lambda: ["authorization_code", "refresh_token"],
+        min_length=1,
+        description=(
+            "Grant types the client wants to use. Each value is checked at /token "
+            "before dispatch — registering ['authorization_code'] only means the "
+            "client can NOT later refresh, and no refresh_token will be issued. "
+            "Empty list rejected at registration time."
+        ),
     )
     response_types: list[Literal["code"]] = Field(default_factory=lambda: ["code"])
     scope: str | None = Field(default=None, max_length=SCOPE_MAX_LEN)

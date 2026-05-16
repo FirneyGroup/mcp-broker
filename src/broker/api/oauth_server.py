@@ -313,6 +313,23 @@ class OAuthServerEndpoints:
         if isinstance(client_or_error, Response):
             return client_or_error
 
+        # Enforce that this client registered for the grant_type it's requesting.
+        # RFC 7591 §2 binds grant_types at registration; without this check a
+        # client registered for ['authorization_code'] only can still call
+        # /token with grant_type=refresh_token. Only gate on grant_types the
+        # server itself supports — unknown values fall through to the existing
+        # `unsupported_grant_type` branch below so RFC 6749 §5.2 semantics are
+        # preserved (server-unknown ≠ this-client-not-registered).
+        if grant_type in (_GRANT_AUTH_CODE, _GRANT_REFRESH):
+            client_record = await self._inbound_auth_store.get_client(client_or_error)
+            assert client_record is not None  # noqa: S101 -- authenticate_token_client just verified existence
+            if grant_type not in client_record.grant_types:
+                return _oauth_error(
+                    HTTPStatus.BAD_REQUEST,
+                    "unauthorized_client",
+                    f"client not registered for grant_type={grant_type}",
+                )
+
         if grant_type == _GRANT_AUTH_CODE:
             return await self._token_authorization_code(params, client_or_error)
         if grant_type == _GRANT_REFRESH:
