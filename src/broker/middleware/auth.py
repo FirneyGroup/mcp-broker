@@ -224,7 +224,11 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
         supplied on the same request.
         """
         authz = request.headers.get("authorization", "")
-        if not authz.startswith("Bearer "):
+        # RFC 6750 §2.1: the Bearer auth-scheme is case-insensitive. Real
+        # clients send "Bearer" capitalized but spec-conformant ones may send
+        # "bearer" / "BEARER"; treating them as not-a-bearer falls through to
+        # legacy key auth → silent 403, breaking interop without diagnostics.
+        if not authz.lower().startswith("bearer "):
             return None
         return await self._verify_bearer(request, path, authz, client_registry)
 

@@ -54,9 +54,13 @@ from broker.services.inbound_oauth_helpers import (
 
 # === CONSTANTS ===
 
-# 43..128 base64url chars — PKCE S256, RFC 7636 §4.2
-_CODE_CHALLENGE_MIN_LEN = 43
-_CODE_CHALLENGE_MAX_LEN = 128
+# RFC 7636 §4.2: the S256 challenge is ALWAYS exactly 43 chars —
+# base64url(SHA-256) is 32 bytes → ceil(32*8/6) = 43 chars (no padding).
+# The 43..128 range applies to the verifier (§4.1), not the challenge.
+# Accepting longer challenges defers the failure to PKCE verification at
+# /token, which returns an opaque `invalid_grant` — harder to debug than
+# `invalid_request` here.
+_CODE_CHALLENGE_LEN = 43
 
 _BEARER_TOKEN_TYPE = "Bearer"  # noqa: S105 -- RFC 6749 §5.1 token_type value, not a credential
 
@@ -353,18 +357,18 @@ class OAuthServerEndpoints:
             # RFC 7009 §2.2: invalid clients still get 200 to avoid leaking
             # which client_ids exist. Authentication failures translate to a
             # silent no-op rather than the standard 401.
-            return Response(status_code=HTTPStatus.OK)
+            return Response(status_code=HTTPStatus.OK, headers=_NO_STORE_HEADERS)
 
         raw_token = params.get("token", "").strip()
         if not raw_token:
-            return Response(status_code=HTTPStatus.OK)
+            return Response(status_code=HTTPStatus.OK, headers=_NO_STORE_HEADERS)
         token_hash = sha256_hex(raw_token)
         kinds = _kinds_from_hint(params.get("token_type_hint", ""))
         for token_kind in kinds:
             await self._inbound_auth_store.revoke_token(
                 token_hash, client_or_error, kind=token_kind
             )
-        return Response(status_code=HTTPStatus.OK)
+        return Response(status_code=HTTPStatus.OK, headers=_NO_STORE_HEADERS)
 
     # --- INTERNAL: validation pipeline ---
 
@@ -422,13 +426,15 @@ class OAuthServerEndpoints:
     ) -> tuple[str | None, str | None]:
         """Return ``(connector_name, None)`` on success, or ``(None, error_code)`` on failure.
 
-        ``error_code`` is one of: ``"invalid_request"``, ``"invalid_target"``.
-        Empty/malformed resource → ``invalid_request``; unknown connector → ``invalid_target``.
+        ``error_code`` is always ``"invalid_target"``. RFC 8707 §2 has a
+        single error code for any resource-indicator problem (malformed or
+        unknown); distinguishing them would diverge from spec and give clients
+        less actionable error info than the spec mandates.
         """
         try:
             resource_norm = normalize_resource(resource_param)
         except ValueError:
-            return None, "invalid_request"
+            return None, "invalid_target"
         connector = connector_from_resource(resource_norm, self._public_url, connector_names)
         if connector is None:
             return None, "invalid_target"
@@ -702,8 +708,19 @@ def _not_found() -> Response:
 
 
 def _oauth_error(status_code: int, code: str, description: str) -> Response:
-    """RFC 6749 §5.2 error payload as JSON."""
-    return JSONResponse({"error": code, "error_description": description}, status_code=status_code)
+    """RFC 6749 §5.2 error payload as JSON.
+
+    Token-endpoint errors (`invalid_client`, `invalid_grant`,
+    `unauthorized_client`, etc.) all flow through here and per RFC 6749 §5.1
+    MUST carry `Cache-Control: no-store` + `Pragma: no-cache`. Same headers
+    used for happy-path responses — applied uniformly so no error path can
+    leak a token-bearing response into a shared cache.
+    """
+    return JSONResponse(
+        {"error": code, "error_description": description},
+        status_code=status_code,
+        headers=_NO_STORE_HEADERS,
+    )
 
 
 def _bad_request_html(description: str) -> Response:
@@ -765,7 +782,7 @@ def _validate_pkce(params: dict[str, str]) -> str | None:
     if method != _VALID_CODE_CHALLENGE_METHOD:
         return "invalid_request"
     challenge = params.get("code_challenge", "")
-    if not _CODE_CHALLENGE_MIN_LEN <= len(challenge) <= _CODE_CHALLENGE_MAX_LEN:
+    if len(challenge) != _CODE_CHALLENGE_LEN:
         return "invalid_request"
     return None
 

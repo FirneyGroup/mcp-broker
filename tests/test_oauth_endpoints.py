@@ -321,6 +321,23 @@ class TestAuthorizeGet:
         assert response.status_code == 302
         assert "error=invalid_request" in response.headers["location"]
 
+    @pytest.mark.parametrize("challenge_len", [42, 44, 60, 128])
+    async def test_non_43_char_challenge_rejected_at_authorize(
+        self, challenge_len: int, endpoints: OAuthServerEndpoints
+    ) -> None:
+        """RFC 7636 §4.2 — S256 challenge is ALWAYS exactly 43 base64url chars
+        (32-byte SHA-256 → base64url no padding). Accepting other lengths at
+        /authorize defers the failure to PKCE verification at /token with an
+        opaque `invalid_grant` — harder to debug for clients. Reject early.
+        """
+        client_id = await _register_public_client(endpoints)
+        wrong_challenge = "a" * challenge_len
+        response = await endpoints.authorize_get(
+            _request_with_query(_authorize_params(client_id, code_challenge=wrong_challenge))
+        )
+        assert response.status_code == 302
+        assert "error=invalid_request" in response.headers["location"]
+
     async def test_unknown_resource_post_redirect(self, endpoints: OAuthServerEndpoints) -> None:
         client_id = await _register_public_client(endpoints)
         response = await endpoints.authorize_get(
@@ -340,9 +357,11 @@ class TestAuthorizeGet:
         response = await endpoints.authorize_get(
             _request_with_query(_authorize_params(client_id, resource=f"{GENERIC_RESOURCE}#frag"))
         )
-        # Fragment → normalize_resource raises → invalid_request post-redirect (not 500).
+        # Fragment → normalize_resource raises → `invalid_target` per RFC 8707
+        # §2 (the spec's single error code for any resource-indicator problem,
+        # including syntactic malformation). NOT 500.
         assert response.status_code == 302
-        assert "error=invalid_request" in response.headers["location"]
+        assert "error=invalid_target" in response.headers["location"]
 
     async def test_scope_widening_outside_connector_rejected(
         self, endpoints: OAuthServerEndpoints
@@ -742,6 +761,13 @@ class TestRevoke:
             )
         )
         assert response.status_code == 200
+        # RFC 6749 §5.1 — revoke is a token-endpoint response and MUST carry
+        # `Cache-Control: no-store` + `Pragma: no-cache` so caches don't
+        # retain the response payload (even though 200 is empty, applying
+        # the headers uniformly across the token-endpoint family is the
+        # standard pattern).
+        assert response.headers.get("Cache-Control") == "no-store"
+        assert response.headers.get("Pragma") == "no-cache"
         # Access row should be gone.
         conn = sqlite3.connect(store._db_path)
         try:
@@ -751,6 +777,25 @@ class TestRevoke:
         finally:
             conn.close()
         assert access_count == 0
+
+    async def test_oauth_error_response_carries_no_store_headers(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        """Token-endpoint errors flow through `_oauth_error()` and MUST carry
+        the no-store headers — otherwise a shared cache could retain an
+        error containing the request's bearer / client_id."""
+        response = await endpoints.token(
+            _request_with_form(
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": "mcp_rt_does_not_exist",
+                    "client_id": "mcp_client_unregistered",
+                }
+            )
+        )
+        assert response.status_code in (400, 401)
+        assert response.headers.get("Cache-Control") == "no-store"
+        assert response.headers.get("Pragma") == "no-cache"
 
     async def test_refresh_revoke_cascades_family(
         self, endpoints: OAuthServerEndpoints, store: SQLiteInboundAuthStore

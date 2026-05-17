@@ -256,6 +256,29 @@ class TestBearerHappyPath:
         assert isinstance(identity, BrokerAppIdentity)
         assert identity.allowed_connectors == ["notion"]
 
+    @pytest.mark.parametrize("scheme", ["Bearer", "bearer", "BEARER", "bEaReR"])
+    async def test_bearer_scheme_is_case_insensitive(
+        self,
+        scheme: str,
+        middleware: BrokerAuthMiddleware,
+        inbound_store: SQLiteInboundAuthStore,
+        key_store: SQLiteBrokerKeyStore,
+        registry: BrokerClientRegistry,
+    ) -> None:
+        """RFC 6750 §2.1 — Bearer auth-scheme is case-insensitive. A client
+        sending `bearer` (lowercase) must be authenticated, not silently
+        passed to legacy key auth (which would return 403 with no diagnostic).
+        """
+        raw_token = await _seed_access_token(inbound_store)
+        request = _make_request(path="/proxy/notion/mcp")
+        request.headers["authorization"] = f"{scheme} {raw_token}"
+        request.scope["headers"] = [(k.encode(), v.encode()) for k, v in request.headers.items()]
+        identity = await middleware._extract_and_verify(
+            request, "/proxy/notion/mcp", key_store, registry
+        )
+        assert isinstance(identity, BrokerAppIdentity)
+        assert identity.app_key == APP_KEY
+
     async def test_bearer_strips_authorization_from_scope(
         self,
         middleware: BrokerAuthMiddleware,
