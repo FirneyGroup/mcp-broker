@@ -913,13 +913,15 @@ def _kinds_from_hint(token_type_hint: str) -> tuple[Literal["access", "refresh"]
     """Map RFC 7009 ``token_type_hint`` to the list of token kinds to revoke.
 
     The hint is advisory per §2.1; servers SHOULD attempt the other type if the
-    hint misses. We always try both unless the hint is one of the two
-    well-known values.
+    hint misses. Ordering tries the hinted kind first for efficiency, then falls
+    back so a mismatched hint still revokes the correct token type — otherwise a
+    client calling ``revoke(token=<refresh>, token_type_hint=access_token)`` would
+    silently no-op and leave the family alive.
     """
     if token_type_hint == "access_token":  # noqa: S105 -- RFC 7009 §2.1 hint value, not a credential
-        return ("access",)
+        return ("access", "refresh")
     if token_type_hint == "refresh_token":  # noqa: S105 -- RFC 7009 §2.1 hint value, not a credential
-        return ("refresh",)
+        return ("refresh", "access")
     return ("access", "refresh")
 
 

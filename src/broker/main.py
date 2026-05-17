@@ -128,9 +128,18 @@ def _load_connectors(connector_names: list[str]) -> None:
 
 
 def _start_token_refresh(settings: BrokerSettings) -> asyncio.Task[None] | None:
-    """Start the background token refresh loop if enabled. Returns the task or None."""
-    if not settings.broker.token_refresh_enabled:
-        logger.info("[Broker] Background token refresh disabled")
+    """Start the background maintenance loop.
+
+    The loop covers two independent concerns on the same cadence: outbound
+    token refresh and inbound OAuth state cleanup. It starts when either is
+    active, and the loop body gates each step on its own flag — so an
+    operator who disables token refresh still gets OAuth cleanup, and an
+    operator who hasn't enabled OAuth still gets token refresh.
+    """
+    refresh_active = settings.broker.token_refresh_enabled
+    oauth_active = settings.broker.oauth.enabled
+    if not refresh_active and not oauth_active:
+        logger.info("[Broker] Background maintenance disabled (no refresh + no OAuth)")
         return None
     base_url = settings.broker.public_url
     return asyncio.create_task(
@@ -455,9 +464,13 @@ def _oauth_disabled_not_found() -> JSONResponse:
 
 @app.get("/.well-known/oauth-authorization-server")
 async def wellknown_oauth_as():
-    """RFC 8414 AS metadata. Always reachable so claude.ai discovery works
-    before the operator flips ``broker.oauth.enabled`` — claude.ai stops here
-    if it can't read the metadata."""
+    """RFC 8414 AS metadata.
+
+    The route is always mounted, but unauthenticated discovery only succeeds
+    when ``broker.oauth.enabled=true`` — the middleware exempts the
+    ``/.well-known/oauth-`` prefix on the same flag. With OAuth disabled,
+    callers must present a broker key to read this document.
+    """
     settings = _get_settings()
     return handle_authorization_server_metadata(
         settings.broker.public_url, ConnectorRegistry.list_names()
@@ -768,21 +781,25 @@ async def _refresh_expiring_tokens(base_url: str) -> dict[str, int]:
 
 
 async def _token_refresh_loop(base_url: str, interval_seconds: int) -> None:
-    """Periodically refresh expiring tokens. Runs as a background asyncio task.
+    """Background maintenance loop. Runs as an asyncio task.
 
-    Also reaps expired rows from the inbound auth store when OAuth is enabled —
-    cheaper than a separate timer and runs on the same cadence as everything
-    else that touches token state.
+    Two flag-gated steps run on the same cadence:
+      • outbound token refresh when ``broker.token_refresh_enabled=true``
+      • inbound OAuth state cleanup whenever the inbound auth store exists
+        (i.e. whenever ``broker.oauth.enabled=true``)
+
+    Either step can be disabled without disabling the other.
     """
     logger.info("[TokenRefresh] Started (interval=%ds)", interval_seconds)
     while True:
         try:
-            results = await _refresh_expiring_tokens(base_url)
-            if results["refreshed"] or results["failed"]:
-                logger.info("[TokenRefresh] %s", results)
+            if _get_settings().broker.token_refresh_enabled:
+                refresh_summary = await _refresh_expiring_tokens(base_url)
+                if refresh_summary["refreshed"] or refresh_summary["failed"]:
+                    logger.info("[TokenRefresh] %s", refresh_summary)
             if _inbound_auth_store is not None:
                 await _inbound_auth_store.cleanup_expired()
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 -- background loop swallows all to keep ticking
             logger.exception("[TokenRefresh] Unexpected error in refresh loop")
         await asyncio.sleep(interval_seconds)
 

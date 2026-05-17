@@ -866,6 +866,30 @@ class TestRevoke:
         )
         assert response.status_code == 200
 
+    async def test_mismatched_hint_still_revokes_refresh_family(
+        self, endpoints: OAuthServerEndpoints, store: SQLiteInboundAuthStore
+    ) -> None:
+        """RFC 7009 §2.1 — hint is advisory; a refresh token presented with
+        token_type_hint=access_token MUST still cascade-revoke the family.
+
+        Regression: without the fallback in ``_kinds_from_hint``, a logout
+        that passes the wrong hint would silently no-op and leave every
+        access + refresh token in the family valid.
+        """
+        client_id, _, refresh = await _mint_initial_pair(endpoints)
+        response = await endpoints.revoke(
+            _request_with_form(
+                {"token": refresh, "client_id": client_id, "token_type_hint": "access_token"}
+            )
+        )
+        assert response.status_code == 200
+        conn = sqlite3.connect(store._db_path)
+        try:
+            family_total = conn.execute("SELECT COUNT(*) FROM inbound_tokens").fetchone()[0]
+        finally:
+            conn.close()
+        assert family_total == 0, "mismatched hint must still revoke the entire family"
+
 
 # =============================================================================
 # DISABLED OAUTH
@@ -1185,11 +1209,13 @@ class TestScopeSubset:
 
 
 class TestKindsFromHint:
-    def test_access_hint(self) -> None:
-        assert _kinds_from_hint("access_token") == ("access",)
+    def test_access_hint_falls_back_to_refresh(self) -> None:
+        # RFC 7009 §2.1 — hint is advisory; server SHOULD try the other type
+        # if the hint misses. Hinted kind first for efficiency, fallback after.
+        assert _kinds_from_hint("access_token") == ("access", "refresh")
 
-    def test_refresh_hint(self) -> None:
-        assert _kinds_from_hint("refresh_token") == ("refresh",)
+    def test_refresh_hint_falls_back_to_access(self) -> None:
+        assert _kinds_from_hint("refresh_token") == ("refresh", "access")
 
     def test_unknown_hint_tries_both(self) -> None:
         assert _kinds_from_hint("") == ("access", "refresh")
