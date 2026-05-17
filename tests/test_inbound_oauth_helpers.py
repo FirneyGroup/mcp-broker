@@ -368,7 +368,7 @@ def test_build_bearer_challenge_escapes_double_quotes_in_values():
         error_description='token said "no" and ended the param',
     )
     # The literal `"` from the caller must be escaped as `\"` in the header.
-    assert r'\"no\"' in challenge
+    assert r"\"no\"" in challenge
     # The challenge must still have exactly one `error_description=` token
     # (no injection-induced duplicate).
     assert challenge.count("error_description=") == 1
@@ -379,7 +379,7 @@ def test_build_bearer_challenge_escapes_backslash_in_values():
     a value ending in `\\` can't escape its closing quote."""
     challenge = build_bearer_challenge(
         PUBLIC_URL + "/.well-known/resource",
-        error_description='path\\with\\backslash',
+        error_description="path\\with\\backslash",
     )
     assert r"path\\with\\backslash" in challenge
 

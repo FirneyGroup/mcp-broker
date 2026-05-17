@@ -652,8 +652,7 @@ class SQLiteInboundAuthStore:
         inheritance bug.
         """
         existing_row = conn.execute(
-            "SELECT family_id, app_key FROM inbound_tokens "
-            "WHERE token_hash = ? AND client_id = ?",
+            "SELECT family_id, app_key FROM inbound_tokens WHERE token_hash = ? AND client_id = ?",
             (parent_token_hash, client_id),
         ).fetchone()
         if not existing_row:  # defensive — _mark_refresh_used_or_replay returned ok
