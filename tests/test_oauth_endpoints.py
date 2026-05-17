@@ -237,6 +237,22 @@ class TestDCR:
         response = await endpoints.register(request)
         assert response.status_code == 400
 
+    async def test_invalid_registration_shape_400(self, endpoints: OAuthServerEndpoints) -> None:
+        """Pydantic v2 ``ValidationError`` does NOT inherit from ``ValueError``;
+        a valid-JSON body that fails field validation must still produce a 400
+        ``invalid_request`` rather than escaping as a 500.
+
+        Regression: without the ``ValidationError`` catch, this raised an
+        unhandled exception from the public ``/oauth/register`` endpoint.
+        """
+        # Missing required ``client_name``; ``redirect_uris`` passed as a
+        # string instead of a list — both trigger Pydantic validation, not
+        # JSON parsing.
+        bad_shape = {"redirect_uris": GENERIC_REDIRECT_URI}
+        response = await endpoints.register(_request_with_json(bad_shape))
+        assert response.status_code == 400
+        assert _response_body(response)["error"] == "invalid_request"
+
 
 # =============================================================================
 # AUTHORIZE (GET /oauth/authorize)

@@ -776,6 +776,9 @@ async def _parse_registration_request(
     try:
         return RegistrationRequest(**raw), None
     except (TypeError, ValueError) as exc:
+        # pydantic.ValidationError is a ValueError subclass (restored in
+        # pydantic 2.5; current >=2.13) so shape/Literal/required failures
+        # land here too.
         return None, _oauth_error(
             HTTPStatus.BAD_REQUEST, "invalid_request", f"invalid registration: {exc}"
         )
