@@ -799,6 +799,8 @@ async def _token_refresh_loop(base_url: str, interval_seconds: int) -> None:
                     logger.info("[TokenRefresh] %s", refresh_summary)
             if _inbound_auth_store is not None:
                 await _inbound_auth_store.cleanup_expired()
+            if _oauth_endpoints is not None:
+                _oauth_endpoints.cleanup_rate_limiter()
         except Exception:  # noqa: BLE001 -- background loop swallows all to keep ticking
             logger.exception("[TokenRefresh] Unexpected error in refresh loop")
         await asyncio.sleep(interval_seconds)

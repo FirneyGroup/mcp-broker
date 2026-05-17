@@ -750,53 +750,69 @@ class SQLiteInboundAuthStore:
         token_hash: str,
         client_id: str,
         kind: Literal["access", "refresh"],
-    ) -> None:
+    ) -> bool:
         """RFC 7009 §2.2 — silently succeed regardless of existence.
 
         Refresh revoke cascades to the whole family (a stolen refresh cannot
         leave live access tokens behind). Access revoke deletes only the row.
         `client_id` scopes the delete to its issuee.
+
+        Returns True iff a row was actually deleted. Callers iterating
+        ``_kinds_from_hint`` use this to short-circuit after a hit and to gate
+        audit-log emission — a hash that misses must NOT produce a spurious
+        ``token_revoke`` event for monitoring.
         """
         with self._db_conn() as conn:
             if kind == "refresh":
-                self._revoke_refresh_family(conn, token_hash, client_id)
+                did_delete = self._revoke_refresh_family(conn, token_hash, client_id)
             else:
-                self._revoke_access_token(conn, token_hash, client_id)
+                did_delete = self._revoke_access_token(conn, token_hash, client_id)
             conn.commit()
-        audit_log_oauth_event(
-            "token_revoke",
-            client_id=client_id,
-            kind=kind,
-            hash_prefix=hash_prefix(token_hash),
-        )
+        if did_delete:
+            audit_log_oauth_event(
+                "token_revoke",
+                client_id=client_id,
+                kind=kind,
+                hash_prefix=hash_prefix(token_hash),
+            )
+        return did_delete
 
     @staticmethod
     def _revoke_refresh_family(
         conn: sqlite3.Connection,
         token_hash: str,
         client_id: str,
-    ) -> None:
-        """Resolve the family from the refresh row, then cascade-delete it."""
+    ) -> bool:
+        """Resolve the family from the refresh row, then cascade-delete it.
+
+        Returns True iff a family was found and deleted.
+        """
         family_row = conn.execute(
             "SELECT family_id FROM inbound_tokens "
             "WHERE token_hash = ? AND token_kind = 'refresh' AND client_id = ?",
             (token_hash, client_id),
         ).fetchone()
-        if family_row:
-            conn.execute("DELETE FROM inbound_tokens WHERE family_id = ?", (family_row[0],))
+        if not family_row:
+            return False
+        conn.execute("DELETE FROM inbound_tokens WHERE family_id = ?", (family_row[0],))
+        return True
 
     @staticmethod
     def _revoke_access_token(
         conn: sqlite3.Connection,
         token_hash: str,
         client_id: str,
-    ) -> None:
-        """Delete a single access-token row, scoped to the supplied client."""
-        conn.execute(
+    ) -> bool:
+        """Delete a single access-token row, scoped to the supplied client.
+
+        Returns True iff a row was actually deleted.
+        """
+        cursor = conn.execute(
             "DELETE FROM inbound_tokens "
             "WHERE token_hash = ? AND token_kind = 'access' AND client_id = ?",
             (token_hash, client_id),
         )
+        return cursor.rowcount > 0
 
     async def revoke_family(self, family_id: str, client_id: str) -> None:
         """Cascade-delete every token in the family (admin-side revoke path).

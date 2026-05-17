@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import html
+import re
 import secrets
 import time
 from collections.abc import Callable
@@ -149,6 +150,12 @@ class _DCRRateLimiter:
     Single-process only — mirrors ``ConnectTokenStore`` caveat. Multi-worker
     deployments would have per-worker limits equal to (cap × N), which is why
     ``broker/__main__.py`` blocks ``WEB_CONCURRENCY > 1`` when OAuth is on.
+
+    ``cleanup_expired`` should be called periodically (the broker's maintenance
+    loop wires this) so per-IP entries whose timestamps have all aged out
+    don't accumulate over the lifetime of the process — otherwise every
+    distinct IP that ever called ``/oauth/register`` would leak a small dict
+    entry indefinitely.
     """
 
     def __init__(self, max_per_window: int, window_seconds: int) -> None:
@@ -159,12 +166,31 @@ class _DCRRateLimiter:
     def allow(self, client_ip: str) -> bool:
         """True if the IP is under the cap; records the event when True."""
         now_ts = time.time()
-        events = self._events.setdefault(client_ip, [])
-        events[:] = [ts for ts in events if now_ts - ts < self._window_seconds]
+        events = [
+            ts for ts in self._events.get(client_ip, []) if now_ts - ts < self._window_seconds
+        ]
         if len(events) >= self._max_per_window:
+            self._events[client_ip] = events
             return False
         events.append(now_ts)
+        self._events[client_ip] = events
         return True
+
+    def cleanup_expired(self) -> None:
+        """Drop per-IP entries whose timestamps have all aged out of the window.
+
+        Called from the broker's background maintenance loop. Cheap O(N) walk —
+        N is bounded by ``unique IPs in the last window`` plus whatever stale
+        entries accumulated between cleanup ticks.
+        """
+        now_ts = time.time()
+        stale_ips = [
+            client_ip
+            for client_ip, events in self._events.items()
+            if not events or all(now_ts - ts >= self._window_seconds for ts in events)
+        ]
+        for client_ip in stale_ips:
+            del self._events[client_ip]
 
 
 class _NewFamilyContext(BaseModel):
@@ -213,6 +239,16 @@ class OAuthServerEndpoints:
             max_per_window=config.dcr_rate_limit_per_ip,
             window_seconds=config.dcr_rate_limit_window_seconds,
         )
+
+    # --- BACKGROUND MAINTENANCE ---
+
+    def cleanup_rate_limiter(self) -> None:
+        """Reap stale per-IP entries from the DCR rate limiter.
+
+        Wired into the broker's maintenance loop so the limiter's dict doesn't
+        grow indefinitely as one-shot IPs come and go.
+        """
+        self._dcr_rate_limiter.cleanup_expired()
 
     # --- /oauth/register ---
 
@@ -374,11 +410,15 @@ class OAuthServerEndpoints:
         if not raw_token:
             return Response(status_code=HTTPStatus.OK, headers=_NO_STORE_HEADERS)
         token_hash = sha256_hex(raw_token)
-        kinds = _kinds_from_hint(params.get("token_type_hint", ""))
-        for token_kind in kinds:
-            await self._inbound_auth_store.revoke_token(
+        # Try the hinted kind first; stop at the first deletion. Without the
+        # break, a refresh-token hash supplied with ``token_type_hint=access_token``
+        # would needlessly probe both kinds (and silently no-op on the access
+        # probe), creating misleading "audit miss" patterns in monitoring.
+        for token_kind in _kinds_from_hint(params.get("token_type_hint", "")):
+            if await self._inbound_auth_store.revoke_token(
                 token_hash, client_or_error, kind=token_kind
-            )
+            ):
+                break
         return Response(status_code=HTTPStatus.OK, headers=_NO_STORE_HEADERS)
 
     # --- INTERNAL: validation pipeline ---
@@ -804,6 +844,13 @@ def _validate_registration_redirects(
     return None
 
 
+# RFC 7636 §4.2 — S256 challenge is base64url(sha256(verifier)) with padding
+# stripped. The base64url alphabet is exactly ``A-Z a-z 0-9 - _`` — anything
+# else (``+`` / ``/`` from standard base64, padding ``=``, whitespace, NUL)
+# means the client built the challenge wrong.
+_PKCE_CHALLENGE_CHARSET = re.compile(r"[A-Za-z0-9\-_]+")
+
+
 def _validate_pkce(params: dict[str, str]) -> str | None:
     """Return an RFC-6749 error code if PKCE is missing/wrong; ``None`` on success."""
     method = params.get("code_challenge_method", "")
@@ -811,6 +858,11 @@ def _validate_pkce(params: dict[str, str]) -> str | None:
         return "invalid_request"
     challenge = params.get("code_challenge", "")
     if len(challenge) != _CODE_CHALLENGE_LEN:
+        return "invalid_request"
+    if not _PKCE_CHALLENGE_CHARSET.fullmatch(challenge):
+        # Length-only validation would let a non-base64url 43-char string through
+        # to be stored in oauth_codes, then trip ``invalid_grant`` at /token —
+        # giving the client the wrong error code and misleading diagnosis.
         return "invalid_request"
     return None
 

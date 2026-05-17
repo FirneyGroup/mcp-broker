@@ -16,7 +16,9 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -28,6 +30,7 @@ from broker.api.oauth_server import (
     _DCRRateLimiter,
     _kinds_from_hint,
     _scope_is_subset,
+    _validate_pkce,
 )
 from broker.config import OAuthInboundConfig
 from broker.services.inbound_auth_store import SQLiteInboundAuthStore
@@ -883,16 +886,21 @@ class TestRevoke:
         assert response.status_code == 200
 
     async def test_mismatched_hint_still_revokes_refresh_family(
-        self, endpoints: OAuthServerEndpoints, store: SQLiteInboundAuthStore
+        self,
+        endpoints: OAuthServerEndpoints,
+        store: SQLiteInboundAuthStore,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """RFC 7009 §2.1 — hint is advisory; a refresh token presented with
         token_type_hint=access_token MUST still cascade-revoke the family.
 
-        Regression: without the fallback in ``_kinds_from_hint``, a logout
-        that passes the wrong hint would silently no-op and leave every
-        access + refresh token in the family valid.
+        Also pins audit-log behavior: exactly ONE ``token_revoke`` event
+        emitted even though the caller probes two kinds — the first kind
+        (``access``) misses and must NOT emit, the second (``refresh``) hits
+        and emits. Regression: previously emitted 2 events (one per probe).
         """
         client_id, _, refresh = await _mint_initial_pair(endpoints)
+        caplog.set_level(logging.INFO, logger="broker.services.inbound_oauth_helpers")
         response = await endpoints.revoke(
             _request_with_form(
                 {"token": refresh, "client_id": client_id, "token_type_hint": "access_token"}
@@ -905,6 +913,38 @@ class TestRevoke:
         finally:
             conn.close()
         assert family_total == 0, "mismatched hint must still revoke the entire family"
+        token_revoke_events = [
+            record
+            for record in caplog.records
+            if record.name == "broker.services.inbound_oauth_helpers"
+            and "token_revoke" in record.getMessage()
+        ]
+        assert len(token_revoke_events) == 1, (
+            "exactly one token_revoke audit event per /oauth/revoke call — the "
+            "access probe missed and must not emit"
+        )
+
+    async def test_revoke_unknown_hash_emits_no_audit_event(
+        self,
+        endpoints: OAuthServerEndpoints,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A revoke call against a hash that exists for neither kind must NOT
+        emit a token_revoke audit event — otherwise an attacker probing random
+        token strings would flood the audit log with phantom revocations."""
+        client_id = await _register_public_client(endpoints)
+        caplog.set_level(logging.INFO, logger="broker.services.inbound_oauth_helpers")
+        response = await endpoints.revoke(
+            _request_with_form({"token": "mcp_at_does_not_exist", "client_id": client_id})
+        )
+        assert response.status_code == 200
+        token_revoke_events = [
+            record
+            for record in caplog.records
+            if record.name == "broker.services.inbound_oauth_helpers"
+            and "token_revoke" in record.getMessage()
+        ]
+        assert token_revoke_events == [], "missing token must not emit token_revoke"
 
 
 # =============================================================================
@@ -947,6 +987,23 @@ class TestRateLimiter:
         assert limiter.allow("client-a")
         assert limiter.allow("client-b")
         assert not limiter.allow("client-a")
+
+    def test_cleanup_drops_ips_whose_timestamps_have_aged_out(self) -> None:
+        """Regression: without periodic cleanup, every one-shot IP would leak
+        a dict entry indefinitely — attacker-controlled memory growth."""
+        limiter = _DCRRateLimiter(max_per_window=5, window_seconds=10)
+        limiter.allow("one-shot-ip")
+        # Force every timestamp to be ``window_seconds`` in the past.
+        stale_ts = time.time() - 20
+        limiter._events["one-shot-ip"] = [stale_ts]
+        limiter.cleanup_expired()
+        assert "one-shot-ip" not in limiter._events
+
+    def test_cleanup_keeps_ips_with_live_timestamps(self) -> None:
+        limiter = _DCRRateLimiter(max_per_window=5, window_seconds=10)
+        limiter.allow("recent-ip")
+        limiter.cleanup_expired()
+        assert "recent-ip" in limiter._events
 
 
 class TestXForwardedForGate:
@@ -1222,6 +1279,43 @@ class TestScopeSubset:
 
     def test_equal_passes(self) -> None:
         assert _scope_is_subset("a b", "a b")
+
+
+class TestValidatePkce:
+    """RFC 7636 §4.2 — S256 challenge must be exactly 43 base64url chars."""
+
+    @staticmethod
+    def _params(challenge: str) -> dict[str, str]:
+        return {"code_challenge": challenge, "code_challenge_method": "S256"}
+
+    def test_well_formed_challenge_accepted(self) -> None:
+        valid = _challenge_for(_VALID_VERIFIER)
+        assert len(valid) == 43
+        assert _validate_pkce(self._params(valid)) is None
+
+    @pytest.mark.parametrize(
+        "bad_challenge",
+        [
+            # Standard-base64 chars (``+``, ``/``) — not in the base64url alphabet.
+            "A" * 42 + "+",
+            "A" * 42 + "/",
+            # Padding character ``=`` — base64url challenges are unpadded per §4.2.
+            "A" * 42 + "=",
+            # Whitespace and NUL — clearly malformed but length-only check missed.
+            "A" * 42 + " ",
+            "A" * 42 + "\x00",
+        ],
+    )
+    def test_non_base64url_charset_rejected(self, bad_challenge: str) -> None:
+        """Regression: length-only validation let these through to be stored
+        in oauth_codes, then trip invalid_grant at /token instead of the
+        intended invalid_request here."""
+        assert len(bad_challenge) == 43, "test setup: bad_challenge is the correct length"
+        assert _validate_pkce(self._params(bad_challenge)) == "invalid_request"
+
+    def test_wrong_length_still_rejected(self) -> None:
+        assert _validate_pkce(self._params("A" * 42)) == "invalid_request"
+        assert _validate_pkce(self._params("A" * 44)) == "invalid_request"
 
 
 class TestKindsFromHint:
