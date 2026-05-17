@@ -12,6 +12,7 @@ import importlib
 import logging
 import time
 from contextlib import asynccontextmanager
+from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -378,6 +379,26 @@ def _reject_sidecar_managed(connector: BaseConnector) -> None:
         )
 
 
+def _resolve_oauth_success_url(settings: BrokerSettings, connector_name: str) -> str:
+    """Resolve the post-OAuth-callback redirect URL.
+
+    Honors ``broker.success_redirect_url`` when set; otherwise falls back to
+    the broker's built-in ``/oauth/success`` page so operators don't need to
+    configure anything to get a sensible default UX. Previously the default
+    was inline HTML rendered by the callback handler itself — a stable URL
+    is cleaner because operators can link to it, bookmark it, and (if they
+    later want a real dashboard) point ``success_redirect_url`` at it as a
+    fallback. ``connector_name`` is URL-encoded as defense-in-depth: in
+    practice it's a Pydantic-validated identifier, but encoding ensures any
+    future code path that admits weirder values can't fold characters into
+    the URL structure (e.g. injecting an extra query param).
+    """
+    if settings.broker.success_redirect_url:
+        return settings.broker.success_redirect_url
+    issuer = settings.broker.public_url.rstrip("/")
+    return f"{issuer}/oauth/success?connector={quote(connector_name, safe='')}"
+
+
 @app.get("/oauth/{connector_name}/connect")
 async def oauth_connect(
     connector_name: str,
@@ -457,12 +478,7 @@ async def oauth_callback(connector_name: str, code: str, state: str, request: Re
             connector, connector_name, code, state, request
         )
         logger.info("[Broker] OAuth connected: %s/%s", returned_app_key, connector_name)
-        redirect_url = _get_settings().broker.success_redirect_url
-        if redirect_url:
-            return RedirectResponse(redirect_url)
-        return HTMLResponse(
-            f"<h1>{html.escape(connector_name.title())} connected</h1><p>You can close this tab.</p>"
-        )
+        return RedirectResponse(_resolve_oauth_success_url(_get_settings(), connector_name))
     except ValueError as value_error:
         logger.warning("[Broker] OAuth callback failed: %s", value_error)
         return HTMLResponse(
@@ -475,6 +491,21 @@ async def oauth_callback(connector_name: str, code: str, state: str, request: Re
             "<h1>Connection failed</h1><p>Unexpected error — check broker logs.</p>",
             status_code=500,
         )
+
+
+@app.get("/oauth/success")
+async def oauth_success_page(connector: str | None = None):
+    """Built-in landing page after a successful outbound OAuth connect.
+
+    Operator-facing. No auth — the success page leaks no protected state and
+    the operator's browser just completed an OAuth dance, so locking the page
+    behind broker-key auth would only break the UX. Operators with a real
+    dashboard override this by setting ``broker.success_redirect_url``.
+    """
+    name = connector if connector and connector.isidentifier() else "Connection"
+    return HTMLResponse(
+        f"<h1>{html.escape(name.title())} connected</h1><p>You can close this tab.</p>"
+    )
 
 
 @app.post("/oauth/{connector_name}/disconnect")
