@@ -139,10 +139,14 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
         OAuth callbacks are always exempt — signed state protects them.
         Inbound OAuth AS endpoints and discovery are exempt per RFC requirements
         (each handler self-authenticates; see PR description for justifications).
+        `/oauth/success` is the operator-facing landing page after a successful
+        outbound connect; static HTML, no protected state.
         """
         if path in self._exempt_paths:
             return True
         if path.startswith("/oauth/") and path.endswith("/callback"):
+            return True
+        if path == "/oauth/success":
             return True
         # AS discovery + DCR/authorize/token/revoke are only exempt when the
         # OAuth feature is actually enabled. With OAuth disabled the handlers

@@ -1901,3 +1901,97 @@ class TestWorkspaceMcpConnector:
         assert params["access_type"] == "offline"
         assert params["prompt"] == "consent"
         assert params["client_id"] == "test"
+
+
+class TestOAuthSuccessPage:
+    """Default success URL falls back to a built-in /oauth/success page.
+
+    Previously the example settings hardcoded `success_redirect_url: http://localhost:3000`
+    which left a dead-end UX for any operator who didn't run a local dashboard. The
+    builtin page makes the default work everywhere, and operators with a real
+    dashboard still override via `broker.success_redirect_url`.
+    """
+
+    def test_resolver_uses_operator_override_when_set(self) -> None:
+        from broker.main import _resolve_oauth_success_url
+
+        settings = MagicMock()
+        settings.broker.success_redirect_url = "https://dashboard.example.com/connections"
+        settings.broker.public_url = "https://broker.example.com/"
+
+        url = _resolve_oauth_success_url(settings, "notion")
+        assert url == "https://dashboard.example.com/connections"
+
+    def test_resolver_falls_back_to_broker_success_page_when_unset(self) -> None:
+        """Unset → derive from public_url. Connector name passed as query param so
+        the success page can display it without a separate route per connector."""
+        from broker.main import _resolve_oauth_success_url
+
+        settings = MagicMock()
+        settings.broker.success_redirect_url = None
+        settings.broker.public_url = "https://broker.example.com/"
+
+        url = _resolve_oauth_success_url(settings, "notion")
+        assert url == "https://broker.example.com/oauth/success?connector=notion"
+
+    def test_resolver_strips_trailing_slash_from_public_url(self) -> None:
+        """public_url is documented to carry a trailing slash; the resolved URL
+        must not double it."""
+        from broker.main import _resolve_oauth_success_url
+
+        settings = MagicMock()
+        settings.broker.success_redirect_url = None
+        settings.broker.public_url = "https://broker.example.com/"
+
+        assert "//oauth/" not in _resolve_oauth_success_url(settings, "notion")
+
+    def test_success_route_returns_html_with_connector_name(self) -> None:
+        """The route accepts a connector query param and includes it in the page."""
+        from fastapi.testclient import TestClient
+
+        from broker.main import app
+
+        client = TestClient(app)
+        response = client.get("/oauth/success?connector=notion")
+        assert response.status_code == 200
+        body = response.text
+        assert "Notion connected" in body
+        assert "You can close this tab" in body
+
+    def test_success_route_handles_missing_connector_param(self) -> None:
+        """No connector query param → generic 'Connection connected' label."""
+        from fastapi.testclient import TestClient
+
+        from broker.main import app
+
+        client = TestClient(app)
+        response = client.get("/oauth/success")
+        assert response.status_code == 200
+        assert "Connection connected" in response.text
+
+    def test_success_route_rejects_non_identifier_connector_to_block_xss(self) -> None:
+        """Connector param is treated as untrusted — non-identifier values fall
+        through to the generic label, blocking HTML injection even though
+        `html.escape` is applied."""
+        from fastapi.testclient import TestClient
+
+        from broker.main import app
+
+        client = TestClient(app)
+        response = client.get("/oauth/success?connector=<script>alert(1)</script>")
+        assert response.status_code == 200
+        assert "<script>" not in response.text
+        # Generic fallback label is used instead of the injected value
+        assert "Connection connected" in response.text
+
+    def test_success_route_is_auth_exempt(self) -> None:
+        """The page is operator-facing; auth must not block the browser landing
+        there after a successful OAuth dance."""
+        from fastapi.testclient import TestClient
+
+        from broker.main import app
+
+        # No auth headers — must still serve the page.
+        client = TestClient(app)
+        response = client.get("/oauth/success?connector=notion")
+        assert response.status_code == 200

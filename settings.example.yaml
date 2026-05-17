@@ -11,7 +11,11 @@ broker:
   encryption_keys:
     - ${BROKER_ENCRYPTION_KEY}
   state_secret: ${BROKER_STATE_SECRET}
-  success_redirect_url: http://localhost:3000  # Where to redirect after successful OAuth
+  # success_redirect_url: https://your-dashboard.example.com/connections
+  # Optional. After a successful outbound OAuth connect, the operator's
+  # browser is redirected here. When unset, the broker bounces to its own
+  # built-in /oauth/success page — sensible default that needs no operator
+  # setup. Override only when you have a real dashboard to land on.
   public_url: http://localhost:8002/     # Public base URL for OAuth callbacks (must include trailing slash)
   # token_refresh_enabled: true          # Background token refresh loop (default: true)
   # token_refresh_interval_seconds: 300  # How often to scan for expiring tokens (default: 300)
