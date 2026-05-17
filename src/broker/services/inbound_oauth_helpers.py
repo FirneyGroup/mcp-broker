@@ -181,6 +181,16 @@ def parse_basic_auth(header_value: str | None) -> tuple[str, str] | None:
 # === WWW-AUTHENTICATE CHALLENGE ===
 
 
+def _escape_quoted_string(value: str) -> str:
+    """RFC 6750 §3 quoted-string escape: backslash before ``"`` and ``\\``.
+
+    Defense-in-depth — current callers pass operator-controlled constants or
+    enum values, but interpolating any caller-supplied string into a quoted
+    HTTP header without escaping is a header-injection waiting to happen.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def build_bearer_challenge(
     resource_metadata_url: str,
     scope: str | None = None,
@@ -193,13 +203,13 @@ def build_bearer_challenge(
     HTTP/2 lowercases header names on the wire; claude.ai bug #219 does
     case-sensitive lookup. CF Tunnel users must force HTTP/1.1 origin.
     """
-    parts = [f'resource_metadata="{resource_metadata_url}"']
+    parts = [f'resource_metadata="{_escape_quoted_string(resource_metadata_url)}"']
     if error:
-        parts.append(f'error="{error}"')
+        parts.append(f'error="{_escape_quoted_string(error)}"')
     if error_description:
-        parts.append(f'error_description="{error_description}"')
+        parts.append(f'error_description="{_escape_quoted_string(error_description)}"')
     if scope:
-        parts.append(f'scope="{scope}"')
+        parts.append(f'scope="{_escape_quoted_string(scope)}"')
     return "Bearer " + ", ".join(parts)
 
 
@@ -211,10 +221,41 @@ def hash_prefix(token_hash: str) -> str:
     return token_hash[:HASH_PREFIX_LEN]
 
 
+# Field names that almost certainly contain a raw credential. Audit logs MUST
+# carry hash prefixes (e.g. `hash_prefix`, `access_hash_prefix`) — never the
+# raw value. Enforced here rather than trusting every caller (AGENTS.md
+# Security Invariant: "Log statements MUST NOT include tokens, keys,
+# secrets, or decrypted credentials — even at DEBUG level").
+_AUDIT_LOG_BANNED_KEYS = frozenset(
+    {
+        "token",
+        "access_token",
+        "refresh_token",
+        "client_secret",
+        "code",
+        "code_verifier",
+        "raw_token",
+        "secret",
+        "password",
+        "api_key",
+    }
+)
+
+
 def audit_log_oauth_event(event_type: str, **fields: object) -> None:
     """Structured audit log for OAuth lifecycle events.
 
-    NEVER includes raw token values — callers MUST pass `token_hash_prefix` or similar.
+    Raises ``ValueError`` if any field name matches a known credential key —
+    callers MUST pass hash prefixes (``hash_prefix``, ``access_hash_prefix``,
+    etc.). The denylist is conservative: anything that LOOKS like a token by
+    name gets blocked even if the value happens to be safe, so a single
+    misnaming can't silently leak a secret into the log aggregator.
     """
+    banned_keys_supplied = _AUDIT_LOG_BANNED_KEYS & fields.keys()
+    if banned_keys_supplied:
+        raise ValueError(
+            f"audit_log_oauth_event refuses banned key(s): {sorted(banned_keys_supplied)}. "
+            "Pass a hash prefix (e.g. hash_prefix=hash_prefix(token_hash)) instead."
+        )
     payload = {"event": event_type, "ts": int(time.time()), **fields}
     logger.info("[OAuthAudit] %s", json.dumps(payload, sort_keys=True, default=str))

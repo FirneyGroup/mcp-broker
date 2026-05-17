@@ -620,7 +620,7 @@ class SQLiteInboundAuthStore:
     ) -> RotatedTokenPair:
         """Mint and insert a fresh (access, refresh) pair in the same family."""
         raw_access, raw_refresh, pair_context = SQLiteInboundAuthStore._prepare_pair_context(
-            conn, rotation_request.token_hash
+            conn, rotation_request.token_hash, rotation_request.client_id
         )
         access_row = SQLiteInboundAuthStore._build_access_row(
             rotation_request, pair_context, now_ts
@@ -639,12 +639,22 @@ class SQLiteInboundAuthStore:
 
     @staticmethod
     def _prepare_pair_context(
-        conn: sqlite3.Connection, parent_token_hash: str
+        conn: sqlite3.Connection, parent_token_hash: str, client_id: str
     ) -> tuple[str, str, _NewPairContext]:
-        """Inherit family + app from the consumed refresh, mint new hashes, return both raws."""
+        """Inherit family + app from the consumed refresh, mint new hashes, return both raws.
+
+        The SELECT filters by ``client_id`` as well as ``token_hash`` even
+        though both reads happen inside the same ``BEGIN IMMEDIATE``
+        transaction. Currently the prior UPDATE already guarantees the row
+        belongs to this client; the redundant filter pins the invariant in
+        the SQL so a future refactor that splits the rotation into separate
+        transactions cannot silently introduce a cross-client family
+        inheritance bug.
+        """
         existing_row = conn.execute(
-            "SELECT family_id, app_key FROM inbound_tokens WHERE token_hash = ?",
-            (parent_token_hash,),
+            "SELECT family_id, app_key FROM inbound_tokens "
+            "WHERE token_hash = ? AND client_id = ?",
+            (parent_token_hash, client_id),
         ).fetchone()
         if not existing_row:  # defensive — _mark_refresh_used_or_replay returned ok
             raise InvalidGrantError("refresh disappeared mid-rotation")
@@ -789,10 +799,20 @@ class SQLiteInboundAuthStore:
             (token_hash, client_id),
         )
 
-    async def revoke_family(self, family_id: str) -> None:
-        """Cascade-delete every token in the family (admin-side revoke path)."""
+    async def revoke_family(self, family_id: str, client_id: str) -> None:
+        """Cascade-delete every token in the family (admin-side revoke path).
+
+        Scoped to ``client_id`` so that even if a caller is tricked into
+        passing an attacker-supplied ``family_id``, they cannot force-logout
+        sessions belonging to a different client. ``family_id`` is a 128-bit
+        random secret so guessing is infeasible — this is defense-in-depth
+        for the case where it might leak through a logging or replay channel.
+        """
         with self._db_conn() as conn:
-            conn.execute("DELETE FROM inbound_tokens WHERE family_id = ?", (family_id,))
+            conn.execute(
+                "DELETE FROM inbound_tokens WHERE family_id = ? AND client_id = ?",
+                (family_id, client_id),
+            )
             conn.commit()
 
     # === MAINTENANCE ===

@@ -373,6 +373,25 @@ class TestAuthorizeGet:
         assert response.status_code == 302
         assert "error=invalid_scope" in response.headers["location"]
 
+    async def test_empty_scope_defaults_to_connector_proxy_scope(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        """RFC 6749 §3.3 — when no scope is requested, the AS may apply a
+        default. We default to `mcp:proxy:{connector}` so the issued token
+        truthfully records what was authorized rather than carrying an empty
+        scope string. Without this, a future scope-gating middleware would
+        treat the token as unscoped and silently bypass scope checks.
+        """
+        client_id = await _register_public_client(endpoints)
+        params = _authorize_params(client_id)
+        del params["scope"]  # client sends no scope at all
+        # Consent page must render — empty scope must not break the flow.
+        response = await endpoints.authorize_get(_request_with_query(params))
+        assert response.status_code == 200
+        # The rendered consent page should show the defaulted scope, not blank.
+        body = response.body.decode()
+        assert "mcp:proxy:notion" in body
+
 
 # =============================================================================
 # AUTHORIZE (POST /oauth/authorize)

@@ -30,7 +30,11 @@ class NotionConnector(BaseConnector):
     meta = ConnectorMeta(
         name="notion",
         display_name="Notion",
-        mcp_url="https://mcp.notion.com/mcp",
+        # Base URL only — the proxy appends the route path from the request,
+        # so an MCP client posting to `/proxy/notion/mcp` ends up at
+        # `https://mcp.notion.com/mcp`. Including `/mcp` here would produce
+        # the double-segment `/mcp/mcp` and 404 from Notion.
+        mcp_url="https://mcp.notion.com",
         mcp_transport="streamable_http",
         # Static URLs kept for documentation — ignored when mcp_oauth_url is set
         oauth_authorize_url="https://mcp.notion.com/authorize",

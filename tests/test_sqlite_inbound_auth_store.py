@@ -488,8 +488,26 @@ async def test_revoke_token_silent_on_wrong_client(store: SQLiteInboundAuthStore
 async def test_revoke_family_cascades(store: SQLiteInboundAuthStore) -> None:
     client_id = generate_client_id()
     _, _, family_id = await _seed_refresh_pair(store, client_id)
-    await store.revoke_family(family_id)
+    await store.revoke_family(family_id, client_id)
     assert _count_family_rows(store._db_path, family_id) == 0
+
+
+async def test_revoke_family_does_not_cross_clients(store: SQLiteInboundAuthStore) -> None:
+    """A caller supplying another client's `family_id` cannot force-logout that
+    client. Defense-in-depth in case `family_id` ever leaks via a logging
+    channel or admin tool. The 128-bit-random `family_id` already makes
+    guessing infeasible; this test pins the additional `client_id` constraint
+    on the DELETE.
+    """
+    victim_client_id = generate_client_id()
+    attacker_client_id = generate_client_id()
+    _, _, victim_family_id = await _seed_refresh_pair(store, victim_client_id)
+
+    # Attacker calls revoke_family with the victim's family_id but their own client_id.
+    await store.revoke_family(victim_family_id, attacker_client_id)
+
+    # Victim's tokens are untouched.
+    assert _count_family_rows(store._db_path, victim_family_id) > 0
 
 
 # =============================================================================

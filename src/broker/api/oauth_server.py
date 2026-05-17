@@ -196,7 +196,7 @@ class OAuthServerEndpoints:
     stays out of the handlers).
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 -- constructor binds all collaborators; one-time wiring, not a hot path
         self,
         inbound_auth_store: SQLiteInboundAuthStore,
         config: OAuthInboundConfig,
@@ -221,22 +221,18 @@ class OAuthServerEndpoints:
         if not self._config.enabled:
             return _not_found()
         client_ip = self._client_ip(request)
-        if not self._dcr_rate_limiter.allow(client_ip):
-            return _oauth_error(
-                HTTPStatus.TOO_MANY_REQUESTS, "invalid_request", "registration rate limit exceeded"
-            )
-
-        registration, error = await _parse_registration_request(request)
-        if error is not None:
-            return error
-        assert registration is not None  # noqa: S101 -- guaranteed by error short-circuit above
-
+        rate_error = self._check_dcr_rate_limit(client_ip)
+        if rate_error is not None:
+            return rate_error
+        registration, parse_error = await _parse_registration_request(request)
+        if parse_error is not None:
+            return parse_error
+        assert registration is not None  # noqa: S101 -- guaranteed by parse_error short-circuit
         redirect_error = _validate_registration_redirects(
             registration.redirect_uris, self._config.allowed_redirect_uris
         )
         if redirect_error is not None:
             return redirect_error
-
         response_payload = await self._inbound_auth_store.create_client(
             registration, client_ip=client_ip
         )
@@ -244,6 +240,14 @@ class OAuthServerEndpoints:
             response_payload.model_dump(exclude_none=True),
             status_code=HTTPStatus.CREATED,
             headers=_NO_STORE_HEADERS,
+        )
+
+    def _check_dcr_rate_limit(self, client_ip: str) -> Response | None:
+        """Return a 429 ``_oauth_error`` if this IP is over the DCR cap, else ``None``."""
+        if self._dcr_rate_limiter.allow(client_ip):
+            return None
+        return _oauth_error(
+            HTTPStatus.TOO_MANY_REQUESTS, "invalid_request", "registration rate limit exceeded"
         )
 
     # --- /oauth/authorize (GET) ---
@@ -316,24 +320,9 @@ class OAuthServerEndpoints:
         client_or_error = await self._authenticate_token_client(request, params)
         if isinstance(client_or_error, Response):
             return client_or_error
-
-        # Enforce that this client registered for the grant_type it's requesting.
-        # RFC 7591 §2 binds grant_types at registration; without this check a
-        # client registered for ['authorization_code'] only can still call
-        # /token with grant_type=refresh_token. Only gate on grant_types the
-        # server itself supports — unknown values fall through to the existing
-        # `unsupported_grant_type` branch below so RFC 6749 §5.2 semantics are
-        # preserved (server-unknown ≠ this-client-not-registered).
-        if grant_type in (_GRANT_AUTH_CODE, _GRANT_REFRESH):
-            client_record = await self._inbound_auth_store.get_client(client_or_error)
-            assert client_record is not None  # noqa: S101 -- authenticate_token_client just verified existence
-            if grant_type not in client_record.grant_types:
-                return _oauth_error(
-                    HTTPStatus.BAD_REQUEST,
-                    "unauthorized_client",
-                    f"client not registered for grant_type={grant_type}",
-                )
-
+        grant_error = await self._check_client_grant_type(client_or_error, grant_type)
+        if grant_error is not None:
+            return grant_error
         if grant_type == _GRANT_AUTH_CODE:
             return await self._token_authorization_code(params, client_or_error)
         if grant_type == _GRANT_REFRESH:
@@ -342,6 +331,28 @@ class OAuthServerEndpoints:
             HTTPStatus.BAD_REQUEST,
             "unsupported_grant_type",
             f"grant_type '{grant_type}' not supported",
+        )
+
+    async def _check_client_grant_type(self, client_id: str, grant_type: str) -> Response | None:
+        """Enforce that this client's DCR registration permits the requested grant_type.
+
+        RFC 7591 §2 binds ``grant_types`` at registration; without this check a
+        client registered for ``['authorization_code']`` only can still call
+        ``/token`` with ``grant_type=refresh_token``. Only gates on grant_types
+        the server itself supports — unknown values flow to the existing
+        ``unsupported_grant_type`` branch in ``token()`` so RFC 6749 §5.2
+        semantics are preserved (server-unknown ≠ this-client-not-registered).
+        """
+        if grant_type not in (_GRANT_AUTH_CODE, _GRANT_REFRESH):
+            return None
+        client_record = await self._inbound_auth_store.get_client(client_id)
+        assert client_record is not None  # noqa: S101 -- authenticate_token_client just verified existence
+        if grant_type in client_record.grant_types:
+            return None
+        return _oauth_error(
+            HTTPStatus.BAD_REQUEST,
+            "unauthorized_client",
+            f"client not registered for grant_type={grant_type}",
         )
 
     # --- /oauth/revoke ---
@@ -414,7 +425,16 @@ class OAuthServerEndpoints:
         if error_code is not None:
             return _redirect_with_error(redirect_uri, state, error_code)
         assert connector is not None  # noqa: S101 -- guaranteed by error_code is None
-        scope_error = _validate_scope(params.get("scope", ""), connector)
+        # RFC 6749 §3.3: when no scope is requested, the AS may apply a
+        # default. Default to the per-connector proxy scope so an empty-scope
+        # request still produces a token whose `scope` field truthfully records
+        # what was authorized (least-privilege intent + future scope-gating
+        # don't silently break). Mutating `params` in-place so downstream
+        # storage (consume_code, audit logging, consent render) sees the
+        # resolved scope rather than the empty caller input.
+        if not params.get("scope"):
+            params["scope"] = f"mcp:proxy:{connector}"
+        scope_error = _validate_scope(params["scope"], connector)
         if scope_error is not None:
             return _redirect_with_error(redirect_uri, state, scope_error)
         return connector
@@ -449,13 +469,9 @@ class OAuthServerEndpoints:
     ) -> str | Response:
         """Return the authenticated ``client_id`` or an error ``Response``.
 
-        Enforces that the client's registered ``token_endpoint_auth_method``
-        matches how the credentials arrived: a client registered as
-        ``client_secret_basic`` may not authenticate via body credentials and
-        a client registered as ``client_secret_post`` may not authenticate via
-        the ``Authorization: Basic`` header. Without this guard the registered
-        method is decorative and the client can pick whichever it likes per
-        request — diverging from the AS metadata's per-method declaration.
+        Enforces the client's registered ``token_endpoint_auth_method`` so
+        Basic-registered clients can't auth via body and post-registered
+        clients can't auth via Basic. See ``_enforce_registered_auth_method``.
         """
         client_id, supplied_secret, source = _extract_client_credentials(request, params)
         if not client_id:
@@ -534,29 +550,16 @@ class OAuthServerEndpoints:
     ) -> RotatedTokenPair | Response:
         """Look up the prior token, enforce scope ⊆, then rotate atomically.
 
-        Reading the prior row first lets us reject scope widening with an
-        explicit ``invalid_scope`` rather than letting the rotation succeed
-        with the widened scope.
+        Reading the prior row first lets us reject scope widening with
+        explicit ``invalid_scope``. client_id mismatch returns the SAME
+        error as "not found" so the response shape can't be used as a
+        confirmation oracle for whether a hash exists in the store.
         """
         prior_row = await self._inbound_auth_store.get_refresh_row(token_hash)
-        # client_id mismatch must return the SAME error as "not found" so an
-        # attacker who happens to know another client's token_hash cannot use
-        # the response shape (invalid_scope vs invalid_grant) as a confirmation
-        # oracle for whether that hash exists in the store.
         if prior_row is None or prior_row.client_id != client_id:
             return _oauth_error(HTTPStatus.BAD_REQUEST, "invalid_grant", "refresh_token invalid")
-        # Replay detection must run BEFORE the scope check. `get_refresh_row`
-        # returns rows where `used_at IS NOT NULL` so we can spot replays here;
-        # if the scope check ran first, an attacker replaying a consumed token
-        # with a widened scope would get `invalid_scope` instead of triggering
-        # the family revoke — defeating OAuth 2.1 §4.3.1. Route used tokens
-        # straight to rotate_refresh; its atomic UPDATE detects the replay and
-        # raises InvalidGrantError after revoking the family.
         if prior_row.used_at is not None:
-            rotation_request = self._build_rotation_request(prior_row, client_id, prior_row.scope)
-            with contextlib.suppress(InvalidGrantError):
-                await self._inbound_auth_store.rotate_refresh(rotation_request)
-            return _oauth_error(HTTPStatus.BAD_REQUEST, "invalid_grant", "refresh_token invalid")
+            return await self._handle_refresh_replay(prior_row, client_id)
         scope_or_error = _resolve_rotation_scope(params.get("scope"), prior_row.scope)
         if isinstance(scope_or_error, Response):
             return scope_or_error
@@ -565,6 +568,22 @@ class OAuthServerEndpoints:
             return await self._inbound_auth_store.rotate_refresh(rotation_request)
         except InvalidGrantError as exc:
             return _oauth_error(HTTPStatus.BAD_REQUEST, "invalid_grant", str(exc))
+
+    async def _handle_refresh_replay(self, prior_row: InboundToken, client_id: str) -> Response:
+        """Trigger the family revoke for a replayed refresh, return invalid_grant.
+
+        Replay detection MUST run before any scope check: if the scope check
+        fired first, an attacker replaying a consumed token with a widened
+        scope would get ``invalid_scope`` instead of triggering the family
+        revoke — defeating OAuth 2.1 §4.3.1. Route the used row through
+        ``rotate_refresh`` so its atomic UPDATE detects the replay and raises
+        ``InvalidGrantError`` after revoking the family; we then collapse to
+        ``invalid_grant`` for the caller.
+        """
+        rotation_request = self._build_rotation_request(prior_row, client_id, prior_row.scope)
+        with contextlib.suppress(InvalidGrantError):
+            await self._inbound_auth_store.rotate_refresh(rotation_request)
+        return _oauth_error(HTTPStatus.BAD_REQUEST, "invalid_grant", "refresh_token invalid")
 
     def _build_rotation_request(
         self, prior_row: InboundToken, client_id: str, scope: str
@@ -636,7 +655,7 @@ class OAuthServerEndpoints:
         """
         raw_access, access_hash = generate_access_token()
         raw_refresh, refresh_hash = generate_refresh_token()
-        ctx = _NewFamilyContext(
+        family_context = _NewFamilyContext(
             consumed=consumed,
             client_id=client_id,
             family_id=generate_family_id(),
@@ -645,39 +664,39 @@ class OAuthServerEndpoints:
             now_ts=int(time.time()),
         )
         return RotatedTokenPair(
-            access=self._new_access_row(ctx),
-            refresh=self._new_refresh_row(ctx),
+            access=self._build_access_row(family_context),
+            refresh=self._build_refresh_row(family_context),
             raw_access_token=raw_access,
             raw_refresh_token=raw_refresh,
         )
 
-    def _new_access_row(self, ctx: _NewFamilyContext) -> InboundToken:
+    def _build_access_row(self, family_context: _NewFamilyContext) -> InboundToken:
         """Build the access-token row for a new family. TTL from config."""
         return InboundToken(
-            token_hash=ctx.access_hash,
+            token_hash=family_context.access_hash,
             token_kind="access",  # noqa: S106 -- discriminator literal, not a credential
-            parent_refresh_hash=ctx.refresh_hash,
-            family_id=ctx.family_id,
-            client_id=ctx.client_id,
-            app_key=ctx.consumed.app_key,
-            resource=ctx.consumed.resource,
-            scope=ctx.consumed.scope,
-            expires_at=ctx.now_ts + self._config.access_token_ttl_seconds,
-            issued_at=ctx.now_ts,
+            parent_refresh_hash=family_context.refresh_hash,
+            family_id=family_context.family_id,
+            client_id=family_context.client_id,
+            app_key=family_context.consumed.app_key,
+            resource=family_context.consumed.resource,
+            scope=family_context.consumed.scope,
+            expires_at=family_context.now_ts + self._config.access_token_ttl_seconds,
+            issued_at=family_context.now_ts,
         )
 
-    def _new_refresh_row(self, ctx: _NewFamilyContext) -> InboundToken:
+    def _build_refresh_row(self, family_context: _NewFamilyContext) -> InboundToken:
         """Build the refresh-token row for a new family. TTL from config."""
         return InboundToken(
-            token_hash=ctx.refresh_hash,
+            token_hash=family_context.refresh_hash,
             token_kind="refresh",  # noqa: S106 -- discriminator literal, not a credential
-            family_id=ctx.family_id,
-            client_id=ctx.client_id,
-            app_key=ctx.consumed.app_key,
-            resource=ctx.consumed.resource,
-            scope=ctx.consumed.scope,
-            expires_at=ctx.now_ts + self._config.refresh_token_ttl_seconds,
-            issued_at=ctx.now_ts,
+            family_id=family_context.family_id,
+            client_id=family_context.client_id,
+            app_key=family_context.consumed.app_key,
+            resource=family_context.consumed.resource,
+            scope=family_context.consumed.scope,
+            expires_at=family_context.now_ts + self._config.refresh_token_ttl_seconds,
+            issued_at=family_context.now_ts,
         )
 
     # --- INTERNAL: rate-limit key ---
@@ -741,7 +760,13 @@ def _redirect_with_error(redirect_uri: str, state: str, error: str) -> Response:
 async def _parse_registration_request(
     request: Request,
 ) -> tuple[RegistrationRequest | None, Response | None]:
-    """Parse JSON body into ``RegistrationRequest`` or return a 400 ``Response``."""
+    """Parse JSON body into ``RegistrationRequest``.
+
+    Returns:
+        On success: ``(RegistrationRequest, None)`` — the parsed request.
+        On failure: ``(None, Response)`` — a 400 ``_oauth_error`` with the
+        reason (non-JSON body, or Pydantic validation failure).
+    """
     try:
         raw = await request.json()
     except (ValueError, UnicodeDecodeError):
@@ -787,37 +812,43 @@ def _validate_pkce(params: dict[str, str]) -> str | None:
     return None
 
 
+# Map each registered method to (required source, mismatch description).
+# Used by ``_enforce_registered_auth_method`` to keep the per-method branches
+# from blowing the function over the 25-line limit while preserving the same
+# RFC 7591 §2.3 contract: the client uses exactly the method it registered.
+_AUTH_METHOD_REQUIRED_SOURCE: dict[str, tuple[str, str]] = {
+    "client_secret_basic": (
+        "basic",
+        "client registered for client_secret_basic must use the Authorization header",
+    ),
+    "client_secret_post": (
+        "post",
+        "client registered for client_secret_post must use form-body credentials",
+    ),
+}
+
+
 def _enforce_registered_auth_method(
     client_record: OAuthClient, source: Literal["basic", "post", "none"]
 ) -> Response | None:
     """Reject when credentials arrived via a method the client didn't register for.
 
     Public clients (``"none"``) MUST NOT carry a client_secret; confidential
-    clients MUST present it via the exact method they registered with. Returns
-    ``invalid_client`` for any mismatch; returns ``None`` to accept.
+    clients MUST present it via the exact method they registered with.
     """
     registered = client_record.token_endpoint_auth_method
     if registered == _PUBLIC_CLIENT_AUTH_METHOD:
-        if source != "none":
-            return _oauth_error(
-                HTTPStatus.UNAUTHORIZED,
-                "invalid_client",
-                "public client must not send a client_secret",
-            )
+        if source == "none":
+            return None
+        return _oauth_error(
+            HTTPStatus.UNAUTHORIZED,
+            "invalid_client",
+            "public client must not send a client_secret",
+        )
+    required_source, mismatch_desc = _AUTH_METHOD_REQUIRED_SOURCE[registered]
+    if source == required_source:
         return None
-    if registered == "client_secret_basic" and source != "basic":
-        return _oauth_error(
-            HTTPStatus.UNAUTHORIZED,
-            "invalid_client",
-            "client registered for client_secret_basic must use the Authorization header",
-        )
-    if registered == "client_secret_post" and source != "post":
-        return _oauth_error(
-            HTTPStatus.UNAUTHORIZED,
-            "invalid_client",
-            "client registered for client_secret_post must use form-body credentials",
-        )
-    return None
+    return _oauth_error(HTTPStatus.UNAUTHORIZED, "invalid_client", mismatch_desc)
 
 
 def _extract_client_credentials(

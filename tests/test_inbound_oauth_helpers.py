@@ -356,6 +356,34 @@ def test_build_bearer_challenge_with_all_parts():
     assert 'scope="mcp:read"' in challenge
 
 
+def test_build_bearer_challenge_escapes_double_quotes_in_values():
+    """RFC 6750 §3 — quoted-string values must escape embedded `"` and `\\`.
+    Without escaping, an `error_description` containing `"` would terminate
+    the parameter early and could inject another header parameter. Today's
+    callers pass constants, but defense-in-depth on every interpolated value.
+    """
+    challenge = build_bearer_challenge(
+        PUBLIC_URL + "/.well-known/resource",
+        error="invalid_token",
+        error_description='token said "no" and ended the param',
+    )
+    # The literal `"` from the caller must be escaped as `\"` in the header.
+    assert r'\"no\"' in challenge
+    # The challenge must still have exactly one `error_description=` token
+    # (no injection-induced duplicate).
+    assert challenge.count("error_description=") == 1
+
+
+def test_build_bearer_challenge_escapes_backslash_in_values():
+    """Backslashes in interpolated values must be escaped to `\\\\` so that
+    a value ending in `\\` can't escape its closing quote."""
+    challenge = build_bearer_challenge(
+        PUBLIC_URL + "/.well-known/resource",
+        error_description='path\\with\\backslash',
+    )
+    assert r"path\\with\\backslash" in challenge
+
+
 def test_build_bearer_challenge_omits_none_values():
     challenge = build_bearer_challenge(
         PUBLIC_URL + "/.well-known/resource",
@@ -398,6 +426,31 @@ def test_audit_log_emits_json_at_info(caplog: pytest.LogCaptureFixture):
     assert payload["client_id"] == "mcp_client_acme"
     assert payload["token_hash_prefix"] == "abcdef12"
     assert "ts" in payload
+
+
+@pytest.mark.parametrize(
+    "banned_field",
+    [
+        "token",
+        "access_token",
+        "refresh_token",
+        "client_secret",
+        "code",
+        "code_verifier",
+        "raw_token",
+        "secret",
+        "password",
+        "api_key",
+    ],
+)
+def test_audit_log_rejects_banned_credential_field_names(banned_field: str):
+    """AGENTS.md Security Invariant: log statements MUST NOT include tokens,
+    keys, secrets, or decrypted credentials. The denylist makes the helper
+    refuse banned key names so a single miscalled `token=raw_value` cannot
+    silently leak — must use `hash_prefix(...)`.
+    """
+    with pytest.raises(ValueError, match="banned key"):
+        audit_log_oauth_event("event", **{banned_field: "anything"})
 
 
 # === PROPERTY TESTS (hypothesis) ===
