@@ -1,4 +1,3 @@
-import html
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -50,13 +49,18 @@ def _broker_managed_connector() -> MagicMock:
     return connector
 
 
-def test_oauth_callback_success_sanitization(client):
-    """Verify connector_name is escaped in success HTML."""
+def test_oauth_callback_success_redirect_sanitization(client):
+    """Connector name must be URL-encoded into the success redirect, not
+    folded raw into the URL where it could inject query params or break
+    URL parsing. The inline-HTML escape path was replaced with a redirect
+    to a built-in /oauth/success page; sanitization happens at the URL
+    boundary now (encoding) and inside the success page (isidentifier check)."""
     connector_name = "bad&connector<xss>"
     app_key = "test_app"
 
     mock_settings = MagicMock()
     mock_settings.broker.success_redirect_url = ""
+    mock_settings.broker.public_url = "https://broker.example.com/"
 
     with (
         patch("broker.main._get_connector_or_404") as mock_get_connector,
@@ -66,11 +70,20 @@ def test_oauth_callback_success_sanitization(client):
         mock_get_connector.return_value = _broker_managed_connector()
         mock_exchange.return_value = app_key
 
-        response = client.get(f"/oauth/{connector_name}/callback?code=123&state=abc")
+        response = client.get(
+            f"/oauth/{connector_name}/callback?code=123&state=abc",
+            follow_redirects=False,
+        )
 
-        assert response.status_code == 200
-        assert html.escape(connector_name.title()) in response.text
-        assert "<xss>" not in response.text
+        assert response.status_code in (302, 307)
+        location = response.headers["location"]
+        # Raw special characters must not appear in the redirect URL; quote()
+        # percent-encodes them so an attacker can't fold an extra `&` into the
+        # query string to inject another param.
+        assert "<" not in location
+        assert ">" not in location
+        # The encoded form is present
+        assert "bad%26connector%3Cxss%3E" in location
 
 
 def test_oauth_callback_value_error_sanitization(client):

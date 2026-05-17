@@ -83,10 +83,16 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
         """Check if the path is exempt from auth.
 
         OAuth callbacks are always exempt — signed state protects them.
+        `/oauth/success` is the operator-facing landing page after a
+        successful connect; it's just a static HTML "you can close this tab"
+        page with no protected state, so auth would only get in the way of
+        the operator's browser.
         """
         if path in self._exempt_paths:
             return True
         if path.startswith("/oauth/") and path.endswith("/callback"):
+            return True
+        if path == "/oauth/success":
             return True
         return any(path.startswith(prefix) for prefix in self._exempt_prefixes)
 
