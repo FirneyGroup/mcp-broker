@@ -80,4 +80,14 @@ jobs:
         run: gitleaks detect --source . --verbose
 
       - name: Dependency audit
-        run: uv run pip-audit
+        # GHSA-58qw-9mgm-455v / CVE-2026-3219 — pip archive-interpretation conflict.
+        # Ignored because:
+        #   1. `pip` is dev-only here — pulled transitively by `pip-audit` (in the
+        #      `[dev]` extra). Runtime broker images do not include it.
+        #   2. The CVE is unfixed upstream (`first_patched_version: null` per the
+        #      Dependabot alert) — no version we could pin to that resolves it.
+        #   3. The vulnerable code path is pip's archive extraction during
+        #      `pip install`, which the broker never executes at runtime.
+        # Re-evaluate when a patched pip ships; track upstream at
+        # https://github.com/advisories/GHSA-58qw-9mgm-455v
+        run: uv run pip-audit --ignore-vuln GHSA-58qw-9mgm-455v
