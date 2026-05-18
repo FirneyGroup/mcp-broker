@@ -143,7 +143,7 @@ def _start_token_refresh(settings: BrokerSettings) -> asyncio.Task[None] | None:
         return None
     base_url = settings.broker.public_url
     return asyncio.create_task(
-        _token_refresh_loop(base_url, settings.broker.token_refresh_interval_seconds)
+        _maintenance_loop(base_url, settings.broker.token_refresh_interval_seconds)
     )
 
 
@@ -290,28 +290,19 @@ app = FastAPI(
 )
 
 
-# Read OAuth toggle + public_url synchronously at module import so the
-# middleware can stash them. ``broker/__main__.py`` already validated settings
-# before uvicorn started; this second parse is cheap and lets the middleware
-# see the OAuth config (its constructor needs scalars, not callables).
-#
-# Import-time failure is tolerated: tests import ``broker.main`` without a
-# ``settings.yaml`` and stitch state in directly. In that case OAuth stays off
-# and the legacy auth path is unaffected.
-def _bootstrap_oauth_args() -> tuple[bool, str]:
-    """Best-effort read of OAuth toggle + public_url at module import."""
-    try:
-        bootstrap = load_settings()
-    except Exception:  # noqa: BLE001 -- tests import without settings.yaml; default to disabled
-        return False, ""
-    return bootstrap.broker.oauth.enabled, bootstrap.broker.public_url
+# Auth middleware — registered before lifespan, uses lazy accessors for every
+# settings-derived value. Reading the module-level ``_settings`` per-request
+# keeps a single source of truth (the lifespan-loaded value) and tolerates the
+# pre-lifespan / no-settings.yaml case by defaulting to OAuth-off, matching
+# the legacy auth path's behaviour during startup and in test imports.
+def _oauth_enabled_or_default() -> bool:
+    return _settings.broker.oauth.enabled if _settings is not None else False
 
 
-_BOOTSTRAP_OAUTH_ENABLED, _BOOTSTRAP_PUBLIC_URL = _bootstrap_oauth_args()
+def _public_url_or_default() -> str:
+    return _settings.broker.public_url if _settings is not None else ""
 
-# Auth middleware — registered before lifespan, uses lazy accessors for the
-# stores. ``oauth_enabled`` and ``public_url`` are read once at import; flipping
-# them requires a process restart (matches the existing connectors-list pattern).
+
 app.add_middleware(
     BrokerAuthMiddleware,
     get_key_store=_get_key_store,
@@ -319,8 +310,8 @@ app.add_middleware(
     get_connect_token_store=_get_connect_token_store,
     exempt_prefixes=("/health", "/admin"),
     exempt_paths=(),
-    oauth_enabled=_BOOTSTRAP_OAUTH_ENABLED,
-    public_url=_BOOTSTRAP_PUBLIC_URL,
+    get_oauth_enabled=_oauth_enabled_or_default,
+    get_public_url=_public_url_or_default,
     get_inbound_auth_store=_get_inbound_auth_store,
     get_connector_names=ConnectorRegistry.list_names,
 )
@@ -777,32 +768,33 @@ async def _refresh_expiring_tokens(base_url: str) -> dict[str, int]:
     return results
 
 
-# --- Background refresh loop ---
+# --- Background maintenance loop ---
 
 
-async def _token_refresh_loop(base_url: str, interval_seconds: int) -> None:
+async def _maintenance_loop(base_url: str, interval_seconds: int) -> None:
     """Background maintenance loop. Runs as an asyncio task.
 
-    Two flag-gated steps run on the same cadence:
+    Three flag-gated steps run on the same cadence:
       • outbound token refresh when ``broker.token_refresh_enabled=true``
       • inbound OAuth state cleanup whenever the inbound auth store exists
         (i.e. whenever ``broker.oauth.enabled=true``)
+      • inbound DCR rate-limiter cleanup, paired with the inbound store
 
-    Either step can be disabled without disabling the other.
+    Each step can be disabled independently.
     """
-    logger.info("[TokenRefresh] Started (interval=%ds)", interval_seconds)
+    logger.info("[Maintenance] Started (interval=%ds)", interval_seconds)
     while True:
         try:
             if _get_settings().broker.token_refresh_enabled:
                 refresh_summary = await _refresh_expiring_tokens(base_url)
                 if refresh_summary["refreshed"] or refresh_summary["failed"]:
-                    logger.info("[TokenRefresh] %s", refresh_summary)
+                    logger.info("[Maintenance] refresh %s", refresh_summary)
             if _inbound_auth_store is not None:
                 await _inbound_auth_store.cleanup_expired()
             if _oauth_endpoints is not None:
                 _oauth_endpoints.cleanup_rate_limiter()
         except Exception:  # noqa: BLE001 -- background loop swallows all to keep ticking
-            logger.exception("[TokenRefresh] Unexpected error in refresh loop")
+            logger.exception("[Maintenance] Unexpected error in loop")
         await asyncio.sleep(interval_seconds)
 
 

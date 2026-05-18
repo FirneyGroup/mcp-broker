@@ -98,8 +98,8 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
         exempt_prefixes: tuple[str, ...] = ("/health", "/admin"),
         exempt_paths: tuple[str, ...] = (),
         *,
-        oauth_enabled: bool = False,
-        public_url: str = "",
+        get_oauth_enabled: Callable[[], bool] = lambda: False,
+        get_public_url: Callable[[], str] = lambda: "",
         get_inbound_auth_store: Callable[[], Any | None] = lambda: None,
         get_connector_names: Callable[[], list[str]] = lambda: [],
     ) -> None:
@@ -109,8 +109,12 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
         self._get_connect_token_store = get_connect_token_store
         self._exempt_prefixes = exempt_prefixes
         self._exempt_paths = exempt_paths
-        self._oauth_enabled = oauth_enabled
-        self._public_url = public_url
+        # OAuth toggle + public_url are callables (not scalars) so the middleware
+        # has a single read path through lifespan-initialized settings — matches
+        # the other ``get_*`` callables and avoids a parallel import-time settings
+        # bootstrap in ``main.py``.
+        self._get_oauth_enabled = get_oauth_enabled
+        self._get_public_url = get_public_url
         self._get_inbound_auth_store = get_inbound_auth_store
         self._get_connector_names = get_connector_names
 
@@ -154,9 +158,10 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
         # exemption ungated would silently bypass broker-key auth for any
         # future route that lands on these paths. AGENTS.md Known Gotcha #3:
         # exempt-path entries must be as narrow as possible.
-        if self._oauth_enabled and path in _OAUTH_PUBLIC_PATHS:
+        oauth_enabled = self._get_oauth_enabled()
+        if oauth_enabled and path in _OAUTH_PUBLIC_PATHS:
             return True
-        if self._oauth_enabled and path.startswith(_WELLKNOWN_OAUTH_PREFIX):
+        if oauth_enabled and path.startswith(_WELLKNOWN_OAUTH_PREFIX):
             return True
         return any(path.startswith(prefix) for prefix in self._exempt_prefixes)
 
@@ -176,7 +181,7 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
         header falls through to the legacy X-App-Id/X-Broker-Key path so that
         existing API clients keep working during the rollout.
         """
-        if self._oauth_enabled:
+        if self._get_oauth_enabled():
             bearer_or_legacy = await self._maybe_verify_bearer(request, path, client_registry)
             if bearer_or_legacy is not None:
                 return bearer_or_legacy
@@ -273,13 +278,13 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
             # HubSpot's).
             if path == "/status":
                 connector_name = connector_from_resource(
-                    resource_norm, self._public_url, self._get_connector_names()
+                    resource_norm, self._get_public_url(), self._get_connector_names()
                 )
                 if connector_name is None:
                     return self._bearer_audit_fail(path, token_hash, "audience_mismatch")
             else:
                 return self._bearer_audit_fail(path, token_hash, "unknown_connector")
-        elif not resource_matches_connector(resource_norm, self._public_url, connector_name):
+        elif not resource_matches_connector(resource_norm, self._get_public_url(), connector_name):
             return self._bearer_audit_fail(path, token_hash, "audience_mismatch")
 
         # Revoked-app check lives here (not in _bearer_build_identity) so we can
@@ -355,7 +360,7 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
         header so claude.ai can find the PRM URL and re-discover the AS.
         Other 401s stay bare to match the historical legacy-only behavior.
         """
-        if self._oauth_enabled and _bearer_protected_path(path):
+        if self._get_oauth_enabled() and _bearer_protected_path(path):
             return self._bearer_401_for_path(
                 path,
                 error="invalid_token",
@@ -366,7 +371,7 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
     def _resource_metadata_url_for(self, path: str) -> str:
         """Build the RFC 9728 PRM URL for the connector inferred from `path`."""
         connector_name = connector_from_request_path(path, self._get_connector_names())
-        public_url = self._public_url.rstrip("/")
+        public_url = self._get_public_url().rstrip("/")
         if connector_name is None:
             return f"{public_url}/.well-known/oauth-protected-resource"
         return f"{public_url}/.well-known/oauth-protected-resource/proxy/{connector_name}"
