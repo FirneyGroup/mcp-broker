@@ -298,6 +298,104 @@ All key commands (except `generate-admin-key`) require the broker to be running 
 
 All admin endpoints require the `X-Admin-Key` header.
 
+## Inbound OAuth 2.1 (claude.ai)
+
+The broker can act as an **OAuth 2.1 authorization server** for remote MCP clients that follow the [MCP authorization spec](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization) — notably [claude.ai's custom connectors](https://claude.com/docs/connectors/building/authentication). When enabled, the broker exposes RFC 7591 Dynamic Client Registration, RFC 8414 + RFC 9728 discovery, PKCE-protected authorization code flow, and family-revoke refresh rotation — and validates `Authorization: Bearer mcp_at_...` on every `/proxy/*` request.
+
+This is **opt-in** (`broker.oauth.enabled: false` by default). The existing `X-App-Id` + `X-Broker-Key` header auth keeps working unchanged.
+
+### Prerequisites
+
+- **Public HTTPS URL.** Anthropic egresses from `160.79.104.0/21`; the broker must be reachable from the public internet over HTTPS.
+- **Single-worker uvicorn.** The DCR rate limiter is in-memory. The broker aborts at startup if `WEB_CONCURRENCY > 1` and `oauth.enabled=true`.
+- **HTTP/1.1 origin protocol** if behind Cloudflare Tunnel. HTTP/2 lowercases header names; claude.ai does a case-sensitive lookup for `WWW-Authenticate` ([anthropics/claude-ai-mcp#219](https://github.com/anthropics/claude-ai-mcp/issues/219)) and silently fails discovery. In `cloudflared` config (or Zero Trust dashboard → Networks → Tunnels → Additional application settings → TLS):
+
+  ```yaml
+  originRequest:
+    http2Origin: false
+  ```
+
+- **An `app_key` registered in `clients:`** with a broker key already provisioned (via `./start create-key` or `POST /admin/keys`). OAuth tokens are minted against this single `app_key` — every claude.ai-issued token grants access to that app's connectors.
+
+### Configuration
+
+Add to `settings.yaml` under `broker:`:
+
+```yaml
+broker:
+  oauth:
+    enabled: true
+    app_key: my_company:app1               # must exist in `clients:` below
+    db_path: ./data/inbound_oauth.db
+    # access_token_ttl_seconds: 3600
+    # refresh_token_ttl_seconds: 2592000   # 30 days
+    # code_ttl_seconds: 60
+    # dcr_rate_limit_per_ip: 10
+    # dcr_rate_limit_window_seconds: 900
+```
+
+The settings validator rejects an `app_key` that does not exist in `clients` (loud at startup).
+
+Restart the broker. Inbound OAuth state lives in `data/inbound_oauth.db`, separate from `data/broker_keys.db` and `data/tokens.db`.
+
+### Verification
+
+Run from outside the broker network (so edge auth, if any, surfaces):
+
+```bash
+BROKER=https://broker.example.com
+
+# Public endpoints — should be 200 or 4xx, NEVER 403 from an edge-auth challenge
+curl -fsS $BROKER/.well-known/oauth-authorization-server -o /dev/null -w "%{http_code}\n"  # 200
+curl -fsS $BROKER/.well-known/oauth-protected-resource/proxy/notion -o /dev/null -w "%{http_code}\n"  # 200
+curl -fsS $BROKER/oauth/register -X POST -H 'content-type: application/json' -d '{}' -o /dev/null -w "%{http_code}\n"  # 400
+curl -fsS $BROKER/oauth/token -X POST -d 'grant_type=authorization_code' -o /dev/null -w "%{http_code}\n"  # 400
+curl -fsS $BROKER/oauth/revoke -X POST -d 'token=x' -o /dev/null -w "%{http_code}\n"  # 200
+curl -fsS $BROKER/proxy/notion/mcp -o /dev/null -w "%{http_code}\n"  # 401
+
+# WWW-Authenticate case check (claude.ai bug #219)
+curl -v $BROKER/proxy/notion/mcp 2>&1 | grep -i 'www-authenticate'
+# MUST show "WWW-Authenticate: Bearer ..." with CAPITAL W. Lowercase → fix origin protocol.
+```
+
+If any public endpoint returns 403, the deployment's edge auth is blocking — exempt those paths before continuing.
+
+### Adding the connector in claude.ai
+
+1. Open claude.ai → Settings → Connectors → **Add custom connector**.
+2. URL: `https://<broker-host>/proxy/<connector>/mcp` (e.g. `…/proxy/notion/mcp`).
+3. Name: anything memorable.
+4. Click **Connect**. Claude.ai will:
+   - Probe `/proxy/<connector>/mcp` → 401 with `WWW-Authenticate: Bearer resource_metadata=…`.
+   - Fetch the PRM at the `resource_metadata` URL.
+   - Fetch `/.well-known/oauth-authorization-server`.
+   - `POST /oauth/register` with `client_name: "Claude"` and redirect URI `https://claude.ai/api/mcp/auth_callback`.
+   - Redirect the user's browser to `/oauth/authorize?…`.
+5. The broker renders a consent page; click **Approve**.
+6. Claude.ai exchanges the auth code at `/oauth/token` and starts using bearer tokens for tool calls.
+
+### Operator workflow notes
+
+- **Disabling**: flip `oauth.enabled: false` and restart. Existing tokens stop validating; the legacy header-auth paths continue working. To fully revoke all issued state, also delete `data/inbound_oauth.db`.
+- **Broker-key revocation cascades**: `DELETE /admin/keys/{app_key}` now also drops the app's `inbound_tokens` and `oauth_codes` rows, so re-provisioning the same `app_key` after a compromise cannot silently regain bearer access.
+- **DCR row growth**: claude.ai re-registers a client on every fresh connection. Rate limit (10 per IP per 15 min) caps volume; for a busy deployment, run `DELETE FROM oauth_clients WHERE created_at < datetime('now', '-30 days')` periodically. (A scheduled cleanup is a v1.5 item.)
+
+### Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| claude.ai shows "Connection failed" with no further detail | Discovery silently failed. Check `WWW-Authenticate` case (`curl -v`). If lowercase, force HTTP/1.1 origin. |
+| `/oauth/authorize` returns 400 `invalid_target` | The `resource` parameter claude.ai sent does not match `{public_url}/proxy/{connector}`. Confirm `broker.public_url` matches the hostname you pasted into claude.ai (including scheme + trailing slash). |
+| `/oauth/token` returns 400 `invalid_grant` after a refresh | Either the refresh token expired, or replay was detected and the family was revoked. Reconnect from claude.ai to re-authorise. |
+| Broker aborts at startup with `OAuth enabled but WEB_CONCURRENCY > 1` | The in-memory DCR rate limiter requires single-worker uvicorn. Drop `--workers` to 1 or set `WEB_CONCURRENCY=1`. |
+| `/oauth/authorize` shows the consent page but POST fails | The consent page must reach the same broker instance (no load balancer in front splitting traffic). Single-instance only in v1. |
+
+### Known claude.ai bugs the broker works around
+
+- **[#82](https://github.com/anthropics/claude-ai-mcp/issues/82)** — claude.ai ignores `authorization_endpoint` from AS metadata and derives `/oauth/authorize` from the MCP base URL. Works in our favour: the AS lives at the same host as `/proxy/*`.
+- **[#219](https://github.com/anthropics/claude-ai-mcp/issues/219)** — case-sensitive `WWW-Authenticate` header lookup. Mitigated by forcing HTTP/1.1 to origin (see prerequisites).
+- **[#52871](https://github.com/anthropics/claude-code/issues/52871)** — claude.ai's WHATWG URL parser adds a trailing slash to host-only resource URLs. `normalize_resource()` strips trailing slashes symmetrically before comparison so the mismatch never surfaces.
+
 ## Adding a Connector
 
 All connectors auto-register via `__init_subclass__` on import. Four flavours exist — pick one before writing code:
@@ -339,9 +437,15 @@ All connectors auto-register via `__init_subclass__` on import. Four flavours ex
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `GET` | `/oauth/{connector}/connect` | Headers or `connect_token` query param | Start OAuth authorization flow |
-| `GET` | `/oauth/{connector}/callback` | Signed state | OAuth callback (called by provider) |
-| `POST` | `/oauth/{connector}/disconnect` | `X-Broker-Key` + `X-App-Id` | Delete stored token |
+| `GET` | `/oauth/{connector}/connect` | Headers or `connect_token` query param | Start outbound OAuth authorization flow (broker → MCP server) |
+| `GET` | `/oauth/{connector}/callback` | Signed state | Outbound OAuth callback (called by upstream provider) |
+| `POST` | `/oauth/{connector}/disconnect` | `X-Broker-Key` + `X-App-Id` | Delete stored upstream token |
+| `POST` | `/oauth/register` | None (rate-limited per IP) | RFC 7591 Dynamic Client Registration — inbound OAuth (opt-in) |
+| `GET`/`POST` | `/oauth/authorize` | PKCE + DCR-issued `client_id` | Inbound authorization code endpoint with consent page |
+| `POST` | `/oauth/token` | `client_id` (+ secret for confidential) | Inbound token endpoint (auth_code + refresh_token grants) |
+| `POST` | `/oauth/revoke` | `client_id` (+ secret for confidential) | RFC 7009 revocation |
+| `GET` | `/.well-known/oauth-authorization-server` | None | RFC 8414 AS metadata |
+| `GET` | `/.well-known/oauth-protected-resource/{path}` | None | RFC 9728 PRM (per-connector) |
 
 The `/connect` endpoint supports two auth modes:
 - **API client**: `X-App-Id` + `X-Broker-Key` headers
@@ -371,7 +475,10 @@ uv run pytest tests/ -v
 The broker implements defense-in-depth for OAuth credential management:
 
 - **API keys hashed at rest** — SHA-256. Raw key shown once on creation, never retrievable.
-- **Tokens encrypted at rest** — MultiFernet encryption with key rotation support
+- **Inbound OAuth tokens hashed at rest** — SHA-256, compared via `hmac.compare_digest`. Raw values surface only at issuance.
+- **Refresh rotation with family revoke** — OAuth 2.1 §4.3.1; replay of a used refresh token deletes every access + refresh token in the family.
+- **Strict redirect URI allowlist** — only `https://claude.ai/api/mcp/auth_callback` and `https://claude.com/api/mcp/auth_callback` accepted; arbitrary HTTPS rejected in v1.
+- **Tokens encrypted at rest** — MultiFernet encryption with key rotation support (outbound upstream tokens; inbound tokens use one-way hashing instead since the broker never replays them)
 - **PKCE (S256)** — All OAuth flows use Proof Key for Code Exchange
 - **Signed state parameters** — HMAC-signed with single-use nonces and 10-minute expiry
 - **Per-app key isolation** — Compromised broker key only affects that app's tokens

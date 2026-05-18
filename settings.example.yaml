@@ -19,6 +19,27 @@ broker:
   public_url: http://localhost:8002/     # Public base URL for OAuth callbacks (must include trailing slash)
   # token_refresh_enabled: true          # Background token refresh loop (default: true)
   # token_refresh_interval_seconds: 300  # How often to scan for expiring tokens (default: 300)
+  # Inbound OAuth 2.1 — required for claude.ai-style remote MCP clients (and any
+  # other RFC 8414/9728-conformant MCP client). When enabled the broker exposes
+  # /oauth/{register,authorize,token,revoke} + /.well-known/oauth-* and validates
+  # `Authorization: Bearer mcp_at_...` on /proxy/*. Requires single-worker uvicorn
+  # (the DCR rate limiter is in-memory).
+  # oauth:
+  #   enabled: true
+  #   app_key: my_company:app1               # must match an entry in `clients:` below
+  #   db_path: ./data/inbound_oauth.db
+  #   access_token_ttl_seconds: 3600
+  #   refresh_token_ttl_seconds: 2592000     # 30 days
+  #   code_ttl_seconds: 60
+  #   dcr_rate_limit_per_ip: 10
+  #   dcr_rate_limit_window_seconds: 900     # 15 min
+  #   # Exact-match allowlist of accepted client redirect_uris. With no identity
+  #   # layer at /oauth/authorize, this list IS the security boundary. Default
+  #   # covers claude.ai web; add entries for other remote MCP clients you trust
+  #   # (Cursor, Windsurf, custom). HTTPS-only — loopback is a v1.5 item.
+  #   allowed_redirect_uris:
+  #     - https://claude.ai/api/mcp/auth_callback
+  #     - https://claude.com/api/mcp/auth_callback
 
 store:
   backend: sqlite

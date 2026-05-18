@@ -12,13 +12,20 @@ import importlib
 import logging
 import time
 from contextlib import asynccontextmanager
+from http import HTTPStatus
 from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from broker.api.admin import AdminEndpoints
+from broker.api.oauth_server import OAuthServerEndpoints
+from broker.api.wellknown import (
+    handle_authorization_server_metadata,
+    handle_broker_protected_resource_metadata,
+    handle_protected_resource_metadata,
+)
 from broker.config import BrokerSettings, load_settings
 from broker.connectors.base import BaseConnector
 from broker.connectors.native import NativeConnector
@@ -28,6 +35,7 @@ from broker.models.connection import AppConnection
 from broker.services.api_key_store import BrokerKeyStore, ConnectTokenStore
 from broker.services.client_registry import BrokerClientRegistry
 from broker.services.discovery import OAuthDiscovery, resolve_oauth
+from broker.services.inbound_auth_store import SQLiteInboundAuthStore
 from broker.services.oauth import OAuthHandler
 from broker.services.proxy import clients, get_valid_token, proxy_mcp_request
 from broker.services.sqlite_api_key_store import SQLiteBrokerKeyStore
@@ -43,6 +51,8 @@ _discovery: OAuthDiscovery | None = None
 _key_store: BrokerKeyStore | None = None
 _client_registry: BrokerClientRegistry | None = None
 _connect_token_store: ConnectTokenStore | None = None
+_inbound_auth_store: SQLiteInboundAuthStore | None = None
+_oauth_endpoints: OAuthServerEndpoints | None = None
 
 
 def _get_settings() -> BrokerSettings:
@@ -86,6 +96,15 @@ def _get_connect_token_store() -> ConnectTokenStore | None:
     return _connect_token_store
 
 
+def _get_inbound_auth_store() -> SQLiteInboundAuthStore | None:
+    """Return inbound OAuth auth store (None when ``broker.oauth.enabled=false``).
+
+    Middleware fails closed on ``None`` only when ``oauth_enabled`` is also true;
+    otherwise the legacy auth path continues to work unchanged.
+    """
+    return _inbound_auth_store
+
+
 # =============================================================================
 # LIFESPAN HELPERS
 # =============================================================================
@@ -109,9 +128,18 @@ def _load_connectors(connector_names: list[str]) -> None:
 
 
 def _start_token_refresh(settings: BrokerSettings) -> asyncio.Task[None] | None:
-    """Start the background token refresh loop if enabled. Returns the task or None."""
-    if not settings.broker.token_refresh_enabled:
-        logger.info("[Broker] Background token refresh disabled")
+    """Start the background maintenance loop.
+
+    The loop covers two independent concerns on the same cadence: outbound
+    token refresh and inbound OAuth state cleanup. It starts when either is
+    active, and the loop body gates each step on its own flag — so an
+    operator who disables token refresh still gets OAuth cleanup, and an
+    operator who hasn't enabled OAuth still gets token refresh.
+    """
+    refresh_active = settings.broker.token_refresh_enabled
+    oauth_active = settings.broker.oauth.enabled
+    if not refresh_active and not oauth_active:
+        logger.info("[Broker] Background maintenance disabled (no refresh + no OAuth)")
         return None
     base_url = settings.broker.public_url
     return asyncio.create_task(
@@ -152,7 +180,9 @@ async def lifespan(app: FastAPI):  # noqa: PLR0915 — startup sequence, all ste
         _discovery, \
         _key_store, \
         _client_registry, \
-        _connect_token_store
+        _connect_token_store, \
+        _inbound_auth_store, \
+        _oauth_endpoints
 
     # 1. Load settings. Validation already ran synchronously in broker/__main__.py
     #    before uvicorn started, so a failure here means either (a) settings.yaml
@@ -175,6 +205,24 @@ async def lifespan(app: FastAPI):  # noqa: PLR0915 — startup sequence, all ste
     key_store = SQLiteBrokerKeyStore(db_path=_settings.store.sqlite.key_db_path)
     await key_store.setup()
     _key_store = key_store
+
+    # 4b. Inbound OAuth auth store — only initialize when the operator opted in.
+    #     Leaving it None keeps the broker's surface area unchanged for users
+    #     who haven't flipped `broker.oauth.enabled`.
+    if _settings.broker.oauth.enabled:
+        inbound_store = SQLiteInboundAuthStore(db_path=_settings.broker.oauth.db_path)
+        await inbound_store.setup()
+        _inbound_auth_store = inbound_store
+        # OAuthServerEndpoints owns the in-memory `_DCRRateLimiter` — it MUST be
+        # a singleton across requests, otherwise the rate-limiter's `_events`
+        # dict resets on every call and the 10/15min/IP cap is unenforceable.
+        _oauth_endpoints = OAuthServerEndpoints(
+            inbound_auth_store=inbound_store,
+            config=_settings.broker.oauth,
+            connector_names_provider=ConnectorRegistry.list_names,
+            public_url=_settings.broker.public_url,
+        )
+        logger.info("[Broker] Inbound OAuth enabled (db=%s)", _settings.broker.oauth.db_path)
 
     # 5. Create connect token store (in-memory, single-use tokens for browser OAuth)
     _connect_token_store = ConnectTokenStore()
@@ -241,7 +289,29 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Auth middleware — registered before lifespan, uses lazy accessors
+
+# Read OAuth toggle + public_url synchronously at module import so the
+# middleware can stash them. ``broker/__main__.py`` already validated settings
+# before uvicorn started; this second parse is cheap and lets the middleware
+# see the OAuth config (its constructor needs scalars, not callables).
+#
+# Import-time failure is tolerated: tests import ``broker.main`` without a
+# ``settings.yaml`` and stitch state in directly. In that case OAuth stays off
+# and the legacy auth path is unaffected.
+def _bootstrap_oauth_args() -> tuple[bool, str]:
+    """Best-effort read of OAuth toggle + public_url at module import."""
+    try:
+        bootstrap = load_settings()
+    except Exception:  # noqa: BLE001 -- tests import without settings.yaml; default to disabled
+        return False, ""
+    return bootstrap.broker.oauth.enabled, bootstrap.broker.public_url
+
+
+_BOOTSTRAP_OAUTH_ENABLED, _BOOTSTRAP_PUBLIC_URL = _bootstrap_oauth_args()
+
+# Auth middleware — registered before lifespan, uses lazy accessors for the
+# stores. ``oauth_enabled`` and ``public_url`` are read once at import; flipping
+# them requires a process restart (matches the existing connectors-list pattern).
 app.add_middleware(
     BrokerAuthMiddleware,
     get_key_store=_get_key_store,
@@ -249,6 +319,10 @@ app.add_middleware(
     get_connect_token_store=_get_connect_token_store,
     exempt_prefixes=("/health", "/admin"),
     exempt_paths=(),
+    oauth_enabled=_BOOTSTRAP_OAUTH_ENABLED,
+    public_url=_BOOTSTRAP_PUBLIC_URL,
+    get_inbound_auth_store=_get_inbound_auth_store,
+    get_connector_names=ConnectorRegistry.list_names,
 )
 
 
@@ -281,6 +355,7 @@ def _get_admin_endpoints() -> AdminEndpoints:
         connect_token_store=connect_token_store,
         token_store=_store,
         refresh_callback=_do_refresh,
+        inbound_auth_store=_inbound_auth_store,
     )
 
 
@@ -312,6 +387,120 @@ async def admin_create_connect_token(request: Request):
 @app.post("/admin/refresh")
 async def admin_refresh_tokens(request: Request):
     return await _get_admin_endpoints().refresh_tokens(request)
+
+
+# =============================================================================
+# INBOUND OAUTH ROUTES (gated by settings.broker.oauth.enabled)
+# =============================================================================
+
+
+def _get_oauth_endpoints() -> OAuthServerEndpoints | None:
+    """Return the lifespan-initialized OAuth endpoints, or None when disabled.
+
+    Returns a singleton so the in-memory ``_DCRRateLimiter._events`` dict
+    accumulates state across requests. Constructing a fresh instance per
+    request would reset the counter on every call and silently disable the
+    10/15min/IP rate limit — and silently nullify the ``WEB_CONCURRENCY=1``
+    startup check, which exists precisely because the limiter is in-process.
+
+    Returns ``None`` when ``broker.oauth.enabled=false`` so route handlers
+    can short-circuit to a 404 instead of letting a RuntimeError propagate
+    into a 500.
+    """
+    return _oauth_endpoints
+
+
+@app.post("/oauth/register")
+async def oauth_register(request: Request):
+    endpoints = _get_oauth_endpoints()
+    if endpoints is None:
+        return _oauth_disabled_not_found()
+    return await endpoints.register(request)
+
+
+@app.get("/oauth/authorize")
+async def oauth_authorize_get(request: Request):
+    endpoints = _get_oauth_endpoints()
+    if endpoints is None:
+        return _oauth_disabled_not_found()
+    return await endpoints.authorize_get(request)
+
+
+@app.post("/oauth/authorize")
+async def oauth_authorize_post(request: Request):
+    endpoints = _get_oauth_endpoints()
+    if endpoints is None:
+        return _oauth_disabled_not_found()
+    return await endpoints.authorize_post(request)
+
+
+@app.post("/oauth/token")
+async def oauth_token(request: Request):
+    endpoints = _get_oauth_endpoints()
+    if endpoints is None:
+        return _oauth_disabled_not_found()
+    return await endpoints.token(request)
+
+
+@app.post("/oauth/revoke")
+async def oauth_revoke(request: Request):
+    endpoints = _get_oauth_endpoints()
+    if endpoints is None:
+        return _oauth_disabled_not_found()
+    return await endpoints.revoke(request)
+
+
+def _oauth_disabled_not_found() -> JSONResponse:
+    """404 for the five /oauth/* routes when broker.oauth.enabled=false.
+
+    Mirrors the in-handler `_not_found()` shape from oauth_server.py so a
+    misconfigured client sees the same disabled-mode response regardless of
+    whether oauth was disabled at lifespan-init time (this path) or flipped
+    off mid-process (the handler-internal check — currently unreachable but
+    kept as defense in depth).
+    """
+    return JSONResponse({"error": "not_found"}, status_code=HTTPStatus.NOT_FOUND)
+
+
+@app.get("/.well-known/oauth-authorization-server")
+async def wellknown_oauth_as():
+    """RFC 8414 AS metadata.
+
+    The route is always mounted, but unauthenticated discovery only succeeds
+    when ``broker.oauth.enabled=true`` — the middleware exempts the
+    ``/.well-known/oauth-`` prefix on the same flag. With OAuth disabled,
+    callers must present a broker key to read this document.
+    """
+    settings = _get_settings()
+    return handle_authorization_server_metadata(
+        settings.broker.public_url, ConnectorRegistry.list_names()
+    )
+
+
+@app.get("/.well-known/oauth-protected-resource")
+async def wellknown_oauth_pr_broker():
+    """RFC 9728 PRM for the broker as a whole.
+
+    Returned when a bearer challenge fires on a non-connector-scoped path
+    (e.g. ``/status``). The path-parameterized handler below requires at least
+    one segment, so this bare route covers the no-suffix case; without it the
+    ``WWW-Authenticate: Bearer resource_metadata="..."`` URL would 404 and
+    break MCP-client discovery bootstrap.
+    """
+    settings = _get_settings()
+    return handle_broker_protected_resource_metadata(
+        settings.broker.public_url, ConnectorRegistry.list_names()
+    )
+
+
+@app.get("/.well-known/oauth-protected-resource/{wellknown_path:path}")
+async def wellknown_oauth_pr(wellknown_path: str):
+    """RFC 9728 PRM. Path-style suffix so ``proxy/notion/mcp`` works alongside
+    ``proxy/workspace_mcp/`` (no uniform per-connector path shape)."""
+    settings = _get_settings()
+    return handle_protected_resource_metadata(
+        settings.broker.public_url, wellknown_path, ConnectorRegistry.list_names()
+    )
 
 
 # =============================================================================
@@ -592,14 +781,27 @@ async def _refresh_expiring_tokens(base_url: str) -> dict[str, int]:
 
 
 async def _token_refresh_loop(base_url: str, interval_seconds: int) -> None:
-    """Periodically refresh expiring tokens. Runs as a background asyncio task."""
+    """Background maintenance loop. Runs as an asyncio task.
+
+    Two flag-gated steps run on the same cadence:
+      • outbound token refresh when ``broker.token_refresh_enabled=true``
+      • inbound OAuth state cleanup whenever the inbound auth store exists
+        (i.e. whenever ``broker.oauth.enabled=true``)
+
+    Either step can be disabled without disabling the other.
+    """
     logger.info("[TokenRefresh] Started (interval=%ds)", interval_seconds)
     while True:
         try:
-            results = await _refresh_expiring_tokens(base_url)
-            if results["refreshed"] or results["failed"]:
-                logger.info("[TokenRefresh] %s", results)
-        except Exception:  # noqa: BLE001
+            if _get_settings().broker.token_refresh_enabled:
+                refresh_summary = await _refresh_expiring_tokens(base_url)
+                if refresh_summary["refreshed"] or refresh_summary["failed"]:
+                    logger.info("[TokenRefresh] %s", refresh_summary)
+            if _inbound_auth_store is not None:
+                await _inbound_auth_store.cleanup_expired()
+            if _oauth_endpoints is not None:
+                _oauth_endpoints.cleanup_rate_limiter()
+        except Exception:  # noqa: BLE001 -- background loop swallows all to keep ticking
             logger.exception("[TokenRefresh] Unexpected error in refresh loop")
         await asyncio.sleep(interval_seconds)
 

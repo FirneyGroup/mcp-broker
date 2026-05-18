@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **Inbound OAuth 2.1 AS for claude.ai-style MCP clients** — opt-in via `broker.oauth.enabled=true` (default `false`). New endpoints:
+  - `POST /oauth/register` — RFC 7591 Dynamic Client Registration with per-IP sliding-window rate limit.
+  - `GET/POST /oauth/authorize` — PKCE S256 + RFC 8707 resource indicators; consent page with `X-Frame-Options: DENY` and `frame-ancestors 'none'` CSP.
+  - `POST /oauth/token` — `authorization_code` + `refresh_token` grants; atomic refresh rotation with family revoke on replay (OAuth 2.1 §4.3.1).
+  - `POST /oauth/revoke` — RFC 7009 silent-success semantics.
+  - `GET /.well-known/oauth-authorization-server` and `GET /.well-known/oauth-protected-resource/{path}` — RFC 8414 + RFC 9728 discovery, cached for 1 hour.
+- **Bearer-token validation on `/proxy/*`** — `Authorization: Bearer mcp_at_...` tokens are validated against the inbound auth store with audience binding to the request connector. SHA-256-hashed at rest; compared via `hmac.compare_digest`.
+- **`broker.oauth` config section** — `enabled`, `app_key`, `db_path`, TTL knobs, DCR rate limit knobs. Cross-field validator rejects an `app_key` that does not exist in `clients`.
+- **Cascade delete** — `DELETE /admin/keys/{app_key}` now also drops inbound OAuth state for the app (DCR codes + access/refresh tokens) so re-provisioning a compromised key cannot silently regain bearer access.
 - **Slack connector** (Native) — bot-identity messaging via Slack OAuth v2.
 - **Broker module entrypoint** (`python -m broker`) — validates settings before uvicorn boots, so config errors exit cleanly instead of propagating from the async lifespan.
 - **`GET /oauth/success`** — built-in landing page after a successful outbound OAuth connect, served at a stable URL on the broker. Accepts an optional `?connector=` query param to customize the heading. Auth-exempt; no protected state.
@@ -16,6 +25,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Grouped config errors** — missing environment variables are reported together with their `settings.yaml` path, instead of failing on the first miss.
 - **`success_redirect_url` defaults to `/oauth/success` on the broker.** When `broker.success_redirect_url` is unset, the OAuth callback now redirects to `{public_url}/oauth/success?connector={connector_name}` rather than rendering inline HTML at the callback URL. Operators with a real dashboard still override via `success_redirect_url` — unchanged behavior. The example settings no longer hardcode `http://localhost:3000`, which left a dead-end UX for any deployment without a local dashboard running.
+
+### Security
+
+- Inbound bearer tokens, refresh tokens, and DCR client secrets are SHA-256-hashed at rest; raw values surface only at issuance and never again. Token comparison uses `hmac.compare_digest`.
+- Inbound `Authorization: Bearer` header is removed from the request before any downstream handler runs (defense in depth on top of the existing proxy strip list).
+- Refresh-token replay triggers immediate cascade revoke of every token in the family.
+- DCR rate-limit `X-Forwarded-For` trust is now gated by `broker.oauth.trusted_proxy_ips` (default empty). Previously the DCR rate limiter trusted `X-Forwarded-For` unconditionally, letting a direct-access attacker bypass the per-IP cap by cycling forwarded values. With the gate, XFF is honored only when `request.client.host` is in the configured trusted-proxy allowlist; otherwise the rate-limit key is the immediate client.
 
 ## [0.1.0] — 2026-04-14
 

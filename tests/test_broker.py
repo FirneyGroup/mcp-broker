@@ -19,7 +19,7 @@ from cryptography.fernet import Fernet
 from httpx import Response
 from pydantic import ValidationError
 
-from broker.config import BrokerConfig, BrokerSettings
+from broker.config import BrokerAppConfig, BrokerConfig, BrokerSettings, OAuthInboundConfig
 from broker.connectors.base import BaseConnector
 from broker.connectors.registry import ConnectorRegistry
 from broker.models.connection import AppConnection
@@ -509,6 +509,42 @@ class TestProxyAuth:
         result = _extract_app_key(request)
         assert result == "app:test"
 
+    def test_upstream_not_connected_returns_distinguishable_503(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Bearer-valid + missing-outbound-OAuth returns 503 with structured body.
+
+        Regression: previously returned bare 401 which collided semantically with
+        inbound-bearer failures and gave the operator no actionable signal.
+        """
+        import json
+        import logging
+
+        from broker.services.proxy import _upstream_not_connected_response
+
+        connector = MagicMock()
+        connector.meta.display_name = "Notion"
+
+        with caplog.at_level(logging.WARNING, logger="broker.services.proxy"):
+            response = _upstream_not_connected_response("notion", connector, "acme:claude_ai")
+
+        assert response.status_code == 503
+        body = json.loads(response.body)
+        assert body == {
+            "error": "upstream_not_connected",
+            "error_description": (
+                "Broker has no Notion access token for app_key acme:claude_ai. "
+                "The inbound bearer is valid; the outbound OAuth connection "
+                "has not been completed."
+            ),
+            "connector": "notion",
+            "app_key": "acme:claude_ai",
+            "next_step": "Complete outbound connect at /oauth/notion/connect?app_key=acme:claude_ai",
+        }
+        warn_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("upstream_not_connected" in r.getMessage() for r in warn_records)
+        assert any("acme:claude_ai" in r.getMessage() for r in warn_records)
+
 
 # =============================================================================
 # MODELS
@@ -592,6 +628,70 @@ class TestConfig:
 
         with pytest.raises(KeyError):
             settings.get_app_credentials("test_company:chat", "notion")
+
+
+# =============================================================================
+# CONFIG VALIDATION (BrokerSettings.oauth cross-field validator)
+# =============================================================================
+
+
+class TestConfigCrossFieldValidator:
+    def test_app_key_missing_when_enabled_raises(self) -> None:
+        with pytest.raises(ValidationError):
+            BrokerSettings(
+                broker=BrokerConfig(
+                    admin_key="test-admin-key-long",
+                    encryption_keys=["k"],
+                    state_secret="test-state-secret-key",
+                    oauth=OAuthInboundConfig(enabled=True),
+                ),
+                clients={"acme": {"claude_ai": BrokerAppConfig()}},
+            )
+
+    def test_app_key_not_in_clients_raises(self) -> None:
+        with pytest.raises(ValidationError):
+            BrokerSettings(
+                broker=BrokerConfig(
+                    admin_key="test-admin-key-long",
+                    encryption_keys=["k"],
+                    state_secret="test-state-secret-key",
+                    oauth=OAuthInboundConfig(enabled=True, app_key="acme:nonexistent"),
+                ),
+                clients={"acme": {"claude_ai": BrokerAppConfig()}},
+            )
+
+    def test_valid_app_key_passes(self) -> None:
+        settings = BrokerSettings(
+            broker=BrokerConfig(
+                admin_key="test-admin-key-long",
+                encryption_keys=["k"],
+                state_secret="test-state-secret-key",
+                oauth=OAuthInboundConfig(enabled=True, app_key="acme:claude_ai"),
+            ),
+            clients={"acme": {"claude_ai": BrokerAppConfig()}},
+        )
+        assert settings.broker.oauth.enabled
+        assert settings.broker.oauth.app_key == "acme:claude_ai"
+
+    def test_disabled_oauth_skips_validation(self) -> None:
+        # No clients section + disabled OAuth — must not raise.
+        settings = BrokerSettings(
+            broker=BrokerConfig(
+                admin_key="test-admin-key-long",
+                encryption_keys=["k"],
+                state_secret="test-state-secret-key",
+            ),
+        )
+        assert not settings.broker.oauth.enabled
+
+    def test_issuer_strips_trailing_slash(self) -> None:
+        config = BrokerConfig(
+            admin_key="test-admin-key-long",
+            encryption_keys=["k"],
+            state_secret="test-state-secret-key",
+            public_url="https://broker.example.com/",
+        )
+        assert config.issuer == "https://broker.example.com"
 
 
 # =============================================================================

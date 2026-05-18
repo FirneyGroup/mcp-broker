@@ -311,15 +311,46 @@ async def _resolve_connection(  # noqa: PLR0913 — OAuth resolution requires al
         app_key, connector_name, connector, resolved, store, oauth_handler
     )
     if not connection:
-        return JSONResponse(
-            {
-                "error": f"No {connector.meta.display_name} connection for {app_key}. "
-                f"Connect via /oauth/{connector_name}/connect?app_key={app_key}"
-            },
-            status_code=401,
-        )
+        return _upstream_not_connected_response(connector_name, connector, app_key)
 
     return connection
+
+
+def _upstream_not_connected_response(
+    connector_name: str, connector: BaseConnector, app_key: str
+) -> JSONResponse:
+    """Render a distinguishable error when the inbound bearer is valid but the
+    broker has no stored upstream OAuth token for this (app_key, connector).
+
+    Returned as 503: this is a broker capability gap, not an inbound-bearer
+    failure — using 401 here would mislead MCP clients into re-running their
+    OAuth flow, which would not help. The structured body + warn log give the
+    operator the exact next step to complete the outbound connect.
+    """
+    connect_path = f"/oauth/{connector_name}/connect?app_key={app_key}"
+    logger.warning(
+        "[upstream_not_connected] app_key=%s connector=%s — inbound bearer "
+        "valid but no stored %s token; operator must complete outbound OAuth "
+        "via %s (or the equivalent admin CLI).",
+        app_key,
+        connector_name,
+        connector.meta.display_name,
+        connect_path,
+    )
+    return JSONResponse(
+        {
+            "error": "upstream_not_connected",
+            "error_description": (
+                f"Broker has no {connector.meta.display_name} access token for "
+                f"app_key {app_key}. The inbound bearer is valid; the outbound "
+                "OAuth connection has not been completed."
+            ),
+            "connector": connector_name,
+            "app_key": app_key,
+            "next_step": f"Complete outbound connect at {connect_path}",
+        },
+        status_code=503,
+    )
 
 
 async def _build_and_stream(  # noqa: PLR0913 — path forwarding requires all params

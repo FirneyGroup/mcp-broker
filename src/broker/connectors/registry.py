@@ -47,6 +47,11 @@ class ConnectorRegistry:
         return list(cls._connectors.values())
 
     @classmethod
+    def list_names(cls) -> list[str]:
+        """List registered connector names."""
+        return [c.meta.name for c in cls._connectors.values()]
+
+    @classmethod
     def clear(cls) -> None:
         """Clear all registered connectors (for testing)."""
         cls._connectors.clear()
