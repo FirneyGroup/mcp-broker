@@ -540,9 +540,13 @@ class SQLiteInboundAuthStore:
             return rotated_pair
         except Exception:
             # Best-effort rollback. Replay branch already committed; sqlite
-            # raises OperationalError if no transaction is open — suppress so
-            # we propagate the original error.
-            with contextlib.suppress(sqlite3.OperationalError):
+            # raises OperationalError if no transaction is open. We suppress
+            # the broader ``sqlite3.Error`` so any other unexpected sqlite
+            # failure during the rollback (DatabaseError, etc.) still lets
+            # the ORIGINAL exception (InvalidGrantError on the replay path)
+            # propagate to the caller — otherwise the outer handler would
+            # see a sqlite exception instead and surface 500.
+            with contextlib.suppress(sqlite3.Error):
                 conn.execute("ROLLBACK")
             raise
 

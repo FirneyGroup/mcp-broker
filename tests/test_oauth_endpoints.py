@@ -666,7 +666,11 @@ class TestTokenRefresh:
         assert first.status_code == 200
         replay = await endpoints.token(_request_with_form(dict(form)))
         assert replay.status_code == 400
-        assert _response_body(replay)["error"] == "invalid_grant"
+        body = _response_body(replay)
+        assert body["error"] == "invalid_grant"
+        # error_description MUST be the coarse hash-blind string so an attacker
+        # cannot distinguish replay-family-revoked from simple expiry / miss.
+        assert body["error_description"] == "refresh_token invalid"
         # Family must be empty after replay-revoke.
         conn = sqlite3.connect(store._db_path)
         try:
@@ -1359,6 +1363,33 @@ class TestConcurrentRotation:
         assert 200 in status_codes
         assert status_codes.count(200) == 1
         assert status_codes.count(400) == 1
+        # The loser's error_description MUST be the coarse hash-blind string
+        # — regression: the race-induced rotate_refresh path used to leak
+        # the internal exception message ("refresh replay; family revoked"
+        # vs "refresh disappeared mid-rotation"), giving a client an oracle
+        # to distinguish family revocation from a plain race.
+        loser = next(r for r in responses if r.status_code == 400)
+        assert _response_body(loser)["error_description"] == "refresh_token invalid"
+
+    async def test_unknown_refresh_returns_coarse_description(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        """The 'token not found' path must return the same opaque description
+        as the replay path — otherwise the response body becomes an oracle."""
+        client_id = await _register_public_client(endpoints)
+        response = await endpoints.token(
+            _request_with_form(
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": "mcp_rt_does_not_exist",
+                    "client_id": client_id,
+                }
+            )
+        )
+        assert response.status_code == 400
+        body = _response_body(response)
+        assert body["error"] == "invalid_grant"
+        assert body["error_description"] == "refresh_token invalid"
 
 
 # =============================================================================

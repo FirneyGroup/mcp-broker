@@ -606,8 +606,12 @@ class OAuthServerEndpoints:
         rotation_request = self._build_rotation_request(prior_row, client_id, scope_or_error)
         try:
             return await self._inbound_auth_store.rotate_refresh(rotation_request)
-        except InvalidGrantError as exc:
-            return _oauth_error(HTTPStatus.BAD_REQUEST, "invalid_grant", str(exc))
+        except InvalidGrantError:
+            # Coarse, hash-blind message — must match the pre-check replay
+            # path and the "not found" path so a client cannot distinguish
+            # "family revoked" from "simply expired" / "missing" via the
+            # error_description (timing/oracle attack on §4.3.1).
+            return _oauth_error(HTTPStatus.BAD_REQUEST, "invalid_grant", "refresh_token invalid")
 
     async def _handle_refresh_replay(self, prior_row: InboundToken, client_id: str) -> Response:
         """Trigger the family revoke for a replayed refresh, return invalid_grant.
