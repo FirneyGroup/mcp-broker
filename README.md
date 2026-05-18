@@ -42,6 +42,7 @@ Works with any MCP-compatible client (Claude Desktop, Claude Code, Google ADK, c
 - [Docker](#docker)
 - [Configuration](#configuration)
 - [Key Management](#key-management)
+- [Inbound OAuth 2.1 (claude.ai)](#inbound-oauth-21-claudeai)
 - [Adding a Connector](#adding-a-connector)
 - [API Reference](#api-reference)
 - [Testing](#testing)
@@ -119,6 +120,7 @@ sequenceDiagram
 
 - **OAuth 2.1 + PKCE** — Full authorization code flow with S256 code challenge for all connectors
 - **OAuth discovery** — Automatic endpoint discovery ([RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414)) and dynamic client registration ([RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591)) for MCP servers that support it
+- **OAuth 2.1 authorization server** — Acts as an AS for remote MCP clients ([claude.ai](https://claude.com/docs/connectors/building/authentication), MCP-spec compliant). RFC 7591 DCR, RFC 8414 + RFC 9728 discovery, PKCE-protected codes, family-revoke refresh rotation. Opt-in via `broker.oauth.enabled` — see [Inbound OAuth 2.1](#inbound-oauth-21-claudeai).
 - **Transparent token injection** — Your agent sends requests to the broker; the broker adds Bearer tokens before forwarding
 - **Automatic token refresh** — Expired tokens are refreshed with locking to prevent concurrent refresh races
 - **Proactive token refresh** — Background loop + admin API refreshes tokens expiring within 10 minutes
@@ -327,6 +329,24 @@ broker:
     enabled: true
     app_key: my_company:app1               # must exist in `clients:` below
     db_path: ./data/inbound_oauth.db
+
+    # Redirect URIs accepted at DCR + consent. HTTPS-only, exact-match.
+    # Defaults to claude.ai's two callbacks; extend if you're integrating
+    # a different MCP client. Loopback / arbitrary-HTTPS support is a
+    # v1.5 item.
+    # allowed_redirect_uris:
+    #   - https://claude.ai/api/mcp/auth_callback
+    #   - https://claude.com/api/mcp/auth_callback
+
+    # IPs the broker trusts to set X-Forwarded-For (e.g. CF Tunnel egress,
+    # Tailscale Funnel, an nginx reverse proxy). Exact-match strings — no
+    # CIDR. Default-empty means the raw socket IP is used for per-IP rate
+    # limiting; only populate this if a trusted proxy sits between the
+    # broker and clients, otherwise an attacker could spoof XFF to bypass
+    # the limit.
+    # trusted_proxy_ips:
+    #   - 198.51.100.42
+
     # access_token_ttl_seconds: 3600
     # refresh_token_ttl_seconds: 2592000   # 30 days
     # code_ttl_seconds: 60
