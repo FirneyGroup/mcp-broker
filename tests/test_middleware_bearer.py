@@ -91,8 +91,8 @@ def _make_middleware(
         get_key_store=lambda: key_store,
         get_client_registry=lambda: registry,
         get_connect_token_store=lambda: None,
-        oauth_enabled=oauth_enabled,
-        public_url=public_url,
+        get_oauth_enabled=lambda: oauth_enabled,
+        get_public_url=lambda: public_url,
         get_inbound_auth_store=lambda: inbound_store,
         get_connector_names=lambda: connector_names if connector_names is not None else CONNECTORS,
     )
