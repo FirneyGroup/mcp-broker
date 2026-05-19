@@ -27,11 +27,12 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import yaml
 from dotenv import load_dotenv
+from pydantic import BaseModel, ConfigDict
 
 logger_prefix = "  "  # Indent all output for readability
 
@@ -428,43 +429,104 @@ def _get_cf_access_headers() -> dict[str, str]:
     }
 
 
-def _show_mcp_config(  # noqa: PLR0913 — display function needs all params
-    broker_url: str,
-    connector_name: str,
-    app_key: str,
-    broker_key: str,
-    transport: str,
-) -> None:
-    """Print MCP server config for the connector.
+AuthMode = Literal["apikey", "oauth", "both"]
 
-    Output is JSON-like and directly usable by Claude Desktop, Claude Code,
-    Cursor, Cline, and any other MCP client that accepts streamable-http
-    servers. ADK users can translate to McpServerConfig(...) trivially.
 
-    The output contains the real broker key (and any CF Access service
-    secret) verbatim so it can be pasted directly into a client config.
-    Don't share or paste the output anywhere public.
+class McpConfigContext(BaseModel):
+    """Display state bundle for ``_show_mcp_config``.
 
-    If CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET are set in the
-    environment, CF-Access-* headers are appended automatically — for
-    brokers fronted by a Cloudflare tunnel with a service-token Access
-    policy.
+    Bundled so the show helpers stay under the 4-arg ceiling (AGENTS.md) once
+    we add OAuth-shaped output that needs to know ``oauth_enabled`` and the
+    ``allowed_redirect_uris`` allowlist alongside the legacy API-key data.
+    """
+
+    broker_url: str
+    app_key: str
+    broker_key: str
+    oauth_enabled: bool
+    allowed_redirect_uris: list[str]
+    auth_mode: AuthMode
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+def _show_apikey_block(connector_name: str, transport: str, ctx: McpConfigContext) -> None:
+    """JSON snippet using X-App-Id + X-Broker-Key headers.
+
+    For trusted internal callers (the gateway, ADK ``McpServerConfig``,
+    operator-controlled scripts) — anything where embedding a long-lived
+    static secret in client config is acceptable.
     """
     headers = [
-        ("X-App-Id", app_key),
-        ("X-Broker-Key", broker_key),
+        ("X-App-Id", ctx.app_key),
+        ("X-Broker-Key", ctx.broker_key),
         *_get_cf_access_headers().items(),
     ]
-    print(f"{logger_prefix}── {connector_name} ──")
+    print(f"{logger_prefix}# Static API-key auth — for trusted internal callers")
+    print(f"{logger_prefix}# (gateway, ADK McpServerConfig, scripts you control).")
+    print(f"{logger_prefix}# Long-lived secret embedded in client config.")
     print(f'  "{connector_name}": {{')
     print(f'    "transport": "{transport}",')
-    print(f'    "url": "{broker_url}/proxy/{connector_name}/mcp",')
+    print(f'    "url": "{ctx.broker_url}/proxy/{connector_name}/mcp",')
     print('    "headers": {')
     for i, (header_name, header_value) in enumerate(headers):
         suffix = "," if i < len(headers) - 1 else ""
         print(f'      "{header_name}": "{header_value}"{suffix}')
     print("    }")
     print("  }\n")
+
+
+def _show_oauth_block(connector_name: str, ctx: McpConfigContext) -> None:
+    """URL-only entry + status note for MCP-spec OAuth clients.
+
+    Claude.ai, Cursor, Cline, etc. — clients that walk RFC 7591 DCR + the
+    authorization-code flow on first connect. They obtain a short-lived
+    ``Authorization: Bearer mcp_at_...`` themselves; no static secret to
+    embed. The output here is the URL + an explanation of state, so an
+    operator handing this to a third-party can also tell them whether the
+    broker is currently configured to accept their handshake.
+    """
+    print(f"{logger_prefix}# OAuth 2.1 (Authorization: Bearer) — for third-party MCP clients")
+    print(f"{logger_prefix}# (claude.ai custom connectors, Cursor, Cline, anything that walks")
+    print(f"{logger_prefix}# the MCP-spec OAuth handshake). Client self-registers via DCR,")
+    print(f"{logger_prefix}# user approves a consent page once, bearer refreshes automatically.")
+    print(f"{logger_prefix}#")
+    if ctx.oauth_enabled:
+        print(f"{logger_prefix}# Status: broker.oauth.enabled = true — ready to handshake.")
+        if ctx.allowed_redirect_uris:
+            print(f"{logger_prefix}# Allowed redirect URIs (operator-configured):")
+            for uri in ctx.allowed_redirect_uris:
+                print(f"{logger_prefix}#   - {uri}")
+        else:
+            print(
+                f"{logger_prefix}# WARNING: allowed_redirect_uris is empty — no client can complete"
+            )
+            print(
+                f"{logger_prefix}# the OAuth dance. Set broker.oauth.allowed_redirect_uris first."
+            )
+    else:
+        print(f"{logger_prefix}# Status: broker.oauth.enabled = false — OAuth path is dormant.")
+        print(f"{logger_prefix}# To enable: set broker.oauth.enabled and broker.oauth.app_key in")
+        print(f"{logger_prefix}# settings.yaml, then restart the broker.")
+    print(f"{logger_prefix}#")
+    print(f"{logger_prefix}# In your MCP client's UI: 'Add custom connector' → paste this URL:")
+    print(f"  {ctx.broker_url}/proxy/{connector_name}/mcp")
+    print()
+
+
+def _show_mcp_config(connector_name: str, transport: str, ctx: McpConfigContext) -> None:
+    """Print one or both auth-shape blocks for a connector.
+
+    Output is JSON-like for the API-key block and a labelled URL for the
+    OAuth block. ``ctx.auth_mode`` chooses which to print; the default of
+    ``both`` lets an operator hand the output to either audience without
+    having to re-run the command.
+    """
+    print(f"{logger_prefix}── {connector_name} ──")
+    if ctx.auth_mode in ("apikey", "both"):
+        _show_apikey_block(connector_name, transport, ctx)
+    if ctx.auth_mode in ("oauth", "both"):
+        _show_oauth_block(connector_name, ctx)
 
 
 def _get_connector_transport(broker_url: str, connector_name: str) -> str:
@@ -476,12 +538,28 @@ def _get_connector_transport(broker_url: str, connector_name: str) -> str:
     return "streamable_http"
 
 
-def _run_connect_flow(  # noqa: PLR0913 — connect flow needs all context
+def _oauth_config(settings: dict[str, Any]) -> tuple[bool, list[str]]:
+    """Extract (oauth_enabled, allowed_redirect_uris) from settings.yaml.
+
+    Both fields default to safe values (disabled, empty list) when the
+    ``broker.oauth`` section is absent — same shape ``OAuthInboundConfig``
+    falls back to server-side, so the script can still show informational
+    output without crashing on older settings files.
+    """
+    oauth = settings.get("broker", {}).get("oauth", {})
+    enabled = bool(oauth.get("enabled", False))
+    redirect_uris = list(oauth.get("allowed_redirect_uris") or [])
+    return enabled, redirect_uris
+
+
+def _run_connect_flow(  # noqa: PLR0913 — connect flow needs broker + key + auth-config context
     broker_url: str,
     connector_name: str,
     app_key: str,
     broker_key: str,
     admin_key: str,
+    oauth_enabled: bool,
+    allowed_redirect_uris: list[str],
 ) -> None:
     """Create connect token, open browser, poll until connected."""
     print(f"\n{logger_prefix}Connecting {connector_name}...")
@@ -498,7 +576,17 @@ def _run_connect_flow(  # noqa: PLR0913 — connect flow needs all context
     if _poll_until_connected(broker_url, connector_name, app_key, broker_key):
         print(f"{logger_prefix}{connector_name} connected successfully!\n")
         transport = _get_connector_transport(broker_url, connector_name)
-        _show_mcp_config(broker_url, connector_name, app_key, broker_key, transport)
+        # After-connect summary defaults to both blocks; the operator can
+        # re-run ./start mcp-config --auth=apikey|oauth later to filter.
+        ctx = McpConfigContext(
+            broker_url=broker_url,
+            app_key=app_key,
+            broker_key=broker_key,
+            oauth_enabled=oauth_enabled,
+            allowed_redirect_uris=allowed_redirect_uris,
+            auth_mode="both",
+        )
+        _show_mcp_config(connector_name, transport, ctx)
     else:
         print(f"{logger_prefix}Timed out waiting for {connector_name} connection.")
         print(f"{logger_prefix}Check the broker logs and try again.")
@@ -527,6 +615,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--show-config",
         action="store_true",
         help="Show MCP server config for connected connectors (no OAuth flow)",
+    )
+    parser.add_argument(
+        "--auth",
+        choices=("apikey", "oauth", "both"),
+        default="both",
+        help=(
+            "Which auth shape to print: 'apikey' (X-Broker-Key headers, for "
+            "trusted internal callers like the gateway), 'oauth' (URL-only, "
+            "for third-party MCP clients that walk the OAuth handshake), or "
+            "'both' (default)."
+        ),
     )
     return parser
 
@@ -557,22 +656,20 @@ def _select_connector_with_status(
 
 
 def _show_all_configs(
-    broker_url: str,
     connections: list[dict[str, Any]],
-    app_key: str,
-    broker_key: str,
+    ctx: McpConfigContext,
 ) -> None:
     """Print MCP config snippets for all connected connectors and exit."""
     connected = [c for c in connections if c.get("connected")]
     if not connected:
-        print(f"{logger_prefix}No connected connectors for {app_key}")
+        print(f"{logger_prefix}No connected connectors for {ctx.app_key}")
         print(f"{logger_prefix}Run ./start connect first to set up OAuth")
         sys.exit(1)
-    print(f"\n{logger_prefix}MCP server config for {app_key}:\n")
+    print(f"\n{logger_prefix}MCP server config for {ctx.app_key} (auth={ctx.auth_mode}):\n")
     for conn in connected:
         name = conn.get("connector", "unknown")
-        transport = _get_connector_transport(broker_url, name)
-        _show_mcp_config(broker_url, name, app_key, broker_key, transport)
+        transport = _get_connector_transport(ctx.broker_url, name)
+        _show_mcp_config(name, transport, ctx)
 
 
 def main() -> None:  # noqa: PLR0915 — CLI entry point with sequential setup steps
@@ -606,19 +703,36 @@ def main() -> None:  # noqa: PLR0915 — CLI entry point with sequential setup s
     broker_key = _ensure_app_key(args.broker_url, admin_key, app_key)
 
     connections = _fetch_connections(args.broker_url, app_key, broker_key)
+    oauth_enabled, allowed_redirect_uris = _oauth_config(settings)
 
     if args.show_config:
         if not broker_key:
             print(f"{logger_prefix}No broker key available — rotate or create one first")
             sys.exit(1)
-        _show_all_configs(args.broker_url, connections, app_key, broker_key)
+        ctx = McpConfigContext(
+            broker_url=args.broker_url,
+            app_key=app_key,
+            broker_key=broker_key,
+            oauth_enabled=oauth_enabled,
+            allowed_redirect_uris=allowed_redirect_uris,
+            auth_mode=args.auth,
+        )
+        _show_all_configs(connections, ctx)
         return
 
     connector_name = _select_connector_with_status(connectors, connections, app_key)
     if not connector_name:
         return
 
-    _run_connect_flow(args.broker_url, connector_name, app_key, broker_key, admin_key)
+    _run_connect_flow(
+        args.broker_url,
+        connector_name,
+        app_key,
+        broker_key,
+        admin_key,
+        oauth_enabled,
+        allowed_redirect_uris,
+    )
 
 
 if __name__ == "__main__":

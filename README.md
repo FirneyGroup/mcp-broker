@@ -191,10 +191,21 @@ Connect an OAuth provider interactively:
 Show configuration snippets for your MCP client:
 
 ```bash
-./start mcp-config
+./start mcp-config                 # both auth shapes per connector (default)
+./start mcp-config --auth=apikey   # only the X-Broker-Key headers block
+./start mcp-config --auth=oauth    # only the OAuth-handshake URL block
 ```
 
-If `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` are set in your `.env` (e.g. when the broker is fronted by a Cloudflare tunnel with a service-token Access policy), the output automatically includes the `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers alongside `X-App-Id` and `X-Broker-Key`.
+Two auth paths exist on `/proxy/*` and the broker accepts both simultaneously — the client picks per-request by which header it sends:
+
+| Audience | Auth shape printed | What the client sends |
+|---|---|---|
+| Trusted internal callers (gateway, ADK `McpServerConfig`, your own scripts) | `--auth=apikey` block — JSON snippet with headers | `X-App-Id` + `X-Broker-Key` (long-lived static secret) |
+| Third-party MCP clients (claude.ai custom connectors, Cursor, Cline) | `--auth=oauth` block — URL only, plus broker.oauth state | `Authorization: Bearer mcp_at_...` (short-lived, refreshed automatically) — the client walks RFC 7591 DCR + the authorization-code flow on first connect, you approve a consent page once |
+
+The OAuth block reads `broker.oauth.enabled` and `broker.oauth.allowed_redirect_uris` from `settings.yaml` and surfaces them in the output, so an operator can see at a glance whether the OAuth path is actionable today.
+
+If `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` are set in your `.env` (e.g. when the broker is fronted by a Cloudflare tunnel with a service-token Access policy), the `--auth=apikey` block automatically includes the `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers alongside `X-App-Id` and `X-Broker-Key`.
 
 ## Docker
 

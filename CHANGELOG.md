@@ -20,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Slack connector** (Native) — bot-identity messaging via Slack OAuth v2.
 - **Broker module entrypoint** (`python -m broker`) — validates settings before uvicorn boots, so config errors exit cleanly instead of propagating from the async lifespan.
 - **`GET /oauth/success`** — built-in landing page after a successful outbound OAuth connect, served at a stable URL on the broker. Accepts an optional `?connector=` query param to customize the heading. Auth-exempt; no protected state.
+- **`./start mcp-config --auth=apikey|oauth|both`** — `mcp-config` (and the post-connect summary in `./start connect`) now prints both auth shapes per connector. The legacy `X-Broker-Key` headers block is for trusted internal callers (gateway, ADK `McpServerConfig`, operator scripts); the new OAuth block surfaces the connector URL for third-party MCP clients (claude.ai custom connectors, Cursor, Cline) along with `broker.oauth.enabled` state and the configured `allowed_redirect_uris`. Default `--auth=both`.
 
 ### Changed
 
