@@ -295,6 +295,8 @@ All key commands (except `generate-admin-key`) require the broker to be running 
 | `DELETE` | `/admin/keys/{app_key}` | Delete key |
 | `POST` | `/admin/connect-token` | Create single-use browser OAuth token |
 | `POST` | `/admin/refresh` | Refresh all tokens expiring within 10 minutes |
+| `POST` | `/admin/oauth/revoke/{app_key}` | Revoke an app's inbound OAuth tokens (kick claude.ai) — keeps the broker key |
+| `DELETE` | `/admin/connections/{app_key}/{connector}` | Disconnect an app's upstream connector (operator-initiated) |
 
 All admin endpoints require the `X-Admin-Key` header.
 

@@ -580,6 +580,360 @@ class TestAdminAPI:
         body = json.loads(response.body)
         assert "no API key" in body["error"]
 
+    # --- Operator-initiated disconnect ---
+
+    async def _seed_inbound_pair(
+        self, inbound_store, app_key: str, client_id: str = "mcp_client_test"
+    ) -> tuple[str, str]:
+        """Insert an (access, refresh) inbound-token pair. Returns their hashes."""
+        import time
+
+        from broker.models.inbound_auth import InboundToken, RotatedTokenPair
+        from broker.services.inbound_auth_store import (
+            generate_access_token,
+            generate_family_id,
+            generate_refresh_token,
+        )
+
+        family_id = generate_family_id()
+        _, access_hash = generate_access_token()
+        _, refresh_hash = generate_refresh_token()
+        now_ts = int(time.time())
+        resource = "https://broker.example.com/proxy/notion"
+        access_row = InboundToken(
+            token_hash=access_hash,
+            token_kind="access",
+            family_id=family_id,
+            client_id=client_id,
+            app_key=app_key,
+            resource=resource,
+            scope="mcp:proxy:notion",
+            expires_at=now_ts + 3600,
+            issued_at=now_ts,
+        )
+        refresh_row = InboundToken(
+            token_hash=refresh_hash,
+            token_kind="refresh",
+            family_id=family_id,
+            client_id=client_id,
+            app_key=app_key,
+            resource=resource,
+            scope="mcp:proxy:notion",
+            expires_at=now_ts + 2592000,
+            issued_at=now_ts,
+        )
+        await inbound_store.create_token_pair(
+            RotatedTokenPair(
+                access=access_row,
+                refresh=refresh_row,
+                raw_access_token="placeholder-not-stored",
+                raw_refresh_token="placeholder-not-stored",
+            )
+        )
+        return access_hash, refresh_hash
+
+    async def test_revoke_inbound_oauth(self, admin_setup, tmp_path: Path) -> None:
+        """Revoke wipes inbound tokens but leaves the broker key + registry intact."""
+        from broker.api.admin import AdminEndpoints
+        from broker.services.inbound_auth_store import SQLiteInboundAuthStore
+
+        store, registry = admin_setup
+        await store.create_key("my_company:app1")
+
+        inbound_store = SQLiteInboundAuthStore(db_path=str(tmp_path / "inbound.db"))
+        await inbound_store.setup()
+        access_hash, refresh_hash = await self._seed_inbound_pair(inbound_store, "my_company:app1")
+        assert await inbound_store.get_access(access_hash) is not None
+
+        endpoints = AdminEndpoints(
+            store,
+            "test-admin-key-long",
+            registry,
+            ConnectTokenStore(),
+            inbound_auth_store=inbound_store,
+        )
+        request = MagicMock()
+        request.headers = {"x-admin-key": "test-admin-key-long"}
+
+        response = await endpoints.revoke_inbound_oauth("my_company:app1", request)
+        assert response.status_code == 200
+        assert json.loads(response.body)["revoked"] is True
+
+        # Inbound tokens gone; broker key survives (this is NOT delete_key).
+        assert await inbound_store.get_access(access_hash) is None
+        assert await inbound_store.get_refresh_row(refresh_hash) is None
+        assert await store.has_key("my_company:app1") is True
+
+    async def test_revoke_inbound_oauth_unauthorized(self, admin_setup, tmp_path: Path) -> None:
+        """Wrong admin key is rejected before any deletion."""
+        from broker.api.admin import AdminEndpoints
+        from broker.services.inbound_auth_store import SQLiteInboundAuthStore
+
+        store, registry = admin_setup
+        inbound_store = SQLiteInboundAuthStore(db_path=str(tmp_path / "inbound.db"))
+        await inbound_store.setup()
+        access_hash, _ = await self._seed_inbound_pair(inbound_store, "my_company:app1")
+
+        endpoints = AdminEndpoints(
+            store,
+            "test-admin-key-long",
+            registry,
+            ConnectTokenStore(),
+            inbound_auth_store=inbound_store,
+        )
+        request = MagicMock()
+        request.headers = {"x-admin-key": "wrong-key"}
+
+        response = await endpoints.revoke_inbound_oauth("my_company:app1", request)
+        assert response.status_code == 401
+        assert await inbound_store.get_access(access_hash) is not None
+
+    async def test_revoke_inbound_oauth_disabled(self, admin_setup) -> None:
+        """404 when inbound OAuth is disabled (no inbound_auth_store wired)."""
+        from broker.api.admin import AdminEndpoints
+
+        store, registry = admin_setup
+        endpoints = AdminEndpoints(store, "test-admin-key-long", registry, ConnectTokenStore())
+        request = MagicMock()
+        request.headers = {"x-admin-key": "test-admin-key-long"}
+
+        response = await endpoints.revoke_inbound_oauth("my_company:app1", request)
+        assert response.status_code == 404
+
+    async def test_revoke_inbound_oauth_unknown_app(self, admin_setup, tmp_path: Path) -> None:
+        """A typo'd app_key is rejected (400), not a silent 'revoked nothing' success."""
+        from broker.api.admin import AdminEndpoints
+        from broker.services.inbound_auth_store import SQLiteInboundAuthStore
+
+        store, registry = admin_setup
+        inbound_store = SQLiteInboundAuthStore(db_path=str(tmp_path / "inbound.db"))
+        await inbound_store.setup()
+
+        endpoints = AdminEndpoints(
+            store,
+            "test-admin-key-long",
+            registry,
+            ConnectTokenStore(),
+            inbound_auth_store=inbound_store,
+        )
+        request = MagicMock()
+        request.headers = {"x-admin-key": "test-admin-key-long"}
+
+        response = await endpoints.revoke_inbound_oauth("nonexistent:app", request)
+        assert response.status_code == 400
+
+    async def test_disconnect_connection(self, admin_setup, tmp_path: Path) -> None:
+        """Admin disconnect deletes the stored outbound token for (app, connector)."""
+        from broker.api.admin import AdminEndpoints
+        from broker.models.connection import AppConnection
+        from broker.services.store import SQLiteTokenStore
+
+        store, registry = admin_setup
+        token_store = SQLiteTokenStore(db_path=str(tmp_path / "tokens.db"))
+        await token_store.save(
+            "my_company:app1",
+            "notion",
+            AppConnection(connector_name="notion", access_token="secret-access"),
+        )
+        assert len(await token_store.list_for_app("my_company:app1")) == 1
+
+        fake_connector = MagicMock()
+        fake_connector.meta.is_sidecar_managed = False
+        endpoints = AdminEndpoints(
+            store,
+            "test-admin-key-long",
+            registry,
+            ConnectTokenStore(),
+            token_store=token_store,
+            connector_lookup=lambda name: fake_connector if name == "notion" else None,
+        )
+        request = MagicMock()
+        request.headers = {"x-admin-key": "test-admin-key-long"}
+
+        response = await endpoints.disconnect_connection("my_company:app1", "notion", request)
+        assert response.status_code == 200
+        assert json.loads(response.body)["disconnected"] is True
+        assert await token_store.list_for_app("my_company:app1") == []
+
+    async def test_disconnect_connection_unauthorized(self, admin_setup, tmp_path: Path) -> None:
+        """Wrong admin key is rejected before any deletion."""
+        from broker.api.admin import AdminEndpoints
+        from broker.models.connection import AppConnection
+        from broker.services.store import SQLiteTokenStore
+
+        store, registry = admin_setup
+        token_store = SQLiteTokenStore(db_path=str(tmp_path / "tokens.db"))
+        await token_store.save(
+            "my_company:app1",
+            "notion",
+            AppConnection(connector_name="notion", access_token="secret-access"),
+        )
+
+        fake_connector = MagicMock()
+        fake_connector.meta.is_sidecar_managed = False
+        endpoints = AdminEndpoints(
+            store,
+            "test-admin-key-long",
+            registry,
+            ConnectTokenStore(),
+            token_store=token_store,
+            connector_lookup=lambda name: fake_connector,
+        )
+        request = MagicMock()
+        request.headers = {"x-admin-key": "wrong-key"}
+
+        response = await endpoints.disconnect_connection("my_company:app1", "notion", request)
+        assert response.status_code == 401
+        assert len(await token_store.list_for_app("my_company:app1")) == 1
+
+    async def test_disconnect_connection_unknown_connector(
+        self, admin_setup, tmp_path: Path
+    ) -> None:
+        """Unknown connector → 404 (mirrors POST /oauth/{connector}/disconnect)."""
+        from broker.api.admin import AdminEndpoints
+        from broker.services.store import SQLiteTokenStore
+
+        store, registry = admin_setup
+        token_store = SQLiteTokenStore(db_path=str(tmp_path / "tokens.db"))
+        endpoints = AdminEndpoints(
+            store,
+            "test-admin-key-long",
+            registry,
+            ConnectTokenStore(),
+            token_store=token_store,
+            connector_lookup=lambda name: None,
+        )
+        request = MagicMock()
+        request.headers = {"x-admin-key": "test-admin-key-long"}
+
+        response = await endpoints.disconnect_connection("my_company:app1", "ghost", request)
+        assert response.status_code == 404
+
+    async def test_disconnect_connection_sidecar_rejected(
+        self, admin_setup, tmp_path: Path
+    ) -> None:
+        """Sidecar-managed connector → 404 (broker holds no token to delete)."""
+        from broker.api.admin import AdminEndpoints
+        from broker.services.store import SQLiteTokenStore
+
+        store, registry = admin_setup
+        token_store = SQLiteTokenStore(db_path=str(tmp_path / "tokens.db"))
+
+        fake_connector = MagicMock()
+        fake_connector.meta.is_sidecar_managed = True
+        fake_connector.meta.display_name = "Google Workspace"
+        endpoints = AdminEndpoints(
+            store,
+            "test-admin-key-long",
+            registry,
+            ConnectTokenStore(),
+            token_store=token_store,
+            connector_lookup=lambda name: fake_connector,
+        )
+        request = MagicMock()
+        request.headers = {"x-admin-key": "test-admin-key-long"}
+
+        response = await endpoints.disconnect_connection(
+            "my_company:app1", "workspace_mcp", request
+        )
+        assert response.status_code == 404
+
+    async def test_disconnect_connection_unknown_app(self, admin_setup, tmp_path: Path) -> None:
+        """A typo'd app_key is rejected (400) before the connector is even looked up."""
+        from broker.api.admin import AdminEndpoints
+        from broker.services.store import SQLiteTokenStore
+
+        store, registry = admin_setup
+        token_store = SQLiteTokenStore(db_path=str(tmp_path / "tokens.db"))
+        endpoints = AdminEndpoints(
+            store,
+            "test-admin-key-long",
+            registry,
+            ConnectTokenStore(),
+            token_store=token_store,
+            connector_lookup=lambda name: None,
+        )
+        request = MagicMock()
+        request.headers = {"x-admin-key": "test-admin-key-long"}
+
+        response = await endpoints.disconnect_connection("nonexistent:app", "notion", request)
+        assert response.status_code == 400
+
+    async def test_rotate_key_does_not_touch_inbound_tokens(
+        self, admin_setup, tmp_path: Path
+    ) -> None:
+        """Documented non-goal: rotating the broker key must NOT disconnect claude.ai.
+
+        Rotate swaps the br_ key hash only; inbound bearer tokens live in a
+        separate store and survive. Revoking them is a distinct, explicit
+        operation (revoke_inbound_oauth).
+        """
+        from broker.api.admin import AdminEndpoints
+        from broker.services.inbound_auth_store import SQLiteInboundAuthStore
+
+        store, registry = admin_setup
+        await store.create_key("my_company:app1")
+        inbound_store = SQLiteInboundAuthStore(db_path=str(tmp_path / "inbound.db"))
+        await inbound_store.setup()
+        access_hash, refresh_hash = await self._seed_inbound_pair(inbound_store, "my_company:app1")
+
+        endpoints = AdminEndpoints(
+            store,
+            "test-admin-key-long",
+            registry,
+            ConnectTokenStore(),
+            inbound_auth_store=inbound_store,
+        )
+        request = MagicMock()
+        request.headers = {"x-admin-key": "test-admin-key-long"}
+
+        response = await endpoints.rotate_key("my_company:app1", request)
+        assert response.status_code == 200
+
+        # Inbound tokens untouched by rotation.
+        assert await inbound_store.get_access(access_hash) is not None
+        assert await inbound_store.get_refresh_row(refresh_hash) is not None
+
+    async def test_revoke_inbound_oauth_route_wired(self, admin_setup) -> None:
+        """HTTP route is registered and dispatches to the handler (wrong key → 401).
+
+        Guards the decorator path + path-param extraction, which the direct-call
+        tests above bypass.
+        """
+        store, registry = admin_setup
+        client, old_ks, old_reg, old_ct, old_settings = self._make_client(store, registry)
+        import broker.main as broker_main
+
+        try:
+            response = client.post(
+                "/admin/oauth/revoke/my_company:app1",
+                headers={"x-admin-key": "wrong-key"},
+            )
+            assert response.status_code == 401
+        finally:
+            broker_main._key_store = old_ks
+            broker_main._client_registry = old_reg
+            broker_main._connect_token_store = old_ct
+            broker_main._settings = old_settings
+
+    async def test_disconnect_connection_route_wired(self, admin_setup) -> None:
+        """HTTP route is registered and dispatches to the handler (wrong key → 401)."""
+        store, registry = admin_setup
+        client, old_ks, old_reg, old_ct, old_settings = self._make_client(store, registry)
+        import broker.main as broker_main
+
+        try:
+            response = client.delete(
+                "/admin/connections/my_company:app1/notion",
+                headers={"x-admin-key": "wrong-key"},
+            )
+            assert response.status_code == 401
+        finally:
+            broker_main._key_store = old_ks
+            broker_main._client_registry = old_reg
+            broker_main._connect_token_store = old_ct
+            broker_main._settings = old_settings
+
 
 # =============================================================================
 # CONNECT TOKEN STORE
