@@ -1337,3 +1337,47 @@ class TestReviewFixRegressions:
         assert payload["match_count"] == 0
         assert payload["search_truncated"] is True
         assert payload["blocks_searched"] == 1
+
+    async def test_update_page_content_replaces_only_first_occurrence_in_block(
+        self, notion_connector
+    ):
+        # A block containing old_str twice must change only the FIRST occurrence (count=1), not both.
+        blocks_page = {
+            "results": [
+                {
+                    "id": _HEX_C,
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": [{"plain_text": "meeting at 9 and meeting at 5"}]},
+                    "has_children": False,
+                }
+            ],
+            "has_more": False,
+            "next_cursor": None,
+        }
+        with (
+            patch("connectors.notion_api.client._request", new_callable=AsyncMock) as mock_paginate,
+            patch("connectors.notion_api.adapter._request", new_callable=AsyncMock) as mock_patch,
+        ):
+            mock_paginate.return_value = blocks_page
+            mock_patch.return_value = {
+                "id": _HEX_C,
+                "type": "paragraph",
+                "paragraph": {"rich_text": [{"plain_text": "x"}]},
+            }
+            await notion_connector.update_page_content(
+                access_token="fake", page_id=_HEX_A, old_str="meeting", new_str="standup"
+            )
+
+        sent_text = mock_patch.call_args.kwargs["json_body"]["paragraph"]["rich_text"][0]["text"][
+            "content"
+        ]
+        assert sent_text == "standup at 9 and meeting at 5"  # only the first 'meeting' replaced
+
+    def test_resolve_upload_bytes_rejects_non_alphabet_base64(self):
+        # validate=True must reject base64 carrying stray non-alphabet chars instead of silently
+        # stripping them and uploading different bytes than the caller encoded.
+        from connectors.notion_api.adapter import _resolve_upload_bytes
+
+        assert _resolve_upload_bytes(content_base64="aGVsbG8=", text_content=None) == b"hello"
+        with pytest.raises(ValueError):
+            _resolve_upload_bytes(content_base64="aGVs!bG8=", text_content=None)

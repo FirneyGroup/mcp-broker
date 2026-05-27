@@ -660,7 +660,9 @@ def _resolve_upload_bytes(content_base64: str | None, text_content: str | None) 
     # content_base64 is non-None here (the XOR guard rejected both/neither); the explicit
     # check lets the type checker narrow str | None -> str.
     if content_base64 is not None:
-        return b64decode(content_base64)
+        # validate=True so malformed input raises instead of silently dropping non-alphabet
+        # characters and decoding to different bytes than the caller encoded.
+        return b64decode(content_base64, validate=True)
     raise ValueError("Provide exactly one of content_base64 or text_content")
 
 
@@ -1140,6 +1142,8 @@ class NotionApiConnector(NativeConnector):
           - 0 matches  → returns {"status": "error", ...} and performs no write (no-op).
           - >1 matches → returns {"status": "error", ...} listing the matches; performs no write.
           - exactly 1  → PATCH /v1/blocks/{block_id} with old_str→new_str applied to its text.
+                         Only the first occurrence within that block is replaced; any later
+                         occurrences in the same block are left untouched.
 
         Limitation: only first-level blocks of types in _TEXT_BLOCK_TYPES (paragraph, headings,
         to_do, bullet/numbered list, quote, callout, toggle) are searched and editable. Nested
@@ -1180,7 +1184,7 @@ class NotionApiConnector(NativeConnector):
                 )
             target = matches[0]
             text_key = target["type"]
-            new_text = _plain_text(target[text_key].get("rich_text")).replace(old_str, new_str)
+            new_text = _plain_text(target[text_key].get("rich_text")).replace(old_str, new_str, 1)
             # Send ONLY rich_text. Notion deep-merges block PATCHes, so sibling fields survive —
             # to_do.checked stays set, heading/callout colour is kept (both verified live). Do NOT
             # echo the block's full GET body back: it carries read-only/contextual fields (e.g.
