@@ -5,6 +5,7 @@ broker:
   connectors:
     - hubspot
     - notion
+    - notion_api
     - slack
     - workspace_mcp
   admin_key: ${BROKER_ADMIN_KEY}           # For /admin/* endpoints (X-Admin-Key header)
@@ -53,7 +54,7 @@ clients:
   my_company:
     app1:
       scopes: [proxy, status]                              # Available scopes: proxy, status
-      allowed_connectors: [hubspot, notion, slack, workspace_mcp] # Empty list = all connectors
+      allowed_connectors: [hubspot, notion, notion_api, slack, workspace_mcp] # Empty list = all connectors
 
 # Only needed for static connectors (discovery connectors get credentials automatically)
 apps:
@@ -68,6 +69,9 @@ apps:
       workspace_mcp:
         client_id: ${GOOGLE_OAUTH_CLIENT_ID}
         client_secret: ${GOOGLE_OAUTH_CLIENT_SECRET}
+      notion_api:
+        client_id: ${NOTION_API_CLIENT_ID}
+        client_secret: ${NOTION_API_CLIENT_SECRET}
       slack:
         client_id: ${SLACK_CLIENT_ID}
         client_secret: ${SLACK_CLIENT_SECRET}
