@@ -601,6 +601,7 @@ def _run_connect_flow(  # noqa: PLR0913 — connect flow needs broker + key + au
     admin_key: str,
     oauth_enabled: bool,
     allowed_redirect_uris: list[str],
+    auth_mode: AuthMode,
 ) -> None:
     """Create connect token, open browser, poll until connected."""
     print(f"\n{logger_prefix}Connecting {connector_name}...")
@@ -617,15 +618,15 @@ def _run_connect_flow(  # noqa: PLR0913 — connect flow needs broker + key + au
     if _poll_until_connected(broker_url, connector_name, app_key, broker_key):
         print(f"{logger_prefix}{connector_name} connected successfully!\n")
         transport = _get_connector_transport(broker_url, connector_name)
-        # After-connect summary defaults to both blocks; the operator can
-        # re-run ./start mcp-config --auth=apikey|oauth later to filter.
+        # Post-connect summary honors --auth (argparse default is "both"); pass
+        # --auth=apikey|oauth to ./start connect to show only that shape.
         ctx = McpConfigContext(
             broker_url=broker_url,
             app_key=app_key,
             broker_key=broker_key,
             oauth_enabled=oauth_enabled,
             allowed_redirect_uris=allowed_redirect_uris,
-            auth_mode="both",
+            auth_mode=auth_mode,
         )
         _show_mcp_config(connector_name, transport, ctx)
     else:
@@ -773,6 +774,7 @@ def main() -> None:  # noqa: PLR0915 — CLI entry point with sequential setup s
         admin_key,
         oauth_enabled,
         allowed_redirect_uris,
+        args.auth,
     )
 
 

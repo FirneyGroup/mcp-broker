@@ -325,3 +325,51 @@ class TestShowMcpConfigClaudeCommand:
         # The OAuth shape has no static headers, so no runnable static-auth command.
         connect._show_mcp_config("slack", "streamable_http", _ctx(auth_mode="oauth"))
         assert "claude mcp add-json" not in capsys.readouterr().out
+
+
+class TestRunConnectFlowHonorsAuthMode:
+    """Regression: the post-connect summary must honor --auth, not hardcode "both".
+
+    Before the fix, _run_connect_flow built the context with auth_mode="both", so
+    `./start connect --auth=oauth` still printed the static X-Broker-Key block.
+    """
+
+    @staticmethod
+    def _stub_network(monkeypatch: pytest.MonkeyPatch) -> None:
+        # Stub the token/browser/poll/transport steps so only the summary runs.
+        monkeypatch.setattr(connect, "_create_connect_token", lambda *a, **k: "ct_test")
+        monkeypatch.setattr(
+            connect, "_get_authorize_url", lambda *a, **k: "https://api.example/authorize"
+        )
+        monkeypatch.setattr(connect, "_open_browser", lambda *a, **k: None)
+        monkeypatch.setattr(connect, "_poll_until_connected", lambda *a, **k: True)
+        monkeypatch.setattr(connect, "_get_connector_transport", lambda *a, **k: "streamable_http")
+
+    @staticmethod
+    def _run(auth_mode: str) -> None:
+        connect._run_connect_flow(
+            GENERIC_BROKER_URL,
+            "slack",
+            GENERIC_APP_KEY,
+            GENERIC_BROKER_KEY,
+            "unused",
+            False,
+            [],
+            auth_mode,
+        )
+
+    def test_oauth_mode_summary_omits_static_key(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._stub_network(monkeypatch)
+        self._run("oauth")
+        out = capsys.readouterr().out
+        assert "X-Broker-Key" not in out
+        assert GENERIC_BROKER_KEY not in out
+
+    def test_both_mode_summary_includes_static_key(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._stub_network(monkeypatch)
+        self._run("both")
+        assert "X-Broker-Key" in capsys.readouterr().out
