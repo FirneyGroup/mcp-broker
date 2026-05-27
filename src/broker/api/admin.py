@@ -10,6 +10,8 @@ POST   /admin/keys/{app_key}/rotate     — Rotate key, return new key
 DELETE /admin/keys/{app_key}            — Delete key for an app
 POST   /admin/connect-token             — Create single-use browser OAuth token
 POST   /admin/refresh                   — Refresh expiring tokens
+POST   /admin/oauth/revoke/{app_key}    — Revoke an app's inbound OAuth tokens (kick the client)
+DELETE /admin/connections/{app_key}/{connector} — Disconnect an app's upstream connector
 """
 
 from __future__ import annotations
@@ -20,10 +22,11 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING
 
-from fastapi import APIRouter, Request
+from fastapi import Request
 from starlette.responses import Response
 
 if TYPE_CHECKING:
+    from broker.connectors.base import BaseConnector
     from broker.services.api_key_store import BrokerKeyStore, ConnectTokenStore
     from broker.services.client_registry import BrokerClientRegistry
     from broker.services.inbound_auth_store import SQLiteInboundAuthStore
@@ -79,6 +82,7 @@ class AdminEndpoints:
         token_store: TokenStore | None = None,
         refresh_callback: RefreshCallback | None = None,
         inbound_auth_store: SQLiteInboundAuthStore | None = None,
+        connector_lookup: Callable[[str], BaseConnector | None] | None = None,
     ) -> None:
         self._key_store = key_store
         self._admin_key = admin_key
@@ -87,6 +91,9 @@ class AdminEndpoints:
         self._token_store = token_store
         self._refresh_callback = refresh_callback
         self._inbound_auth_store = inbound_auth_store
+        # Looks up a connector instance by name (= ConnectorRegistry.get). Injected
+        # so admin.py stays decoupled from the registry and tests can stub it.
+        self._connector_lookup = connector_lookup
 
     # --- Auth ---
 
@@ -239,38 +246,63 @@ class AdminEndpoints:
         logger.info("[Admin] Token refresh: %s", results)
         return _json_response(200, results)
 
+    # --- Disconnect (operator-initiated) ---
 
-# =============================================================================
-# ROUTER FACTORY
-# =============================================================================
+    async def revoke_inbound_oauth(self, app_key: str, request: Request) -> Response:
+        """Revoke an app's inbound OAuth tokens without destroying its broker key.
 
+        Wipes the app's ``oauth_codes`` + ``inbound_tokens`` (the bearer/refresh
+        tokens a remote MCP client such as claude.ai holds) but leaves the broker
+        key and YAML config intact. The client re-runs the full OAuth flow on its
+        next request — this is the "kick this client" operation.
 
-def create_admin_router(  # noqa: PLR0913 — router factory needs all deps
-    key_store: BrokerKeyStore,
-    admin_key: str,
-    client_registry: BrokerClientRegistry,
-    connect_token_store: ConnectTokenStore,
-    token_store: TokenStore | None = None,
-    refresh_callback: RefreshCallback | None = None,
-    inbound_auth_store: SQLiteInboundAuthStore | None = None,
-) -> APIRouter:
-    """Create a FastAPI router with admin endpoints."""
-    endpoints = AdminEndpoints(
-        key_store,
-        admin_key,
-        client_registry,
-        connect_token_store,
-        token_store,
-        refresh_callback,
-        inbound_auth_store,
-    )
-    router = APIRouter()
-    router.add_api_route("/admin/keys", endpoints.create_key, methods=["POST"])
-    router.add_api_route("/admin/keys", endpoints.list_keys, methods=["GET"])
-    router.add_api_route(
-        "/admin/keys/{app_key:path}/rotate", endpoints.rotate_key, methods=["POST"]
-    )
-    router.add_api_route("/admin/keys/{app_key:path}", endpoints.delete_key, methods=["DELETE"])
-    router.add_api_route("/admin/connect-token", endpoints.create_connect_token, methods=["POST"])
-    router.add_api_route("/admin/refresh", endpoints.refresh_tokens, methods=["POST"])
-    return router
+        Distinct from ``delete_key``, which also destroys the broker key. Returns
+        404 when inbound OAuth is disabled (the store is only created when
+        ``broker.oauth.enabled`` is true).
+        """
+        if not self._verify_admin(request):
+            return _json_response(401, {"error": "Unauthorized"})
+
+        if self._inbound_auth_store is None:
+            return _json_response(404, {"error": "Inbound OAuth is not enabled"})
+
+        if self._client_registry.get(app_key) is None:
+            return _json_response(400, {"error": f"App '{app_key}' not found in registry"})
+
+        await self._inbound_auth_store.delete_all_for_app(app_key)
+        logger.info("[Admin] Revoked inbound OAuth tokens for app: %s", app_key)
+        return _json_response(200, {"revoked": True, "app_key": app_key})
+
+    async def disconnect_connection(
+        self, app_key: str, connector_name: str, request: Request
+    ) -> Response:
+        """Disconnect an app's upstream connector on the operator's behalf.
+
+        The admin-authenticated counterpart of ``POST /oauth/{connector}/disconnect``:
+        deletes the stored outbound OAuth token for (app_key, connector) so the app
+        must re-connect the provider. Mirrors that route's validation — unknown and
+        sidecar-managed connectors are rejected with 404.
+        """
+        if not self._verify_admin(request):
+            return _json_response(401, {"error": "Unauthorized"})
+
+        if self._token_store is None or self._connector_lookup is None:
+            return _json_response(503, {"error": "Connection store not configured"})
+
+        if self._client_registry.get(app_key) is None:
+            return _json_response(400, {"error": f"App '{app_key}' not found in registry"})
+
+        connector = self._connector_lookup(connector_name)
+        if connector is None:
+            return _json_response(404, {"error": f"Unknown connector: {connector_name}"})
+        if connector.meta.is_sidecar_managed:
+            return _json_response(
+                404,
+                {"error": f"{connector.meta.display_name} manages its own authentication"},
+            )
+
+        await self._token_store.delete(app_key, connector_name)
+        logger.info("[Admin] Disconnected: %s/%s", app_key, connector_name)
+        return _json_response(
+            200, {"disconnected": True, "app_key": app_key, "connector": connector_name}
+        )

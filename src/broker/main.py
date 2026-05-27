@@ -347,6 +347,7 @@ def _get_admin_endpoints() -> AdminEndpoints:
         token_store=_store,
         refresh_callback=_do_refresh,
         inbound_auth_store=_inbound_auth_store,
+        connector_lookup=ConnectorRegistry.get,
     )
 
 
@@ -378,6 +379,16 @@ async def admin_create_connect_token(request: Request):
 @app.post("/admin/refresh")
 async def admin_refresh_tokens(request: Request):
     return await _get_admin_endpoints().refresh_tokens(request)
+
+
+@app.post("/admin/oauth/revoke/{app_key:path}")
+async def admin_revoke_inbound_oauth(app_key: str, request: Request):
+    return await _get_admin_endpoints().revoke_inbound_oauth(app_key, request)
+
+
+@app.delete("/admin/connections/{app_key:path}/{connector_name}")
+async def admin_disconnect_connection(app_key: str, connector_name: str, request: Request):
+    return await _get_admin_endpoints().disconnect_connection(app_key, connector_name, request)
 
 
 # =============================================================================
