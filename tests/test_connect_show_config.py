@@ -17,6 +17,8 @@ clause.
 from __future__ import annotations
 
 import importlib.util
+import json
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -113,6 +115,16 @@ def _ctx(**overrides: Any):
     }
     defaults.update(overrides)
     return connect.McpConfigContext(**defaults)
+
+
+def _server_json(command: str) -> dict[str, Any]:
+    """Parse the server-config JSON back out of a rendered claude command.
+
+    ``shlex.split`` is the inverse of the renderer's ``shlex.quote``; the final
+    token is the server JSON. Round-tripping through it proves the shell quoting
+    is correct as well as the JSON shape.
+    """
+    return json.loads(shlex.split(command)[-1])
 
 
 # =============================================================================
@@ -250,3 +262,66 @@ class TestMcpConfigContext:
     def test_invalid_auth_mode_rejected(self) -> None:
         with pytest.raises(ValidationError):
             _ctx(auth_mode="other")
+
+
+# =============================================================================
+# _render_claude_command — runnable `claude mcp add-json` one-liner
+# =============================================================================
+
+
+class TestRenderClaudeCommand:
+    def test_command_prefix_and_server_name(self) -> None:
+        tokens = shlex.split(connect._render_claude_command("slack", "streamable_http", _ctx()))
+        # Server name is `{connector}-broker` per the documented convention.
+        assert tokens[:4] == ["claude", "mcp", "add-json", "slack-broker"]
+
+    def test_apikey_headers_url_and_http_type(self) -> None:
+        server = _server_json(connect._render_claude_command("slack", "streamable_http", _ctx()))
+        assert server["type"] == "http"
+        assert server["url"] == f"{GENERIC_BROKER_URL}/proxy/slack/mcp"
+        assert server["headers"]["X-App-Id"] == GENERIC_APP_KEY
+        assert server["headers"]["X-Broker-Key"] == GENERIC_BROKER_KEY
+
+    def test_sse_transport_maps_to_sse_type(self) -> None:
+        server = _server_json(connect._render_claude_command("hubspot", "sse", _ctx()))
+        assert server["type"] == "sse"
+
+    def test_unknown_transport_defaults_to_http(self) -> None:
+        server = _server_json(connect._render_claude_command("slack", "weird", _ctx()))
+        assert server["type"] == "http"
+
+    def test_cf_access_headers_included_when_env_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Stays in lockstep with _show_apikey_block: both source CF-Access from env.
+        monkeypatch.setenv("CF_ACCESS_CLIENT_ID", "cf-id-value")
+        monkeypatch.setenv("CF_ACCESS_CLIENT_SECRET", "cf-secret-value")
+        server = _server_json(connect._render_claude_command("slack", "streamable_http", _ctx()))
+        assert server["headers"]["CF-Access-Client-Id"] == "cf-id-value"
+        assert server["headers"]["CF-Access-Client-Secret"] == "cf-secret-value"
+
+    def test_cf_access_headers_absent_when_env_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Fail-closed: a half-configured environment must not emit a lone CF header.
+        monkeypatch.delenv("CF_ACCESS_CLIENT_ID", raising=False)
+        monkeypatch.delenv("CF_ACCESS_CLIENT_SECRET", raising=False)
+        server = _server_json(connect._render_claude_command("slack", "streamable_http", _ctx()))
+        assert "CF-Access-Client-Id" not in server["headers"]
+        assert "CF-Access-Client-Secret" not in server["headers"]
+
+
+# =============================================================================
+# _show_mcp_config — runnable command rides the API-key shape only
+# =============================================================================
+
+
+class TestShowMcpConfigClaudeCommand:
+    def test_apikey_mode_prints_runnable_command(self, capsys: pytest.CaptureFixture[str]) -> None:
+        connect._show_mcp_config("slack", "streamable_http", _ctx(auth_mode="apikey"))
+        assert "claude mcp add-json slack-broker" in capsys.readouterr().out
+
+    def test_both_mode_prints_runnable_command(self, capsys: pytest.CaptureFixture[str]) -> None:
+        connect._show_mcp_config("slack", "streamable_http", _ctx(auth_mode="both"))
+        assert "claude mcp add-json slack-broker" in capsys.readouterr().out
+
+    def test_oauth_mode_omits_runnable_command(self, capsys: pytest.CaptureFixture[str]) -> None:
+        # The OAuth shape has no static headers, so no runnable static-auth command.
+        connect._show_mcp_config("slack", "streamable_http", _ctx(auth_mode="oauth"))
+        assert "claude mcp add-json" not in capsys.readouterr().out

@@ -21,8 +21,10 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -49,6 +51,9 @@ _HTTP_UNAUTHORIZED = 401
 _HTTP_NOT_FOUND = 404
 _HTTP_REDIRECT_CODES = (302, 307)
 _BROKER_ROOT = Path(__file__).parent.parent
+
+# Claude Code's `mcp add-json` uses "type"; the broker speaks "transport".
+_CLAUDE_MCP_TYPE_BY_TRANSPORT = {"streamable_http": "http", "sse": "sse"}
 
 
 # =============================================================================
@@ -476,6 +481,40 @@ def _show_apikey_block(connector_name: str, transport: str, ctx: McpConfigContex
     print("  }\n")
 
 
+def _claude_mcp_type(transport: str) -> str:
+    """Map the broker's MCP transport to Claude Code's `mcp add-json` "type"."""
+    return _CLAUDE_MCP_TYPE_BY_TRANSPORT.get(transport, "http")
+
+
+def _render_claude_command(connector_name: str, transport: str, ctx: McpConfigContext) -> str:
+    """Build a ready-to-run ``claude mcp add-json`` command for the API-key shape.
+
+    Mirrors ``_show_apikey_block``'s headers exactly — same X-App-Id, same
+    X-Broker-Key, same CF-Access conditional via ``_get_cf_access_headers`` — so
+    the runnable command and the displayed JSON snippet never drift. The server
+    object is compact JSON wrapped in shell single-quotes (``shlex.quote``) so it
+    pastes-and-runs as a single line, even if a header value ever contained a quote.
+    """
+    headers = {
+        "X-App-Id": ctx.app_key,
+        "X-Broker-Key": ctx.broker_key,
+        **_get_cf_access_headers(),
+    }
+    server = {
+        "type": _claude_mcp_type(transport),
+        "url": f"{ctx.broker_url}/proxy/{connector_name}/mcp",
+        "headers": headers,
+    }
+    server_json = json.dumps(server, separators=(",", ":"))  # compact, matches example
+    return f"claude mcp add-json {connector_name}-broker {shlex.quote(server_json)}"
+
+
+def _show_claude_command(connector_name: str, transport: str, ctx: McpConfigContext) -> None:
+    """Print the API-key shape as a runnable Claude Code CLI command."""
+    print(f"{logger_prefix}# Or add it to Claude Code directly:")
+    print(f"  {_render_claude_command(connector_name, transport, ctx)}\n")
+
+
 def _show_oauth_block(connector_name: str, ctx: McpConfigContext) -> None:
     """URL-only entry + status note for MCP-spec OAuth clients.
 
@@ -517,14 +556,16 @@ def _show_oauth_block(connector_name: str, ctx: McpConfigContext) -> None:
 def _show_mcp_config(connector_name: str, transport: str, ctx: McpConfigContext) -> None:
     """Print one or both auth-shape blocks for a connector.
 
-    Output is JSON-like for the API-key block and a labelled URL for the
-    OAuth block. ``ctx.auth_mode`` chooses which to print; the default of
-    ``both`` lets an operator hand the output to either audience without
+    Output is JSON-like for the API-key block — followed by a ready-to-run
+    ``claude mcp add-json`` command for that same shape — and a labelled URL
+    for the OAuth block. ``ctx.auth_mode`` chooses which to print; the default
+    of ``both`` lets an operator hand the output to either audience without
     having to re-run the command.
     """
     print(f"{logger_prefix}── {connector_name} ──")
     if ctx.auth_mode in ("apikey", "both"):
         _show_apikey_block(connector_name, transport, ctx)
+        _show_claude_command(connector_name, transport, ctx)
     if ctx.auth_mode in ("oauth", "both"):
         _show_oauth_block(connector_name, ctx)
 
