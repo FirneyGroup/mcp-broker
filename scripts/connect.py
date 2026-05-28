@@ -438,11 +438,11 @@ AuthMode = Literal["apikey", "oauth", "both"]
 
 
 class McpConfigContext(BaseModel):
-    """Display state bundle for ``_show_mcp_config``.
+    """Display state bundle for the mcp-config show helpers (legend + per-connector).
 
-    Bundled so the show helpers stay under the 4-arg ceiling (AGENTS.md) once
-    we add OAuth-shaped output that needs to know ``oauth_enabled`` and the
-    ``allowed_redirect_uris`` allowlist alongside the legacy API-key data.
+    Bundled so the show helpers stay under the 4-arg ceiling (AGENTS.md): they
+    need ``oauth_enabled`` and the ``allowed_redirect_uris`` allowlist alongside
+    the API-key data, and ``auth_mode`` to decide which lines to print.
     """
 
     broker_url: str
@@ -455,32 +455,6 @@ class McpConfigContext(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
-def _show_apikey_block(connector_name: str, transport: str, ctx: McpConfigContext) -> None:
-    """JSON snippet using X-App-Id + X-Broker-Key headers.
-
-    For trusted internal callers (the gateway, ADK ``McpServerConfig``,
-    operator-controlled scripts) — anything where embedding a long-lived
-    static secret in client config is acceptable.
-    """
-    headers = [
-        ("X-App-Id", ctx.app_key),
-        ("X-Broker-Key", ctx.broker_key),
-        *_get_cf_access_headers().items(),
-    ]
-    print(f"{logger_prefix}# Static API-key auth — for trusted internal callers")
-    print(f"{logger_prefix}# (gateway, ADK McpServerConfig, scripts you control).")
-    print(f"{logger_prefix}# Long-lived secret embedded in client config.")
-    print(f'  "{connector_name}": {{')
-    print(f'    "transport": "{transport}",')
-    print(f'    "url": "{ctx.broker_url}/proxy/{connector_name}/mcp",')
-    print('    "headers": {')
-    for i, (header_name, header_value) in enumerate(headers):
-        suffix = "," if i < len(headers) - 1 else ""
-        print(f'      "{header_name}": "{header_value}"{suffix}')
-    print("    }")
-    print("  }\n")
-
-
 def _claude_mcp_type(transport: str) -> str:
     """Map the broker's MCP transport to Claude Code's `mcp add-json` "type"."""
     return _CLAUDE_MCP_TYPE_BY_TRANSPORT.get(transport, "http")
@@ -489,10 +463,10 @@ def _claude_mcp_type(transport: str) -> str:
 def _render_claude_command(connector_name: str, transport: str, ctx: McpConfigContext) -> str:
     """Build a ready-to-run ``claude mcp add-json`` command for the API-key shape.
 
-    Mirrors ``_show_apikey_block``'s headers exactly — same X-App-Id, same
-    X-Broker-Key, same CF-Access conditional via ``_get_cf_access_headers`` — so
-    the runnable command and the displayed JSON snippet never drift. The server
-    object is compact JSON wrapped in shell single-quotes (``shlex.quote``) so it
+    The api-key shape carries X-App-Id + X-Broker-Key (plus the CF-Access
+    conditional via ``_get_cf_access_headers``) — for trusted internal callers
+    (gateway, ADK ``McpServerConfig``, operator scripts). The server object is
+    compact JSON wrapped in shell single-quotes (``shlex.quote``) so it
     pastes-and-runs as a single line, even if a header value ever contained a quote.
     """
     headers = {
@@ -509,65 +483,57 @@ def _render_claude_command(connector_name: str, transport: str, ctx: McpConfigCo
     return f"claude mcp add-json {connector_name}-broker {shlex.quote(server_json)}"
 
 
-def _show_claude_command(connector_name: str, transport: str, ctx: McpConfigContext) -> None:
-    """Print the API-key shape as a runnable Claude Code CLI command."""
-    print(f"{logger_prefix}# Or add it to Claude Code directly:")
-    print(f"  {_render_claude_command(connector_name, transport, ctx)}\n")
-
-
-def _show_oauth_block(connector_name: str, ctx: McpConfigContext) -> None:
-    """URL-only entry + status note for MCP-spec OAuth clients.
-
-    Claude.ai, Cursor, Cline, etc. — clients that walk RFC 7591 DCR + the
-    authorization-code flow on first connect. They obtain a short-lived
-    ``Authorization: Bearer mcp_at_...`` themselves; no static secret to
-    embed. The output here is the URL + an explanation of state, so an
-    operator handing this to a third-party can also tell them whether the
-    broker is currently configured to accept their handshake.
-    """
-    print(f"{logger_prefix}# OAuth 2.1 (Authorization: Bearer) — for third-party MCP clients")
-    print(f"{logger_prefix}# (claude.ai custom connectors, Cursor, Cline, anything that walks")
-    print(f"{logger_prefix}# the MCP-spec OAuth handshake). Client self-registers via DCR,")
-    print(f"{logger_prefix}# user approves a consent page once, bearer refreshes automatically.")
-    print(f"{logger_prefix}#")
-    if ctx.oauth_enabled:
-        print(f"{logger_prefix}# Status: broker.oauth.enabled = true — ready to handshake.")
-        if ctx.allowed_redirect_uris:
-            print(f"{logger_prefix}# Allowed redirect URIs (operator-configured):")
-            for uri in ctx.allowed_redirect_uris:
-                print(f"{logger_prefix}#   - {uri}")
-        else:
-            print(
-                f"{logger_prefix}# WARNING: allowed_redirect_uris is empty — no client can complete"
-            )
-            print(
-                f"{logger_prefix}# the OAuth dance. Set broker.oauth.allowed_redirect_uris first."
-            )
+def _show_oauth_status(ctx: McpConfigContext) -> None:
+    """Print the broker's inbound-OAuth readiness once (part of the legend)."""
+    if not ctx.oauth_enabled:
+        print(f"{logger_prefix}  oauth status: dormant (broker.oauth.enabled = false).")
+        return
+    print(f"{logger_prefix}  oauth status: enabled — ready to handshake.")
+    if ctx.allowed_redirect_uris:
+        print(f"{logger_prefix}  allowed redirect URIs: {', '.join(ctx.allowed_redirect_uris)}")
     else:
-        print(f"{logger_prefix}# Status: broker.oauth.enabled = false — OAuth path is dormant.")
-        print(f"{logger_prefix}# To enable: set broker.oauth.enabled and broker.oauth.app_key in")
-        print(f"{logger_prefix}# settings.yaml, then restart the broker.")
-    print(f"{logger_prefix}#")
-    print(f"{logger_prefix}# In your MCP client's UI: 'Add custom connector' → paste this URL:")
-    print(f"  {ctx.broker_url}/proxy/{connector_name}/mcp")
+        print(
+            f"{logger_prefix}  WARNING: allowed_redirect_uris is empty — no client can complete it."
+        )
+
+
+def _show_legend(ctx: McpConfigContext) -> None:
+    """Print the once-per-run header + legend explaining the per-connector lines.
+
+    The verbose api-key/OAuth explanation used to repeat for every connector,
+    which is what made the output hard to scan. It lives here now — printed once
+    — so each connector below is just its name plus the line(s) you act on.
+    """
+    title = f"MCP servers for {ctx.app_key}   (auth={ctx.auth_mode})"
+    print(f"\n{logger_prefix}{title}")
+    print(f"{logger_prefix}{'─' * len(title)}")
+    if ctx.auth_mode in ("apikey", "both"):
+        print(f"{logger_prefix}• Run the `claude mcp add-json` line to register the server in")
+        print(f"{logger_prefix}  Claude Code — api-key auth (long-lived X-Broker-Key header), for")
+        print(f"{logger_prefix}  trusted internal callers: the gateway, ADK, scripts you control.")
+    if ctx.auth_mode in ("oauth", "both"):
+        print(f"{logger_prefix}• For claude.ai / Cursor / Cline, add a custom connector with the")
+        print(
+            f"{logger_prefix}  `oauth url` — MCP-spec OAuth handshake, no static secret to embed."
+        )
+        _show_oauth_status(ctx)
     print()
 
 
-def _show_mcp_config(connector_name: str, transport: str, ctx: McpConfigContext) -> None:
-    """Print one or both auth-shape blocks for a connector.
+def _show_connector(connector_name: str, transport: str, ctx: McpConfigContext) -> None:
+    """Print one connector's compact entry: its name, then the line(s) to act on.
 
-    Output is JSON-like for the API-key block — followed by a ready-to-run
-    ``claude mcp add-json`` command for that same shape — and a labelled URL
-    for the OAuth block. ``ctx.auth_mode`` chooses which to print; the default
-    of ``both`` lets an operator hand the output to either audience without
-    having to re-run the command.
+    ``ctx.auth_mode`` selects which lines appear: the api-key line is the
+    runnable ``claude mcp add-json`` command; the OAuth line is the plain
+    connector URL to paste into a third-party client. The shared legend
+    (printed once by ``_show_legend``) explains what each is for.
     """
-    print(f"{logger_prefix}── {connector_name} ──")
+    print(f"{logger_prefix}{connector_name}")
     if ctx.auth_mode in ("apikey", "both"):
-        _show_apikey_block(connector_name, transport, ctx)
-        _show_claude_command(connector_name, transport, ctx)
+        print(f"{logger_prefix}  {_render_claude_command(connector_name, transport, ctx)}")
     if ctx.auth_mode in ("oauth", "both"):
-        _show_oauth_block(connector_name, ctx)
+        print(f"{logger_prefix}  oauth url:  {ctx.broker_url}/proxy/{connector_name}/mcp")
+    print()
 
 
 def _get_connector_transport(broker_url: str, connector_name: str) -> str:
@@ -628,7 +594,8 @@ def _run_connect_flow(  # noqa: PLR0913 — connect flow needs broker + key + au
             allowed_redirect_uris=allowed_redirect_uris,
             auth_mode=auth_mode,
         )
-        _show_mcp_config(connector_name, transport, ctx)
+        _show_legend(ctx)
+        _show_connector(connector_name, transport, ctx)
     else:
         print(f"{logger_prefix}Timed out waiting for {connector_name} connection.")
         print(f"{logger_prefix}Check the broker logs and try again.")
@@ -701,17 +668,17 @@ def _show_all_configs(
     connections: list[dict[str, Any]],
     ctx: McpConfigContext,
 ) -> None:
-    """Print MCP config snippets for all connected connectors and exit."""
+    """Print the legend once, then a compact entry per connected connector, and exit."""
     connected = [c for c in connections if c.get("connected")]
     if not connected:
         print(f"{logger_prefix}No connected connectors for {ctx.app_key}")
         print(f"{logger_prefix}Run ./start connect first to set up OAuth")
         sys.exit(1)
-    print(f"\n{logger_prefix}MCP server config for {ctx.app_key} (auth={ctx.auth_mode}):\n")
+    _show_legend(ctx)
     for conn in connected:
         name = conn.get("connector", "unknown")
         transport = _get_connector_transport(ctx.broker_url, name)
-        _show_mcp_config(name, transport, ctx)
+        _show_connector(name, transport, ctx)
 
 
 def main() -> None:  # noqa: PLR0915 — CLI entry point with sequential setup steps
