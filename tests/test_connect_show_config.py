@@ -1,17 +1,17 @@
 """Tests for ``scripts/connect.py`` show-config helpers.
 
-Covers the dual-auth output added alongside the inbound OAuth feature:
+Covers the command-first mcp-config output:
 - ``_oauth_config`` extracts ``broker.oauth.enabled`` + ``allowed_redirect_uris``
   safely whether the section is present, partial, or missing.
-- ``_show_mcp_config`` honors ``ctx.auth_mode`` — apikey, oauth, or both.
-- ``_show_apikey_block`` emits the X-Broker-Key shape.
-- ``_show_oauth_block`` emits the URL-paste shape and reflects whether
-  ``oauth_enabled`` is true and whether ``allowed_redirect_uris`` is populated.
+- ``_render_claude_command`` builds a runnable ``claude mcp add-json`` one-liner.
+- ``_show_connector`` honors ``ctx.auth_mode`` — apikey prints the runnable
+  command, oauth prints the plain URL, both prints command-then-URL.
+- ``_show_legend`` / ``_show_oauth_status`` print the once-per-run header,
+  legend, and inbound-OAuth readiness (so the per-connector lines stay terse).
 
-These tests exercise the *output contract* the operator depends on — a
-breaking change to the JSON shape or the OAuth status line would be a public
-surface change per AGENTS.md's `./start CLI subcommands and output formats`
-clause.
+These tests exercise the *output contract* the operator depends on — a change
+to the command shape or the OAuth status line is a public-surface change per
+AGENTS.md's `./start CLI subcommands and output formats` clause.
 """
 
 from __future__ import annotations
@@ -128,63 +128,46 @@ def _server_json(command: str) -> dict[str, Any]:
 
 
 # =============================================================================
-# _show_mcp_config — auth_mode dispatch
+# _show_connector — per-connector dispatch by auth_mode
 # =============================================================================
 
 
-class TestShowMcpConfigDispatch:
-    def test_apikey_only_prints_headers_block_no_oauth_block(
+class TestShowConnector:
+    def test_apikey_only_prints_command_no_oauth_url(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        connect._show_mcp_config("slack", "streamable_http", _ctx(auth_mode="apikey"))
+        connect._show_connector("slack", "streamable_http", _ctx(auth_mode="apikey"))
         out = capsys.readouterr().out
-        assert "── slack ──" in out
-        assert "X-Broker-Key" in out
+        assert "slack" in out
+        assert "claude mcp add-json slack-broker" in out
+        assert "X-Broker-Key" in out  # carried inside the command JSON
+        assert "oauth url:" not in out
         assert "Bearer" not in out
-        assert "OAuth" not in out
 
-    def test_oauth_only_prints_url_block_no_headers(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        connect._show_mcp_config("slack", "streamable_http", _ctx(auth_mode="oauth"))
+    def test_oauth_only_prints_url_no_command(self, capsys: pytest.CaptureFixture[str]) -> None:
+        connect._show_connector("slack", "streamable_http", _ctx(auth_mode="oauth"))
         out = capsys.readouterr().out
-        assert "── slack ──" in out
-        assert "OAuth 2.1" in out
-        assert f"{GENERIC_BROKER_URL}/proxy/slack/mcp" in out
-        # Headers block must be absent — no static credential on the OAuth path.
+        assert f"oauth url:  {GENERIC_BROKER_URL}/proxy/slack/mcp" in out
+        # No static credential on the OAuth path.
+        assert "claude mcp add-json" not in out
         assert "X-Broker-Key" not in out
         assert GENERIC_BROKER_KEY not in out
 
-    def test_both_prints_both_blocks(self, capsys: pytest.CaptureFixture[str]) -> None:
-        connect._show_mcp_config("slack", "streamable_http", _ctx(auth_mode="both"))
+    def test_both_prints_command_then_oauth_url(self, capsys: pytest.CaptureFixture[str]) -> None:
+        connect._show_connector("slack", "streamable_http", _ctx(auth_mode="both"))
         out = capsys.readouterr().out
-        assert "X-Broker-Key" in out
-        assert "OAuth 2.1" in out
-        # Apikey appears first (operator scanning for headers should see them).
-        assert out.index("X-Broker-Key") < out.index("OAuth 2.1")
+        assert "claude mcp add-json slack-broker" in out
+        assert "oauth url:" in out
+        # The runnable command (what you act on) comes before the paste-url.
+        assert out.index("claude mcp add-json") < out.index("oauth url:")
 
 
 # =============================================================================
-# _show_apikey_block — header contract
+# _show_oauth_status — readiness line in the once-printed legend
 # =============================================================================
 
 
-class TestShowApikeyBlock:
-    def test_emits_app_id_and_broker_key_headers(self, capsys: pytest.CaptureFixture[str]) -> None:
-        connect._show_apikey_block("slack", "streamable_http", _ctx())
-        out = capsys.readouterr().out
-        assert f'"X-App-Id": "{GENERIC_APP_KEY}"' in out
-        assert f'"X-Broker-Key": "{GENERIC_BROKER_KEY}"' in out
-        assert f'"url": "{GENERIC_BROKER_URL}/proxy/slack/mcp"' in out
-        assert '"transport": "streamable_http"' in out
-
-
-# =============================================================================
-# _show_oauth_block — status line reflects oauth_enabled
-# =============================================================================
-
-
-class TestShowOauthBlock:
+class TestShowOauthStatus:
     def test_enabled_with_allowlist_shows_ready_and_lists_uris(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -192,42 +175,48 @@ class TestShowOauthBlock:
             "https://claude.ai/api/mcp/auth_callback",
             "https://claude.com/api/mcp/auth_callback",
         ]
-        connect._show_oauth_block(
-            "slack",
-            _ctx(oauth_enabled=True, allowed_redirect_uris=uris),
-        )
+        connect._show_oauth_status(_ctx(oauth_enabled=True, allowed_redirect_uris=uris))
         out = capsys.readouterr().out
-        assert "broker.oauth.enabled = true" in out
         assert "ready to handshake" in out
         for uri in uris:
             assert uri in out
-        assert f"{GENERIC_BROKER_URL}/proxy/slack/mcp" in out
 
     def test_enabled_but_empty_allowlist_warns(self, capsys: pytest.CaptureFixture[str]) -> None:
-        connect._show_oauth_block("slack", _ctx(oauth_enabled=True, allowed_redirect_uris=[]))
+        connect._show_oauth_status(_ctx(oauth_enabled=True, allowed_redirect_uris=[]))
         out = capsys.readouterr().out
         assert "WARNING" in out
         assert "allowed_redirect_uris is empty" in out
 
-    def test_disabled_shows_dormant_status_and_enable_hint(
+    def test_disabled_shows_dormant_status(self, capsys: pytest.CaptureFixture[str]) -> None:
+        connect._show_oauth_status(_ctx(oauth_enabled=False))
+        out = capsys.readouterr().out
+        assert "dormant" in out
+        assert "broker.oauth.enabled = false" in out
+
+
+# =============================================================================
+# _show_legend — printed once per run; reflects auth_mode
+# =============================================================================
+
+
+class TestShowLegend:
+    def test_apikey_mode_explains_command_not_oauth(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        connect._show_oauth_block("slack", _ctx(oauth_enabled=False))
+        connect._show_legend(_ctx(auth_mode="apikey"))
         out = capsys.readouterr().out
-        assert "broker.oauth.enabled = false" in out
-        assert "dormant" in out
-        # Operator should see the actionable next step inline.
-        assert "broker.oauth.enabled" in out
-        assert "broker.oauth.app_key" in out
+        assert "claude mcp add-json" in out
+        assert f"MCP servers for {GENERIC_APP_KEY}" in out
+        assert "oauth" not in out.lower()
 
-    def test_does_not_leak_static_broker_key(self, capsys: pytest.CaptureFixture[str]) -> None:
-        """The OAuth block is for third-party MCP clients who should NEVER
-        see a static broker key. Regression guard against the obvious bug
-        where the URL-only block accidentally interpolates ctx.broker_key."""
-        connect._show_oauth_block(
-            "slack", _ctx(oauth_enabled=True, allowed_redirect_uris=["https://x/"])
-        )
+    def test_oauth_mode_explains_url_and_status_without_leaking_key(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        connect._show_legend(_ctx(auth_mode="oauth", oauth_enabled=False))
         out = capsys.readouterr().out
+        assert "oauth url" in out
+        assert "dormant" in out
+        # The legend must never leak the static broker key.
         assert GENERIC_BROKER_KEY not in out
 
 
@@ -291,7 +280,7 @@ class TestRenderClaudeCommand:
         assert server["type"] == "http"
 
     def test_cf_access_headers_included_when_env_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # Stays in lockstep with _show_apikey_block: both source CF-Access from env.
+        # The command and the api-key shape both source CF-Access from env (lockstep).
         monkeypatch.setenv("CF_ACCESS_CLIENT_ID", "cf-id-value")
         monkeypatch.setenv("CF_ACCESS_CLIENT_SECRET", "cf-secret-value")
         server = _server_json(connect._render_claude_command("slack", "streamable_http", _ctx()))
@@ -305,26 +294,6 @@ class TestRenderClaudeCommand:
         server = _server_json(connect._render_claude_command("slack", "streamable_http", _ctx()))
         assert "CF-Access-Client-Id" not in server["headers"]
         assert "CF-Access-Client-Secret" not in server["headers"]
-
-
-# =============================================================================
-# _show_mcp_config — runnable command rides the API-key shape only
-# =============================================================================
-
-
-class TestShowMcpConfigClaudeCommand:
-    def test_apikey_mode_prints_runnable_command(self, capsys: pytest.CaptureFixture[str]) -> None:
-        connect._show_mcp_config("slack", "streamable_http", _ctx(auth_mode="apikey"))
-        assert "claude mcp add-json slack-broker" in capsys.readouterr().out
-
-    def test_both_mode_prints_runnable_command(self, capsys: pytest.CaptureFixture[str]) -> None:
-        connect._show_mcp_config("slack", "streamable_http", _ctx(auth_mode="both"))
-        assert "claude mcp add-json slack-broker" in capsys.readouterr().out
-
-    def test_oauth_mode_omits_runnable_command(self, capsys: pytest.CaptureFixture[str]) -> None:
-        # The OAuth shape has no static headers, so no runnable static-auth command.
-        connect._show_mcp_config("slack", "streamable_http", _ctx(auth_mode="oauth"))
-        assert "claude mcp add-json" not in capsys.readouterr().out
 
 
 class TestRunConnectFlowHonorsAuthMode:
