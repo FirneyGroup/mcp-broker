@@ -281,8 +281,8 @@ CLI commands require bash (Linux/macOS). The `./start` script auto-creates a vir
 ./start create-key [url]      # Create key for an app (interactive)
 ./start rotate-key [url]      # Rotate an existing key (interactive)
 ./start delete-key [url]      # Delete a key (interactive, with confirmation)
-./start revoke-oauth [url]    # Revoke an app's inbound OAuth tokens (kick connected MCP client)
-./start disconnect-connector [url]  # Delete an app's stored upstream connector token (interactive)
+./start disconnect-inbound [url]   # Disconnect a connected MCP client (revoke its inbound OAuth tokens)
+./start disconnect-outbound [url]  # Disconnect an app from an upstream connector (delete stored token)
 ```
 
 All key commands (except `generate-admin-key`) require the broker to be running and `BROKER_ADMIN_KEY` set in `.env`. The optional `[url]` argument targets a remote broker instead of localhost.

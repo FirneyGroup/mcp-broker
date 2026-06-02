@@ -255,7 +255,7 @@ else:
     print('Response:', json.dumps(r, indent=2))
 " 2>/dev/null || echo "Key deleted (or app had no key)."
         ;;
-    revoke-oauth)
+    disconnect-inbound)
         ensure_venv
         shift; if [[ "${1:-}" == http* ]]; then BROKER_URL="$1"; shift; fi
         echo "Fetching app list..."
@@ -277,7 +277,7 @@ else:
         fi
         echo "Apps with keys:"
         echo "$apps_with_keys"
-        printf "Select app number to revoke inbound OAuth: "
+        printf "Select app number to disconnect (inbound): "
         read -r selection
         selected_app=$(echo "$response" | _SEL="$selection" python3 -c "
 import sys, json, os
@@ -292,7 +292,7 @@ if 0 <= idx < len(candidates):
             echo "Invalid selection."
             exit 1
         fi
-        printf "Revoke inbound OAuth for '%s'? Connected MCP clients will be forced to re-authorize. [y/N] " "$selected_app"
+        printf "Disconnect inbound MCP client for '%s'? Client will be forced to re-authorize. [y/N] " "$selected_app"
         read -r confirm
         if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
             echo "Cancelled."
@@ -303,14 +303,14 @@ if 0 <= idx < len(candidates):
 import sys, json
 r = json.load(sys.stdin)
 if r.get('revoked'):
-    print('Inbound OAuth tokens revoked.')
-    print('Connected clients (e.g. claude.ai) will re-authorize on next request.')
+    print('Inbound MCP client disconnected (OAuth tokens revoked).')
+    print('Client (e.g. claude.ai) will re-authorize on next request.')
     print('Broker key + YAML config are unchanged.')
 else:
     print('Response:', json.dumps(r, indent=2))
-" 2>/dev/null || echo "Revoked (or no tokens existed)."
+" 2>/dev/null || echo "Disconnected (or no tokens existed)."
         ;;
-    disconnect-connector)
+    disconnect-outbound)
         ensure_venv
         shift; if [[ "${1:-}" == http* ]]; then BROKER_URL="$1"; shift; fi
         echo "Fetching app list..."
@@ -401,8 +401,8 @@ else:
         echo "  ./start create-key [url]      Create an API key for an app (interactive)"
         echo "  ./start rotate-key [url]      Rotate an existing API key (interactive)"
         echo "  ./start delete-key [url]      Delete an API key (interactive, with confirmation)"
-        echo "  ./start revoke-oauth [url]    Revoke an app's inbound OAuth tokens (kick connected MCP client)"
-        echo "  ./start disconnect-connector [url]  Delete an app's stored upstream connector token (interactive)"
+        echo "  ./start disconnect-inbound [url]   Disconnect a connected MCP client (revoke its inbound OAuth tokens)"
+        echo "  ./start disconnect-outbound [url]  Disconnect an app from an upstream connector (delete stored token)"
         echo ""
         echo "First run auto-creates venv. Loads .env if present."
         echo "Key commands use BROKER_ADMIN_KEY from .env and BROKER_URL (default: http://localhost:8002)."
