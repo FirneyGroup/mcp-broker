@@ -255,6 +255,131 @@ else:
     print('Response:', json.dumps(r, indent=2))
 " 2>/dev/null || echo "Key deleted (or app had no key)."
         ;;
+    revoke-oauth)
+        ensure_venv
+        shift; if [[ "${1:-}" == http* ]]; then BROKER_URL="$1"; shift; fi
+        echo "Fetching app list..."
+        response=$(admin_api GET /admin/keys)
+        apps_with_keys=$(echo "$response" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+apps = data.get('apps', data) if isinstance(data, dict) else data
+candidates = [a for a in apps if a.get('has_key')]
+if not candidates:
+    print('NO_CANDIDATES')
+else:
+    for i, a in enumerate(candidates, 1):
+        print(f\"{i}. {a['app_key']}\")
+" 2>/dev/null)
+        if [ "$apps_with_keys" = "NO_CANDIDATES" ] || [ -z "$apps_with_keys" ]; then
+            echo "No apps with keys found."
+            exit 0
+        fi
+        echo "Apps with keys:"
+        echo "$apps_with_keys"
+        printf "Select app number to revoke inbound OAuth: "
+        read -r selection
+        selected_app=$(echo "$response" | _SEL="$selection" python3 -c "
+import sys, json, os
+data = json.load(sys.stdin)
+apps = data.get('apps', data) if isinstance(data, dict) else data
+candidates = [a for a in apps if a.get('has_key')]
+idx = int(os.environ.get('_SEL', '0')) - 1
+if 0 <= idx < len(candidates):
+    print(candidates[idx]['app_key'])
+" 2>/dev/null)
+        if [ -z "$selected_app" ]; then
+            echo "Invalid selection."
+            exit 1
+        fi
+        printf "Revoke inbound OAuth for '%s'? Connected MCP clients will be forced to re-authorize. [y/N] " "$selected_app"
+        read -r confirm
+        if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+            echo "Cancelled."
+            exit 0
+        fi
+        revoke_response=$(admin_api POST "/admin/oauth/revoke/$selected_app")
+        echo "$revoke_response" | python3 -c "
+import sys, json
+r = json.load(sys.stdin)
+if r.get('revoked'):
+    print('Inbound OAuth tokens revoked.')
+    print('Connected clients (e.g. claude.ai) will re-authorize on next request.')
+    print('Broker key + YAML config are unchanged.')
+else:
+    print('Response:', json.dumps(r, indent=2))
+" 2>/dev/null || echo "Revoked (or no tokens existed)."
+        ;;
+    disconnect-connector)
+        ensure_venv
+        shift; if [[ "${1:-}" == http* ]]; then BROKER_URL="$1"; shift; fi
+        echo "Fetching app list..."
+        response=$(admin_api GET /admin/keys)
+        apps_with_keys=$(echo "$response" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+apps = data.get('apps', data) if isinstance(data, dict) else data
+candidates = [a for a in apps if a.get('has_key')]
+if not candidates:
+    print('NO_CANDIDATES')
+else:
+    for i, a in enumerate(candidates, 1):
+        print(f\"{i}. {a['app_key']}\")
+" 2>/dev/null)
+        if [ "$apps_with_keys" = "NO_CANDIDATES" ] || [ -z "$apps_with_keys" ]; then
+            echo "No apps with keys found."
+            exit 0
+        fi
+        echo "Apps with keys:"
+        echo "$apps_with_keys"
+        printf "Select app number: "
+        read -r app_selection
+        selected_app=$(echo "$response" | _SEL="$app_selection" python3 -c "
+import sys, json, os
+data = json.load(sys.stdin)
+apps = data.get('apps', data) if isinstance(data, dict) else data
+candidates = [a for a in apps if a.get('has_key')]
+idx = int(os.environ.get('_SEL', '0')) - 1
+if 0 <= idx < len(candidates):
+    print(candidates[idx]['app_key'])
+" 2>/dev/null)
+        if [ -z "$selected_app" ]; then
+            echo "Invalid selection."
+            exit 1
+        fi
+        allowed=$(echo "$response" | _APP="$selected_app" python3 -c "
+import sys, json, os
+data = json.load(sys.stdin)
+apps = data.get('apps', data) if isinstance(data, dict) else data
+target = os.environ.get('_APP', '')
+app = next((a for a in apps if a['app_key'] == target), None)
+connectors = app.get('allowed_connectors', []) if app else []
+print(', '.join(connectors) if connectors else 'all (no allowlist set)')
+" 2>/dev/null)
+        echo "Allowed connectors for $selected_app: $allowed"
+        printf "Connector name to disconnect: "
+        read -r selected_connector
+        if [ -z "$selected_connector" ]; then
+            echo "No connector specified."
+            exit 1
+        fi
+        printf "Disconnect '%s' for '%s'? Stored upstream token will be deleted. [y/N] " "$selected_connector" "$selected_app"
+        read -r confirm
+        if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+            echo "Cancelled."
+            exit 0
+        fi
+        disconnect_response=$(admin_api DELETE "/admin/connections/$selected_app/$selected_connector")
+        echo "$disconnect_response" | python3 -c "
+import sys, json
+r = json.load(sys.stdin)
+if r.get('disconnected'):
+    print(f\"Disconnected {r.get('connector', '?')} for {r.get('app_key', '?')}.\")
+    print('Re-connect via: ./start connect')
+else:
+    print('Response:', json.dumps(r, indent=2))
+" 2>/dev/null || echo "Disconnected (or no stored token)."
+        ;;
     setup)
         ensure_venv
         echo "Venv ready at $VENV"
@@ -276,6 +401,8 @@ else:
         echo "  ./start create-key [url]      Create an API key for an app (interactive)"
         echo "  ./start rotate-key [url]      Rotate an existing API key (interactive)"
         echo "  ./start delete-key [url]      Delete an API key (interactive, with confirmation)"
+        echo "  ./start revoke-oauth [url]    Revoke an app's inbound OAuth tokens (kick connected MCP client)"
+        echo "  ./start disconnect-connector [url]  Delete an app's stored upstream connector token (interactive)"
         echo ""
         echo "First run auto-creates venv. Loads .env if present."
         echo "Key commands use BROKER_ADMIN_KEY from .env and BROKER_URL (default: http://localhost:8002)."
