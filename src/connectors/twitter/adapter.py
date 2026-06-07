@@ -329,7 +329,9 @@ class TwitterConnector(NativeConnector):
 
     @native_tool(_POST_TWEET_META)
     async def post_tweet(self, *, access_token: str, text: str) -> list[dict[str, Any]]:
-        """Post a tweet. Validates length before calling X API."""
+        """Post a tweet. Validates text is non-empty and within length before calling X API."""
+        if not text.strip():
+            raise ValueError("Tweet text is empty")
         if len(text) > MAX_TWEET_LENGTH:
             raise ValueError(f"Tweet exceeds {MAX_TWEET_LENGTH} characters ({len(text)} given)")
         loop = asyncio.get_running_loop()

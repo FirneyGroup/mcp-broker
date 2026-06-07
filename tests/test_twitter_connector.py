@@ -209,6 +209,12 @@ class TestPostTweet:
         with pytest.raises(ValueError, match="exceeds 280 characters"):
             await twitter_connector.post_tweet(access_token="fake_token", text=long_text)
 
+    async def test_rejects_empty_text(self, twitter_connector):
+        with patch("connectors.twitter.adapter._post_tweet_sync") as mock_post:
+            with pytest.raises(ValueError, match="empty"):
+                await twitter_connector.post_tweet(access_token="fake_token", text="   ")
+            mock_post.assert_not_called()
+
     async def test_allows_exactly_280_chars(self, twitter_connector):
         text_280 = "x" * 280
         mock_response = {"data": {"id": "999", "text": text_280}}
