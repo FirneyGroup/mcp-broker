@@ -96,6 +96,8 @@ Should return a list of Twitter MCP tools, then the authenticated user's profile
 | Tool | Purpose |
 |------|---------|
 | `post_tweet` | Post a tweet (max 280 chars) |
+| `post_thread` | Post a thread — ordered tweets chained as replies (each max 280 chars, up to 25) |
+| `reply_to_tweet` | Reply to (comment on) an existing tweet by ID (max 280 chars) |
 | `get_me` | Get authenticated user's profile (id, name, username) |
 | `delete_tweet` | Delete a tweet by ID |
 | `get_my_tweets` | Get the authenticated user's recent tweets (default 10, max 100) |
