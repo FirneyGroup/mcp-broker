@@ -8,7 +8,7 @@ input validation, and edge cases.
 from __future__ import annotations
 
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -54,11 +54,19 @@ class TestRegistration:
     def test_display_name(self, twitter_connector):
         assert twitter_connector.meta.display_name == "Twitter/X"
 
-    def test_has_five_tools(self, twitter_connector):
-        assert len(twitter_connector._tools) == 5
+    def test_has_seven_tools(self, twitter_connector):
+        assert len(twitter_connector._tools) == 7
 
     def test_tool_names(self, twitter_connector):
-        expected_names = {"post_tweet", "get_me", "delete_tweet", "get_my_tweets", "search_tweets"}
+        expected_names = {
+            "post_tweet",
+            "get_me",
+            "delete_tweet",
+            "get_my_tweets",
+            "search_tweets",
+            "post_thread",
+            "reply_to_tweet",
+        }
         actual_names = set(twitter_connector._tools.keys())
         assert actual_names == expected_names
 
@@ -141,7 +149,7 @@ class TestMCPDispatch:
         server_info = response["result"]["serverInfo"]
         assert server_info["name"] == "twitter"
 
-    async def test_tools_list_returns_all_five(self, twitter_connector):
+    async def test_tools_list_returns_all_seven(self, twitter_connector):
         response = await twitter_connector.handle_mcp_request(
             method="tools/list",
             params={},
@@ -149,9 +157,10 @@ class TestMCPDispatch:
             access_token="fake_token",
         )
         tool_names = [t["name"] for t in response["result"]["tools"]]
-        assert len(tool_names) == 5
+        assert len(tool_names) == 7
         assert "post_tweet" in tool_names
-        assert "search_tweets" in tool_names
+        assert "post_thread" in tool_names
+        assert "reply_to_tweet" in tool_names
 
     async def test_unknown_method_returns_error(self, twitter_connector):
         response = await twitter_connector.handle_mcp_request(
@@ -405,6 +414,166 @@ class TestSearchTweets:
 
 
 # =============================================================================
+# TOOL: post_thread
+# =============================================================================
+
+
+class TestPostThread:
+    """Tests for the post_thread tool (handler validation + result wrapping)."""
+
+    def test_schema_advertises_max_thread_tweets(self, twitter_connector):
+        """The LLM-facing tools/list schema must publish the same ceiling the validator enforces."""
+        from connectors.twitter.adapter import MAX_THREAD_TWEETS
+
+        tweets_schema = twitter_connector._tools["post_thread"].meta.input_schema["properties"][
+            "tweets"
+        ]
+        assert tweets_schema["maxItems"] == MAX_THREAD_TWEETS
+
+    async def test_posts_thread_successfully(self, twitter_connector):
+        mock_outcome = {
+            "status": "complete",
+            "count": 2,
+            "thread": [{"id": "1", "text": "a"}, {"id": "2", "text": "b"}],
+        }
+        with patch("connectors.twitter.adapter._post_thread_sync") as mock_thread:
+            mock_thread.return_value = mock_outcome
+            content_blocks = await twitter_connector.post_thread(
+                access_token="fake_token", tweets=["a", "b"]
+            )
+
+        mock_thread.assert_called_once_with("fake_token", ["a", "b"])
+        parsed = json.loads(content_blocks[0]["text"])
+        assert parsed["status"] == "complete"
+        assert parsed["count"] == 2
+
+    async def test_rejects_empty_list(self, twitter_connector):
+        with patch("connectors.twitter.adapter._post_thread_sync") as mock_thread:
+            with pytest.raises(ValueError, match="non-empty list"):
+                await twitter_connector.post_thread(access_token="fake_token", tweets=[])
+            mock_thread.assert_not_called()
+
+    async def test_rejects_over_length_tweet(self, twitter_connector):
+        with patch("connectors.twitter.adapter._post_thread_sync") as mock_thread:
+            with pytest.raises(ValueError, match="exceeds 280 characters"):
+                await twitter_connector.post_thread(
+                    access_token="fake_token", tweets=["ok", "x" * 281]
+                )
+            mock_thread.assert_not_called()
+
+    async def test_rejects_too_many_tweets(self, twitter_connector):
+        from connectors.twitter.adapter import MAX_THREAD_TWEETS
+
+        with patch("connectors.twitter.adapter._post_thread_sync") as mock_thread:
+            with pytest.raises(ValueError, match="exceeds"):
+                await twitter_connector.post_thread(
+                    access_token="fake_token", tweets=["x"] * (MAX_THREAD_TWEETS + 1)
+                )
+            mock_thread.assert_not_called()
+
+    async def test_rejects_empty_tweet_text(self, twitter_connector):
+        with patch("connectors.twitter.adapter._post_thread_sync") as mock_thread:
+            with pytest.raises(ValueError, match="is empty"):
+                await twitter_connector.post_thread(access_token="fake_token", tweets=["ok", "   "])
+            mock_thread.assert_not_called()
+
+    async def test_surfaces_partial_status(self, twitter_connector):
+        mock_outcome = {
+            "status": "partial",
+            "posted": [{"id": "1", "text": "a"}],
+            "failed_at_index": 1,
+            "error": "rate limited",
+        }
+        with patch("connectors.twitter.adapter._post_thread_sync") as mock_thread:
+            mock_thread.return_value = mock_outcome
+            content_blocks = await twitter_connector.post_thread(
+                access_token="fake_token", tweets=["a", "b"]
+            )
+
+        parsed = json.loads(content_blocks[0]["text"])
+        assert parsed["status"] == "partial"
+        assert parsed["posted"][0]["id"] == "1"
+
+    async def test_dispatch_via_mcp(self, twitter_connector):
+        mock_outcome = {"status": "complete", "count": 1, "thread": [{"id": "9", "text": "x"}]}
+        with patch("connectors.twitter.adapter._post_thread_sync") as mock_thread:
+            mock_thread.return_value = mock_outcome
+            response = await twitter_connector.handle_mcp_request(
+                method="tools/call",
+                params={"name": "post_thread", "arguments": {"tweets": ["x"]}},
+                request_id=60,
+                access_token="fake_token",
+            )
+
+        assert "result" in response
+        parsed = json.loads(response["result"]["content"][0]["text"])
+        assert parsed["thread"][0]["id"] == "9"
+
+
+# =============================================================================
+# TOOL: reply_to_tweet
+# =============================================================================
+
+
+class TestReplyToTweet:
+    """Tests for the reply_to_tweet tool."""
+
+    async def test_rejects_empty_text(self, twitter_connector):
+        with patch("connectors.twitter.adapter._reply_to_tweet_sync") as mock_reply_sync:
+            with pytest.raises(ValueError, match="empty"):
+                await twitter_connector.reply_to_tweet(
+                    access_token="fake_token", text="   ", tweet_id="123"
+                )
+            mock_reply_sync.assert_not_called()
+
+    async def test_replies_successfully(self, twitter_connector):
+        mock_reply = {"data": {"id": "555", "text": "nice"}}
+        with patch("connectors.twitter.adapter._reply_to_tweet_sync") as mock_reply_sync:
+            mock_reply_sync.return_value = mock_reply
+            content_blocks = await twitter_connector.reply_to_tweet(
+                access_token="fake_token", text="nice", tweet_id="123"
+            )
+
+        mock_reply_sync.assert_called_once_with("fake_token", "nice", "123")
+        parsed = json.loads(content_blocks[0]["text"])
+        assert parsed["data"]["id"] == "555"
+
+    async def test_rejects_over_length(self, twitter_connector):
+        with patch("connectors.twitter.adapter._reply_to_tweet_sync") as mock_reply_sync:
+            with pytest.raises(ValueError, match="exceeds 280 characters"):
+                await twitter_connector.reply_to_tweet(
+                    access_token="fake_token", text="x" * 281, tweet_id="123"
+                )
+            mock_reply_sync.assert_not_called()
+
+    async def test_rejects_invalid_tweet_id(self, twitter_connector):
+        with patch("connectors.twitter.adapter._reply_to_tweet_sync") as mock_reply_sync:
+            with pytest.raises(ValueError, match="Invalid tweet ID"):
+                await twitter_connector.reply_to_tweet(
+                    access_token="fake_token", text="hi", tweet_id="not-an-id"
+                )
+            mock_reply_sync.assert_not_called()
+
+    async def test_dispatch_via_mcp(self, twitter_connector):
+        mock_reply = {"data": {"id": "777", "text": "dispatched reply"}}
+        with patch("connectors.twitter.adapter._reply_to_tweet_sync") as mock_reply_sync:
+            mock_reply_sync.return_value = mock_reply
+            response = await twitter_connector.handle_mcp_request(
+                method="tools/call",
+                params={
+                    "name": "reply_to_tweet",
+                    "arguments": {"text": "dispatched reply", "tweet_id": "123"},
+                },
+                request_id=61,
+                access_token="fake_token",
+            )
+
+        assert "result" in response
+        parsed = json.loads(response["result"]["content"][0]["text"])
+        assert parsed["data"]["id"] == "777"
+
+
+# =============================================================================
 # TOOL DISPATCH — unknown tool
 # =============================================================================
 
@@ -507,3 +676,109 @@ class TestSyncHelpers:
         assert len(blocks) == 1
         assert blocks[0]["type"] == "text"
         assert json.loads(blocks[0]["text"]) == {"key": "value"}
+
+    def test_extract_tweet_id_from_data(self):
+        from connectors.twitter.adapter import _extract_tweet_id
+
+        assert _extract_tweet_id({"data": {"id": "777", "text": "x"}}) == "777"
+
+    def test_extract_tweet_id_raises_on_bad_shape(self):
+        from connectors.twitter.adapter import _extract_tweet_id
+
+        with pytest.raises(ValueError, match="Unexpected create response"):
+            _extract_tweet_id({"errors": [{"message": "no data"}]})
+
+    def test_validate_thread_tweets_accepts_valid(self):
+        from connectors.twitter.adapter import _validate_thread_tweets
+
+        _validate_thread_tweets(["first", "second"])  # must not raise
+
+    def test_validate_thread_tweets_rejects_empty_list(self):
+        from connectors.twitter.adapter import _validate_thread_tweets
+
+        with pytest.raises(ValueError, match="non-empty list"):
+            _validate_thread_tweets([])
+
+    def test_validate_thread_tweets_rejects_too_many(self):
+        from connectors.twitter.adapter import MAX_THREAD_TWEETS, _validate_thread_tweets
+
+        with pytest.raises(ValueError, match="exceeds"):
+            _validate_thread_tweets(["x"] * (MAX_THREAD_TWEETS + 1))
+
+    def test_validate_thread_tweets_rejects_overlength(self):
+        from connectors.twitter.adapter import _validate_thread_tweets
+
+        with pytest.raises(ValueError, match="exceeds 280"):
+            _validate_thread_tweets(["ok", "x" * 281])
+
+    def test_post_thread_sync_chains_each_reply_to_the_previous(self):
+        """Root has no reply; each subsequent tweet replies to the prior tweet's ID."""
+        from connectors.twitter.adapter import _post_thread_sync
+
+        created_bodies = []
+
+        def fake_create(body):
+            created_bodies.append(body)
+            sequence = len(created_bodies)
+            return {"data": {"id": f"id{sequence}", "text": body.text}}
+
+        fake_client = MagicMock()
+        fake_client.posts.create.side_effect = fake_create
+        with patch("connectors.twitter.adapter.XClient", return_value=fake_client):
+            outcome = _post_thread_sync("fake_token", ["first", "second", "third"])
+
+        assert outcome["status"] == "complete"
+        assert outcome["count"] == 3
+        assert created_bodies[0].reply is None
+        assert created_bodies[1].reply.in_reply_to_tweet_id == "id1"
+        assert created_bodies[2].reply.in_reply_to_tweet_id == "id2"
+
+    def test_post_thread_sync_returns_partial_on_midthread_failure(self):
+        from connectors.twitter.adapter import _post_thread_sync
+
+        attempts = {"count": 0}
+
+        def fake_create(body):
+            attempts["count"] += 1
+            if attempts["count"] == 2:
+                raise RuntimeError("rate limited")
+            return {"data": {"id": f"id{attempts['count']}", "text": body.text}}
+
+        fake_client = MagicMock()
+        fake_client.posts.create.side_effect = fake_create
+        with patch("connectors.twitter.adapter.XClient", return_value=fake_client):
+            outcome = _post_thread_sync("fake_token", ["a", "b", "c"])
+
+        assert outcome["status"] == "partial"
+        assert outcome["failed_at_index"] == 1
+        assert [tweet["id"] for tweet in outcome["posted"]] == ["id1"]
+        assert "rate limited" in outcome["error"]
+
+    def test_post_thread_sync_raises_when_first_post_fails(self):
+        from connectors.twitter.adapter import _post_thread_sync
+
+        fake_client = MagicMock()
+        fake_client.posts.create.side_effect = RuntimeError("boom")
+        with patch("connectors.twitter.adapter.XClient", return_value=fake_client):
+            with pytest.raises(RuntimeError, match="boom"):
+                _post_thread_sync("fake_token", ["only"])
+
+    def test_post_thread_sync_unreadable_id_midthread_raises_not_partial(self):
+        """A mid-thread tweet that posts but returns an unreadable ID must raise, not be
+        reported as failed_at_index — the tweet is live, so labeling it failed would
+        double-post on retry. ID extraction lives outside the post try for this reason."""
+        from connectors.twitter.adapter import _post_thread_sync
+
+        attempts = {"count": 0}
+
+        def fake_create(body):
+            attempts["count"] += 1
+            if attempts["count"] == 2:
+                return {"unexpected": "shape"}  # posted successfully, but ID is unreadable
+            return {"data": {"id": f"id{attempts['count']}", "text": body.text}}
+
+        fake_client = MagicMock()
+        fake_client.posts.create.side_effect = fake_create
+        with patch("connectors.twitter.adapter.XClient", return_value=fake_client):
+            with pytest.raises(ValueError, match="Unexpected create response"):
+                _post_thread_sync("fake_token", ["a", "b", "c"])
