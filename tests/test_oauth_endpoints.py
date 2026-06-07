@@ -745,6 +745,56 @@ class TestTokenRefresh:
         assert response.status_code == 400
         assert _response_body(response)["error"] == "invalid_grant"
 
+    async def test_admin_revoke_invalidates_refresh_token(
+        self, endpoints: OAuthServerEndpoints, store: SQLiteInboundAuthStore, tmp_path: Path
+    ) -> None:
+        """End-to-end: an admin inbound-OAuth revoke makes a previously-issued
+        refresh token unusable at /oauth/token.
+
+        Guards the *observable* consequence of the disconnect feature, not just
+        store-layer deletion. A future change that validated refresh tokens
+        against surviving DCR client state (which a revoke deliberately keeps)
+        instead of `inbound_tokens` would pass the store-level tests but fail
+        here — reopening the disconnect silently.
+        """
+        from broker.api.admin import AdminEndpoints
+        from broker.config import BrokerAppConfig
+        from broker.services.api_key_store import ConnectTokenStore
+        from broker.services.client_registry import BrokerClientRegistry
+        from broker.services.sqlite_api_key_store import SQLiteBrokerKeyStore
+
+        client_id, _, refresh = await _mint_initial_pair(endpoints)
+
+        # Operator revokes via the admin endpoint, sharing the same inbound
+        # store that backs the OAuth endpoints (= the production wiring shape).
+        key_store = SQLiteBrokerKeyStore(db_path=str(tmp_path / "keys.db"))
+        await key_store.setup()
+        registry = BrokerClientRegistry({"acme": {"claude_ai": BrokerAppConfig(scopes=["proxy"])}})
+        admin = AdminEndpoints(
+            key_store,
+            "admin-key-long-enough",
+            registry,
+            ConnectTokenStore(),
+            inbound_auth_store=store,
+        )
+        admin_request = MagicMock()
+        admin_request.headers = {"x-admin-key": "admin-key-long-enough"}
+        revoke = await admin.revoke_inbound_oauth(GENERIC_APP_KEY, admin_request)
+        assert revoke.status_code == 200
+
+        # The surviving refresh token must now be rejected at the token endpoint.
+        response = await endpoints.token(
+            _request_with_form(
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh,
+                    "client_id": client_id,
+                }
+            )
+        )
+        assert response.status_code == 400
+        assert _response_body(response)["error"] == "invalid_grant"
+
     async def test_cross_client_with_wide_scope_returns_invalid_grant_not_invalid_scope(
         self, endpoints: OAuthServerEndpoints
     ) -> None:
