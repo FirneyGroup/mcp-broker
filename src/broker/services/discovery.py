@@ -10,6 +10,7 @@ Neither class imports from store.py or oauth.py — no boundary crossing.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import time
 from datetime import UTC, datetime
@@ -34,8 +35,31 @@ logger = logging.getLogger(__name__)
 _HTTP_OK = 200
 _HTTP_CREATED = 201
 
+# Max characters of a non-200 discovery body to log (caps verbose error pages).
+_MAX_ERROR_LOG_LENGTH = 500
+
+# Hostnames that always resolve to the local/internal network — rejected for SSRF.
+_BLOCKED_NAMES = frozenset({"localhost"})
+
 # Lock per connector to prevent concurrent duplicate registrations
 _registration_locks: dict[str, asyncio.Lock] = {}
+
+
+def _raise_for_discovery_status(response: httpx.Response, connector_name: str, label: str) -> None:
+    """Log + raise on a non-200 discovery response, with the body truncated.
+
+    CRLF in the body is escaped so a malicious upstream cannot forge log lines.
+    """
+    if response.status_code == _HTTP_OK:
+        return
+    logger.error(
+        "[Discovery] %s failed for %s: %s %s",
+        label,
+        connector_name,
+        response.status_code,
+        response.text[:_MAX_ERROR_LOG_LENGTH].replace("\r", "\\r").replace("\n", "\\n"),
+    )
+    raise ValueError(f"OAuth {label} failed for {connector_name}: HTTP {response.status_code}")
 
 
 def _validate_https_url(url: str, label: str) -> None:
@@ -54,9 +78,6 @@ def _validate_https_url(url: str, label: str) -> None:
 
 def _is_private_host(hostname: str) -> bool:
     """Check if hostname resolves to a private, loopback, or link-local address."""
-    import ipaddress
-
-    _BLOCKED_NAMES = {"localhost"}  # noqa: N806
     if hostname in _BLOCKED_NAMES or hostname.endswith(".local"):
         return True
     try:
@@ -164,6 +185,10 @@ class OAuthDiscovery:
         Returns dict with keys: authorization_endpoint, token_endpoint, registration_endpoint.
         Caches result in memory per connector.
         """
+        # Defense in depth: ConnectorMeta already enforces HTTPS on mcp_oauth_url,
+        # but re-validate here so this layer is safe even if called with an
+        # unvalidated URL (SSRF defence on the very first fetch).
+        _validate_https_url(mcp_oauth_url, "mcp_oauth_url")
         async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
             auth_server = await self._discover_auth_server(client, connector_name, mcp_oauth_url)
             server_metadata = await self._fetch_server_metadata(client, connector_name, auth_server)
@@ -186,26 +211,26 @@ class OAuthDiscovery:
         logger.info("[Discovery] Fetching protected resource metadata: %s", resource_url)
         resource_response = await client.get(resource_url)
 
-        if resource_response.status_code != _HTTP_OK:
-            logger.error(
-                "[Discovery] Protected resource discovery failed for %s: %s %s",
-                connector_name,
-                resource_response.status_code,
-                resource_response.text[:500].replace("\r", "\\r").replace("\n", "\\n"),
-            )
-            raise ValueError(
-                f"OAuth protected resource discovery failed for {connector_name}: "
-                f"HTTP {resource_response.status_code}"
-            )
+        _raise_for_discovery_status(
+            resource_response, connector_name, "protected resource discovery"
+        )
 
-        resource_metadata = resource_response.json()
+        try:
+            resource_metadata = resource_response.json()
+        except ValueError as exc:
+            raise ValueError(
+                f"Protected resource discovery returned non-JSON response for {connector_name}"
+            ) from exc
         auth_servers = resource_metadata.get("authorization_servers", [])
         if not auth_servers:
             raise ValueError(
                 f"No authorization_servers in protected resource metadata for {connector_name}"
             )
 
-        auth_server = auth_servers[0].rstrip("/")
+        auth_server = auth_servers[0]
+        if not isinstance(auth_server, str):
+            raise ValueError(f"authorization_servers[0] is not a string for {connector_name}")
+        auth_server = auth_server.rstrip("/")
         _validate_https_url(auth_server, f"authorization_server for {connector_name}")
         logger.info("[Discovery] Authorization server for %s: %s", connector_name, auth_server)
         return auth_server
@@ -218,19 +243,16 @@ class OAuthDiscovery:
         logger.info("[Discovery] Fetching authorization server metadata: %s", wellknown_url)
         server_response = await client.get(wellknown_url)
 
-        if server_response.status_code != _HTTP_OK:
-            logger.error(
-                "[Discovery] Auth server metadata failed for %s: %s %s",
-                connector_name,
-                server_response.status_code,
-                server_response.text[:500].replace("\r", "\\r").replace("\n", "\\n"),
-            )
-            raise ValueError(
-                f"OAuth authorization server discovery failed for {connector_name}: "
-                f"HTTP {server_response.status_code}"
-            )
+        _raise_for_discovery_status(
+            server_response, connector_name, "authorization server discovery"
+        )
 
-        return server_response.json()
+        try:
+            return server_response.json()
+        except ValueError as exc:
+            raise ValueError(
+                f"Authorization server discovery returned non-JSON response for {connector_name}"
+            ) from exc
 
     def get_cached_metadata(self, connector_name: str) -> dict[str, str] | None:
         """Return cached discovery metadata, or None if not yet discovered."""
@@ -271,13 +293,19 @@ class OAuthDiscovery:
                 "[Discovery] Dynamic registration failed for %s: %s %s",
                 connector_name,
                 response.status_code,
-                response.text[:500].replace("\r", "\\r").replace("\n", "\\n"),
+                response.text[:_MAX_ERROR_LOG_LENGTH].replace("\r", "\\r").replace("\n", "\\n"),
             )
             raise ValueError(
                 f"Dynamic registration failed for {connector_name}: HTTP {response.status_code}"
             )
 
-        return _parse_registration(response.json(), connector_name, redirect_uri)
+        try:
+            registration_response = response.json()
+        except ValueError as exc:
+            raise ValueError(
+                f"Dynamic registration returned non-JSON response for {connector_name}"
+            ) from exc
+        return _parse_registration(registration_response, connector_name, redirect_uri)
 
 
 # =============================================================================

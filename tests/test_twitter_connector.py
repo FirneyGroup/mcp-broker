@@ -92,6 +92,20 @@ class TestRegistration:
         assert twitter_connector.meta.mcp_url is None
         assert twitter_connector.meta.is_native
 
+    def test_timeline_schema_advertises_five_to_hundred(self):
+        from connectors.twitter.adapter import _GET_MY_TWEETS_META
+
+        # The schema range must match the real clamp floor (X timeline min = 5).
+        description = _GET_MY_TWEETS_META.input_schema["properties"]["max_results"]["description"]
+        assert "5-100" in description
+
+    def test_search_schema_advertises_ten_to_hundred(self):
+        from connectors.twitter.adapter import _SEARCH_TWEETS_META
+
+        # The schema range must match the real clamp floor (X search min = 10).
+        description = _SEARCH_TWEETS_META.input_schema["properties"]["max_results"]["description"]
+        assert "10-100" in description
+
 
 # =============================================================================
 # OAUTH — build_token_request_auth
@@ -191,9 +205,10 @@ class TestPostTweet:
     """Tests for the post_tweet tool."""
 
     async def test_posts_tweet_successfully(self, twitter_connector):
-        mock_response = {"data": {"id": "123456", "text": "Hello world"}}
+        # post_tweet returns the unwrapped tweet object, matching get_me/timeline/search.
+        mock_tweet = {"id": "123456", "text": "Hello world"}
         with patch("connectors.twitter.adapter._post_tweet_sync") as mock_post:
-            mock_post.return_value = mock_response
+            mock_post.return_value = mock_tweet
             content_blocks = await twitter_connector.post_tweet(
                 access_token="fake_token", text="Hello world"
             )
@@ -202,7 +217,7 @@ class TestPostTweet:
         assert len(content_blocks) == 1
         assert content_blocks[0]["type"] == "text"
         parsed = json.loads(content_blocks[0]["text"])
-        assert parsed["data"]["id"] == "123456"
+        assert parsed["id"] == "123456"
 
     async def test_rejects_text_over_280_chars(self, twitter_connector):
         long_text = "x" * 281
@@ -217,9 +232,9 @@ class TestPostTweet:
 
     async def test_allows_exactly_280_chars(self, twitter_connector):
         text_280 = "x" * 280
-        mock_response = {"data": {"id": "999", "text": text_280}}
+        mock_tweet = {"id": "999", "text": text_280}
         with patch("connectors.twitter.adapter._post_tweet_sync") as mock_post:
-            mock_post.return_value = mock_response
+            mock_post.return_value = mock_tweet
             content_blocks = await twitter_connector.post_tweet(
                 access_token="fake_token", text=text_280
             )
@@ -232,11 +247,42 @@ class TestPostTweet:
                 await twitter_connector.post_tweet(access_token="fake_token", text="x" * 281)
             mock_post.assert_not_called()
 
+    async def test_rejects_141_cjk_chars_as_weighted_282(self, twitter_connector):
+        # CJK weighs 2: 141 chars = 282 weighted > 280.
+        cjk_text = "茶" * 141
+        with patch("connectors.twitter.adapter._post_tweet_sync") as mock_post:
+            with pytest.raises(ValueError, match="282 weighted"):
+                await twitter_connector.post_tweet(access_token="fake_token", text=cjk_text)
+            mock_post.assert_not_called()
+
+    async def test_allows_140_cjk_chars_as_weighted_280(self, twitter_connector):
+        # 140 CJK chars = 280 weighted, exactly at the limit.
+        cjk_text = "茶" * 140
+        with patch("connectors.twitter.adapter._post_tweet_sync") as mock_post:
+            mock_post.return_value = {"id": "1", "text": cjk_text}
+            content_blocks = await twitter_connector.post_tweet(
+                access_token="fake_token", text=cjk_text
+            )
+
+        assert len(content_blocks) == 1
+
+    async def test_url_counts_as_fixed_23_weighted(self, twitter_connector):
+        # A 100-char URL counts as 23, so 23 + 250 ASCII = 273 <= 280.
+        url = "https://example.com/" + "a" * 80  # 100 chars total
+        text = url + " " + "x" * 249  # +1 space +249 = 250 ASCII outside the URL
+        with patch("connectors.twitter.adapter._post_tweet_sync") as mock_post:
+            mock_post.return_value = {"id": "1", "text": text}
+            content_blocks = await twitter_connector.post_tweet(
+                access_token="fake_token", text=text
+            )
+
+        assert len(content_blocks) == 1
+
     async def test_dispatch_via_mcp(self, twitter_connector):
         """Verify post_tweet works through handle_mcp_request dispatch."""
-        mock_response = {"data": {"id": "789", "text": "dispatched"}}
+        mock_tweet = {"id": "789", "text": "dispatched"}
         with patch("connectors.twitter.adapter._post_tweet_sync") as mock_post:
-            mock_post.return_value = mock_response
+            mock_post.return_value = mock_tweet
             response = await twitter_connector.handle_mcp_request(
                 method="tools/call",
                 params={"name": "post_tweet", "arguments": {"text": "dispatched"}},
@@ -246,6 +292,47 @@ class TestPostTweet:
 
         assert "result" in response
         assert len(response["result"]["content"]) == 1
+
+    def test_sync_raises_sanitized_value_error_on_errors(self):
+        """When X returns errors and no data, _post_tweet_sync raises a sanitized
+        ValueError summarizing the error titles — no URLs or tokens leak through."""
+        from types import SimpleNamespace
+
+        from connectors.twitter.adapter import _post_tweet_sync
+
+        # xdk returns a Pydantic envelope at runtime; model_dump() yields this dict.
+        envelope = {
+            "data": None,
+            "errors": [
+                {
+                    "title": "Forbidden",
+                    "detail": "https://api.x.com/oops",
+                    "type": "https://api.x.com/problems/duplicate",
+                }
+            ],
+        }
+        fake_client = SimpleNamespace(posts=SimpleNamespace(create=lambda body: envelope))
+        with patch("connectors.twitter.adapter.XClient", return_value=fake_client):
+            with pytest.raises(ValueError, match="Forbidden") as exc_info:
+                _post_tweet_sync("fake_token", "dup tweet")
+
+        message = str(exc_info.value)
+        assert "https://" not in message
+        assert "fake_token" not in message
+
+    def test_sync_unwraps_data_on_success(self):
+        """On success _post_tweet_sync returns the unwrapped tweet object, not the
+        {data, errors} envelope."""
+        from types import SimpleNamespace
+
+        from connectors.twitter.adapter import _post_tweet_sync
+
+        envelope = {"data": {"id": "555", "text": "ok"}, "errors": None}
+        fake_client = SimpleNamespace(posts=SimpleNamespace(create=lambda body: envelope))
+        with patch("connectors.twitter.adapter.XClient", return_value=fake_client):
+            tweet = _post_tweet_sync("fake_token", "ok")
+
+        assert tweet == {"id": "555", "text": "ok"}
 
 
 # =============================================================================
@@ -348,12 +435,14 @@ class TestGetMyTweets:
 
         mock_get.assert_called_once_with("fake_token", 100)
 
-    async def test_clamps_negative_to_one(self, twitter_connector):
+    async def test_clamps_below_minimum_to_timeline_floor(self, twitter_connector):
+        # X timeline endpoint 400s on max_results < 5, even though the schema
+        # advertises a 5-100 range — clamp up to the floor instead of forwarding 1.
         with patch("connectors.twitter.adapter._get_my_tweets_sync") as mock_get:
             mock_get.return_value = []
-            await twitter_connector.get_my_tweets(access_token="fake_token", max_results=-5)
+            await twitter_connector.get_my_tweets(access_token="fake_token", max_results=1)
 
-        mock_get.assert_called_once_with("fake_token", 1)
+        mock_get.assert_called_once_with("fake_token", 5)
 
     async def test_default_max_results(self, twitter_connector):
         with patch("connectors.twitter.adapter._get_my_tweets_sync") as mock_get:
@@ -392,6 +481,17 @@ class TestSearchTweets:
             )
 
         mock_search.assert_called_once_with("fake_token", "test", 100)
+
+    async def test_clamps_below_minimum_to_search_floor(self, twitter_connector):
+        # X recent-search endpoint 400s on max_results < 10 — clamp up rather
+        # than forward the advertised-but-invalid value of 1.
+        with patch("connectors.twitter.adapter._search_tweets_sync") as mock_search:
+            mock_search.return_value = []
+            await twitter_connector.search_tweets(
+                access_token="fake_token", query="test", max_results=1
+            )
+
+        mock_search.assert_called_once_with("fake_token", "test", 10)
 
     async def test_default_max_results(self, twitter_connector):
         with patch("connectors.twitter.adapter._search_tweets_sync") as mock_search:
@@ -598,7 +698,8 @@ class TestToolDispatchErrors:
         assert response["error"]["code"] == -32602
 
     async def test_tool_exception_returns_is_error(self, twitter_connector):
-        """When a tool raises, MCP returns isError=True with the message."""
+        """A non-ValueError exception returns isError=True with a generic message —
+        the raw exception text is withheld (leak prevention); only the tool name leaks."""
         with patch("connectors.twitter.adapter._get_me_sync") as mock_get:
             mock_get.side_effect = RuntimeError("API rate limited")
             response = await twitter_connector.handle_mcp_request(
@@ -609,7 +710,9 @@ class TestToolDispatchErrors:
             )
 
         assert response["result"]["isError"] is True
-        assert "API rate limited" in response["result"]["content"][0]["text"]
+        text = response["result"]["content"][0]["text"]
+        assert "API rate limited" not in text
+        assert "get_me" in text
 
 
 # =============================================================================
@@ -660,20 +763,29 @@ class TestSyncHelpers:
             _extract_user_id("not_a_user")
 
     def test_clamp_max_results_caps_at_100(self):
-        from connectors.twitter.adapter import _clamp_max_results
+        from connectors.twitter.adapter import MIN_TIMELINE_RESULTS, _clamp_max_results
 
-        assert _clamp_max_results(200) == 100
+        assert _clamp_max_results(200, MIN_TIMELINE_RESULTS) == 100
 
-    def test_clamp_max_results_floors_at_1(self):
-        from connectors.twitter.adapter import _clamp_max_results
+    def test_clamp_max_results_floors_at_timeline_minimum(self):
+        from connectors.twitter.adapter import MIN_TIMELINE_RESULTS, _clamp_max_results
 
-        assert _clamp_max_results(0) == 1
-        assert _clamp_max_results(-10) == 1
+        # X timeline endpoint rejects max_results < 5.
+        assert _clamp_max_results(0, MIN_TIMELINE_RESULTS) == 5
+        assert _clamp_max_results(-10, MIN_TIMELINE_RESULTS) == 5
+        assert _clamp_max_results(1, MIN_TIMELINE_RESULTS) == 5
+
+    def test_clamp_max_results_floors_at_search_minimum(self):
+        from connectors.twitter.adapter import MIN_SEARCH_RESULTS, _clamp_max_results
+
+        # X recent-search endpoint rejects max_results < 10.
+        assert _clamp_max_results(1, MIN_SEARCH_RESULTS) == 10
+        assert _clamp_max_results(0, MIN_SEARCH_RESULTS) == 10
 
     def test_clamp_max_results_passes_through_valid(self):
-        from connectors.twitter.adapter import _clamp_max_results
+        from connectors.twitter.adapter import MIN_TIMELINE_RESULTS, _clamp_max_results
 
-        assert _clamp_max_results(50) == 50
+        assert _clamp_max_results(50, MIN_TIMELINE_RESULTS) == 50
 
     def test_mcp_text_content_format(self):
         from connectors.twitter.adapter import _mcp_text_content
@@ -788,3 +900,65 @@ class TestSyncHelpers:
         with patch("connectors.twitter.adapter.XClient", return_value=fake_client):
             with pytest.raises(ValueError, match="Unexpected create response"):
                 _post_thread_sync("fake_token", ["a", "b", "c"])
+
+
+# =============================================================================
+# WEIGHTED TWEET LENGTH
+# =============================================================================
+
+
+class TestWeightedTweetLength:
+    """Unit tests for the twitter-text v3 weighted length helper."""
+
+    def test_ascii_weighs_one_per_char(self):
+        from connectors.twitter.adapter import _weighted_tweet_length
+
+        assert _weighted_tweet_length("x" * 280) == 280
+
+    def test_basic_latin_range_weighs_one(self):
+        # U+0000-U+10FF bucket: a Latin Extended char (U+0100) weighs 1.
+        from connectors.twitter.adapter import _weighted_tweet_length
+
+        assert _weighted_tweet_length("ĀĀĀ") == 3
+
+    def test_general_punctuation_range_weighs_one(self):
+        # U+2000-U+200A (en quad) and U+2010-U+201F (hyphen, quotes) weigh 1.
+        from connectors.twitter.adapter import _weighted_tweet_length
+
+        assert _weighted_tweet_length(" ‐“") == 3
+
+    def test_prime_range_weighs_one(self):
+        # U+2032-U+2037 (primes) weigh 1.
+        from connectors.twitter.adapter import _weighted_tweet_length
+
+        assert _weighted_tweet_length("′″‷") == 3
+
+    def test_cjk_weighs_two_per_char(self):
+        # CJK (U+8336) is outside the weight-1 ranges → weighs 2.
+        from connectors.twitter.adapter import _weighted_tweet_length
+
+        assert _weighted_tweet_length("茶茶") == 4
+
+    def test_symbol_outside_weight_one_ranges_weighs_two(self):
+        # U+2049 (exclamation-question mark) is above U+2037 → weighs 2.
+        from connectors.twitter.adapter import _weighted_tweet_length
+
+        assert _weighted_tweet_length("⁉") == 2
+
+    def test_url_with_scheme_counts_as_23(self):
+        from connectors.twitter.adapter import URL_WEIGHTED_LENGTH, _weighted_tweet_length
+
+        url = "https://example.com/" + "a" * 200
+        assert _weighted_tweet_length(url) == URL_WEIGHTED_LENGTH
+
+    def test_url_plus_text_sums_correctly(self):
+        from connectors.twitter.adapter import _weighted_tweet_length
+
+        # 23 (URL) + 1 (space) + 5 (ascii) = 29.
+        assert _weighted_tweet_length("https://example.com/foo hello") == 29
+
+    def test_bare_domain_not_treated_as_url(self):
+        # Documented approximation: no scheme → counted per character (over-counts).
+        from connectors.twitter.adapter import _weighted_tweet_length
+
+        assert _weighted_tweet_length("example.com") == len("example.com")

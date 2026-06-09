@@ -20,7 +20,7 @@ _MCP_URL = os.environ.get("WORKSPACE_MCP_URL", "http://workspace-mcp:8000/mcp")
 # create_calendar_event, update_spreadsheet, etc.) alongside read tools.
 # A compromised token grants read+write to Gmail, Drive, Calendar, Docs, Sheets.
 # For read-only deployments, replace with .readonly variants.
-_GOOGLE_SCOPES = [
+_GOOGLE_SCOPES = (
     "openid",
     "email",
     "profile",
@@ -29,7 +29,7 @@ _GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/documents",
     "https://www.googleapis.com/auth/spreadsheets",
-]
+)
 
 
 class WorkspaceMcpConnector(BaseConnector):

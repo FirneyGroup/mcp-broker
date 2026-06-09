@@ -244,7 +244,7 @@ class TestBrokerAuthMiddleware:
         config = BrokerAppConfig()
         registry = BrokerClientRegistry({"client": {"app": config}})
         ct_store = ConnectTokenStore()
-        token = ct_store.create("client:app")
+        token = await ct_store.create("client:app")
         middleware = self._make_middleware(store, registry, ct_store)
 
         request = MagicMock()
@@ -541,6 +541,61 @@ class TestAdminAPI:
         body = json.loads(response.body)
         assert body["deleted"] is True
         assert body["tokens_deleted"] == 0
+
+    async def test_create_key_purges_orphaned_tokens(self, admin_setup, tmp_path: Path) -> None:
+        """Creating a key for an app with no existing key purges orphaned tokens,
+        so a re-provisioned app_key cannot inherit a prior incarnation's data."""
+        from broker.api.admin import AdminEndpoints
+        from broker.models.connection import AppConnection
+        from broker.services.store import SQLiteTokenStore
+
+        store, registry = admin_setup
+        token_store = SQLiteTokenStore(db_path=str(tmp_path / "tokens.db"))
+        await token_store.save(
+            "my_company:app1",
+            "notion",
+            AppConnection(connector_name="notion", access_token="orphaned"),
+        )
+        endpoints = AdminEndpoints(
+            store, "test-admin-key-long", registry, ConnectTokenStore(), token_store=token_store
+        )
+        request = MagicMock()
+        request.headers = {"x-admin-key": "test-admin-key-long"}
+        request.json = AsyncMock(return_value={"app_key": "my_company:app1"})
+
+        response = await endpoints.create_key(request)
+        assert response.status_code == 201
+        # Orphaned connection from the prior incarnation is gone.
+        assert await token_store.list_for_app("my_company:app1") == []
+
+    async def test_create_key_over_existing_does_not_purge(
+        self, admin_setup, tmp_path: Path
+    ) -> None:
+        """Creating a key for an app that already has one returns 409 and must NOT
+        purge that live app's tokens (the has_key gate prevents the footgun)."""
+        from broker.api.admin import AdminEndpoints
+        from broker.models.connection import AppConnection
+        from broker.services.store import SQLiteTokenStore
+
+        store, registry = admin_setup
+        await store.create_key("my_company:app1")
+        token_store = SQLiteTokenStore(db_path=str(tmp_path / "tokens.db"))
+        await token_store.save(
+            "my_company:app1",
+            "notion",
+            AppConnection(connector_name="notion", access_token="live"),
+        )
+        endpoints = AdminEndpoints(
+            store, "test-admin-key-long", registry, ConnectTokenStore(), token_store=token_store
+        )
+        request = MagicMock()
+        request.headers = {"x-admin-key": "test-admin-key-long"}
+        request.json = AsyncMock(return_value={"app_key": "my_company:app1"})
+
+        response = await endpoints.create_key(request)
+        assert response.status_code == 409
+        # Live app's tokens are untouched.
+        assert len(await token_store.list_for_app("my_company:app1")) == 1
 
     async def test_create_connect_token(self, admin_setup) -> None:
         """Test connect token creation directly via endpoint handler."""
@@ -941,35 +996,35 @@ class TestAdminAPI:
 
 
 class TestConnectTokenStore:
-    def test_create_and_consume(self) -> None:
+    async def test_create_and_consume(self) -> None:
         store = ConnectTokenStore()
-        token = store.create("client:app")
+        token = await store.create("client:app")
         assert token.startswith(CONNECT_TOKEN_PREFIX)
-        assert store.consume(token) == "client:app"
+        assert await store.consume(token) == "client:app"
 
-    def test_single_use(self) -> None:
+    async def test_single_use(self) -> None:
         """Token consumed on first use, second use returns None."""
         store = ConnectTokenStore()
-        token = store.create("client:app")
-        assert store.consume(token) == "client:app"
-        assert store.consume(token) is None
+        token = await store.create("client:app")
+        assert await store.consume(token) == "client:app"
+        assert await store.consume(token) is None
 
-    def test_invalid_token(self) -> None:
+    async def test_invalid_token(self) -> None:
         store = ConnectTokenStore()
-        assert store.consume("ct_nonexistent") is None
+        assert await store.consume("ct_nonexistent") is None
 
-    def test_expired_token(self) -> None:
+    async def test_expired_token(self) -> None:
         """Expired tokens return None."""
         import time
         from unittest.mock import patch
 
         store = ConnectTokenStore()
-        token = store.create("client:app")
+        token = await store.create("client:app")
 
         # Fast-forward past TTL
         with patch("broker.services.api_key_store.time") as mock_time:
             mock_time.time.return_value = time.time() + 400
-            assert store.consume(token) is None
+            assert await store.consume(token) is None
 
     async def test_middleware_connect_token_flow(self, tmp_path: Path) -> None:
         """Middleware validates connect token for /oauth/*/connect."""
@@ -982,7 +1037,7 @@ class TestConnectTokenStore:
         registry = BrokerClientRegistry({"client": {"app": config}})
         ct_store = ConnectTokenStore()
 
-        token = ct_store.create("client:app")
+        token = await ct_store.create("client:app")
 
         middleware = BrokerAuthMiddleware(
             app=MagicMock(),

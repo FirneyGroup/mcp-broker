@@ -23,8 +23,13 @@ _DOCKER_SERVICE_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9_-]*[a-zA-Z0-
 
 
 def _is_internal_url(url: str) -> bool:
-    """Return True for Docker service names and localhost (dev)."""
-    hostname = urlparse(url).hostname or ""
+    """Return True for Docker service names and localhost (dev).
+
+    The dot-free hostname allowance encodes the Docker-service-name convention
+    (e.g. ``workspace-mcp``) and applies only to code-reviewed ``ConnectorMeta``
+    constants — it is NOT a guard against untrusted input.
+    """
+    hostname = (urlparse(url).hostname or "").lower()
     if hostname == "localhost":
         return True
     return bool(_DOCKER_SERVICE_NAME_PATTERN.match(hostname))
@@ -67,7 +72,10 @@ class ConnectorMeta(BaseModel):
         default=None,
         description="OAuth token exchange endpoint (required when auth_mode='broker')",
     )
-    scopes: list[str] = Field(default_factory=list, description="OAuth scopes to request")
+    # Tuple, not list: ConnectorMeta is frozen, but frozen does not freeze list
+    # contents — a list would let scopes (which feed the authorize URL) be
+    # mutated by reference. Pydantic coerces the list literals in adapters.
+    scopes: tuple[str, ...] = Field(default=(), description="OAuth scopes to request")
     supports_pkce: bool = Field(
         default=True,
         description="Whether the OAuth provider supports PKCE (S256). Default True per OAuth 2.1 spec.",
@@ -122,6 +130,12 @@ class ConnectorMeta(BaseModel):
             and not _is_internal_url(self.mcp_url)
         ):
             raise ValueError(f"mcp_url must use HTTPS for external URLs: {self.mcp_url}")
+
+        # Discovery base URL is fetched at startup to resolve OAuth endpoints —
+        # SSRF defence requires it to be HTTPS (no Docker-internal exemption: the
+        # remote auth server lives on the public internet).
+        if self.mcp_oauth_url and not self.mcp_oauth_url.startswith("https://"):
+            raise ValueError(f"mcp_oauth_url must use HTTPS: {self.mcp_oauth_url}")
 
         return self
 

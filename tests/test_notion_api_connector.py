@@ -116,7 +116,8 @@ class TestRegistration:
 
     def test_scopes_empty(self, notion_connector):
         # Notion uses integration-level capabilities, not OAuth scopes.
-        assert notion_connector.meta.scopes == []
+        # ConnectorMeta.scopes is a tuple, so the empty value is ().
+        assert notion_connector.meta.scopes == ()
 
     def test_does_not_support_pkce(self, notion_connector):
         assert notion_connector.meta.supports_pkce is False
@@ -813,7 +814,9 @@ class TestToolDispatchErrors:
         assert response["error"]["code"] == -32602
 
     async def test_tool_exception_returns_is_error(self, notion_connector):
-        # A raising tool surfaces as result.isError == True (the dispatcher catches all).
+        # A non-ValueError exception surfaces as result.isError == True with a
+        # generic message — the raw exception text is withheld to avoid leaking
+        # SDK response bodies/tokens; only the tool name is exposed.
         with patch("connectors.notion_api.adapter._send", new_callable=AsyncMock) as mock_send:
             mock_send.side_effect = RuntimeError("upstream blew up")
             response = await notion_connector.handle_mcp_request(
@@ -827,7 +830,9 @@ class TestToolDispatchErrors:
             )
 
         assert response["result"]["isError"] is True
-        assert "upstream blew up" in response["result"]["content"][0]["text"]
+        text = response["result"]["content"][0]["text"]
+        assert "upstream blew up" not in text
+        assert "query_data_source" in text
 
 
 # =============================================================================
@@ -1381,3 +1386,191 @@ class TestReviewFixRegressions:
         assert _resolve_upload_bytes(content_base64="aGVsbG8=", text_content=None) == b"hello"
         with pytest.raises(ValueError):
             _resolve_upload_bytes(content_base64="aGVs!bG8=", text_content=None)
+
+
+# =============================================================================
+# AUDIT-FIX REGRESSIONS — silent truncation, fetch 400 fallback, partial creates,
+# match validation, upload-size cap
+# =============================================================================
+
+
+class TestPaginationTruncation:
+    """A page that over-returns past the cap must report has_more/truncated, not drop rows silently."""
+
+    async def test_paginate_get_reports_has_more_when_server_overfills_one_page(self):
+        # The server holds 50 rows. With the fix the helper asks for page_size=10 (the cap), so the
+        # server returns 10 rows + has_more=True. Pre-fix it asked for page_size=100, got all 50 in
+        # one page with has_more=False, then sliced to 10 — losing 40 rows under a false has_more.
+        from connectors.notion_api.client import _paginate_get
+
+        async def fake_request(_client, _token, _method, _path, *, params=None, **_kw):
+            requested = params["page_size"]
+            held = 50
+            returned = min(requested, held)
+            return {
+                "results": [{"id": f"u{i}"} for i in range(returned)],
+                "has_more": returned < held,
+                "next_cursor": "cursor" if returned < held else None,
+            }
+
+        with patch("connectors.notion_api.client._request", new=fake_request):
+            items, has_more, cursor = await _paginate_get(None, "fake", "/users", 10)
+
+        assert len(items) == 10  # exactly the cap, no over-fetch
+        assert has_more is True  # rows remain — must NOT report "nothing left"
+        assert cursor == "cursor"
+
+    async def test_query_data_source_truncated_flag_set_when_page_overfills(self, notion_connector):
+        # Adapter-level mirror: with the fix the query asks for page_size=10, the server returns 10
+        # rows + has_more=True, and the tool's truncated flag is True. Pre-fix the unconditional
+        # page_size=100 pulled all 50 rows in one has_more=False page → truncated=False (rows lost).
+        schema_response = _mock_response(200, {"id": _HEX_B, "properties": {}})
+
+        async def fake_request(_client, _token, _method, path, *, json_body=None, **_kw):
+            requested = json_body["page_size"]
+            held = 50
+            returned = min(requested, held)
+            return {
+                "results": [
+                    {"id": f"row-{i}", "url": f"https://notion.so/row-{i}", "properties": {}}
+                    for i in range(returned)
+                ],
+                "has_more": returned < held,
+                "next_cursor": "cursor" if returned < held else None,
+            }
+
+        with (
+            patch("connectors.notion_api.adapter._send", new_callable=AsyncMock) as mock_send,
+            patch("connectors.notion_api.adapter._request", new=fake_request),
+        ):
+            mock_send.return_value = schema_response
+            content = await notion_connector.query_data_source(
+                access_token="fake", data_source=_HEX_B, max_rows=10
+            )
+
+        payload = json.loads(content[0]["text"])
+        assert payload["count"] == 10
+        assert payload["has_more"] is True
+        assert payload["truncated"] is True
+
+    async def test_paginate_get_terminates_on_empty_page_with_has_more(self):
+        # A server can return an empty results list while still claiming has_more=True. Without the
+        # empty-page break this loops forever; the break makes it terminate after one fetch.
+        from connectors.notion_api.client import _paginate_get
+
+        page = {"results": [], "has_more": True, "next_cursor": "always-more"}
+        with patch("connectors.notion_api.client._request", new_callable=AsyncMock) as mock_request:
+            mock_request.return_value = page
+            items, has_more, _cursor = await _paginate_get(None, "fake", "/x", 100)
+
+        assert items == []
+        assert has_more is True
+        assert mock_request.call_count == 1  # did not loop on the empty page
+
+
+class TestFetchFallbackOnNon200:
+    """fetch must fall back to data-source resolution on ANY non-200 page probe, not just 404."""
+
+    async def _run_fetch_with_page_status(self, notion_connector, page_status: int):
+        ds_schema = {"id": _HEX_B, "properties": {"Name": {"type": "title"}}}
+
+        async def fake_send(_client, _token, _method, path, **_kw):
+            if path.startswith("/pages/"):
+                return _mock_response(page_status)
+            if path.startswith("/data_sources/"):
+                return _mock_response(200, ds_schema)
+            return _mock_response(404)
+
+        with patch("connectors.notion_api.adapter._send", new=fake_send):
+            content = await notion_connector.fetch(access_token="fake", notion_id=_HEX_B)
+        return json.loads(content[0]["text"])
+
+    async def test_page_probe_400_takes_data_source_branch(self, notion_connector):
+        # Notion answers 400 (not 404) when a data-source id is sent to GET /pages. Pre-fix the
+        # 404-only check fell through to _check_status and raised, so the data-source path was dead.
+        payload = await self._run_fetch_with_page_status(notion_connector, 400)
+        assert payload["kind"] == "data_source"
+        assert payload["data_source_id"] == _HEX_B
+
+    async def test_page_probe_404_takes_data_source_branch(self, notion_connector):
+        payload = await self._run_fetch_with_page_status(notion_connector, 404)
+        assert payload["kind"] == "data_source"
+        assert payload["data_source_id"] == _HEX_B
+
+
+class TestCreatePagesPartialFailure:
+    """create_pages must cap batch size and never lose the record of pages already written."""
+
+    async def test_rejects_batch_over_cap(self, notion_connector):
+        from connectors.notion_api.adapter import MAX_PAGES_PER_CALL
+
+        oversized = [{"properties": {"Name": "x"}} for _ in range(MAX_PAGES_PER_CALL + 1)]
+        with pytest.raises(ValueError, match="the limit is"):
+            await notion_connector.create_pages(access_token="fake", parent=_HEX_A, pages=oversized)
+
+    async def test_mid_loop_failure_returns_created_so_far_and_failed_at(self, notion_connector):
+        # Page index 1 fails on POST /pages; page index 0 was already written. The payload must
+        # report status=partial with the created page kept and failed_at=1 — never a lost write.
+        ds = _mock_response(200, {"id": _HEX_B, "properties": {"Name": {"type": "title"}}})
+
+        first_created = {
+            "id": "page-0",
+            "url": "https://notion.so/page-0",
+            "properties": {"Name": {"type": "title", "title": [{"plain_text": "A"}]}},
+        }
+        calls = {"n": 0}
+
+        async def fake_request(_client, _token, method, path, *, json_body=None, **_kw):
+            if (method, path) == ("POST", "/pages"):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return first_created
+                raise ValueError("Notion API error (409): conflict")
+            return {}
+
+        with (
+            patch("connectors.notion_api.adapter._send", new_callable=AsyncMock) as mock_send,
+            patch("connectors.notion_api.adapter._request", new=fake_request),
+        ):
+            mock_send.return_value = ds
+            content = await notion_connector.create_pages(
+                access_token="fake",
+                parent=_HEX_A,
+                pages=[{"properties": {"Name": "A"}}, {"properties": {"Name": "B"}}],
+            )
+
+        payload = json.loads(content[0]["text"])
+        assert payload["status"] == "partial"
+        assert payload["count"] == 1
+        assert payload["pages"][0]["title"] == "A"  # the written page is preserved
+        assert payload["failed_at"] == 1
+        assert "409" in payload["error"]
+
+
+class TestBuildFilterMatchValidation:
+    """_build_filter must reject an out-of-enum match instead of silently treating it as AND."""
+
+    def test_invalid_match_raises_with_value(self):
+        from connectors.notion_api.adapter import _build_filter
+
+        with pytest.raises(ValueError, match="bogus"):
+            _build_filter(
+                [{"property": "Status", "op": "equals", "value": "Done"}], "bogus", _STUB_SCHEMA
+            )
+
+
+class TestUploadFileSizeCap:
+    """upload_file must reject an oversized payload before any HTTP (OOM guard)."""
+
+    async def test_oversized_content_base64_raises_before_http(self, notion_connector):
+        from base64 import b64encode
+
+        from connectors.notion_api.adapter import MAX_UPLOAD_BYTES
+
+        oversized = b64encode(b"\x00" * (MAX_UPLOAD_BYTES + 1)).decode("ascii")
+        # No HTTP is patched: the size check must raise before _create_file_upload is reached,
+        # so an unpatched outbound call would itself fail the test if the guard were absent.
+        with pytest.raises(ValueError, match="upload limit"):
+            await notion_connector.upload_file(
+                access_token="fake", filename="big.bin", content_base64=oversized
+            )

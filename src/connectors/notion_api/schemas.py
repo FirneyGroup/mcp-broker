@@ -16,6 +16,12 @@ from connectors.notion_api.client import (
     MAX_ROWS_CAP,
 )
 
+# upload_file input bounds (mirror MAX_UPLOAD_BYTES = 20 MiB in adapter.py). Advertised in the
+# schema so the LLM/client rejects an oversized payload before sending it. Standard base64 encodes
+# 3 raw bytes as 4 chars (with padding), so 20 MiB of bytes is ceil(20*1024*1024/3)*4 chars.
+_MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+_MAX_CONTENT_BASE64_CHARS = -(-_MAX_UPLOAD_BYTES // 3) * 4  # ceil division, then *4
+
 _QUERY_DATA_SOURCE_META = NativeToolMeta(
     name="query_data_source",
     description=(
@@ -255,7 +261,10 @@ _CREATE_PAGES_META = NativeToolMeta(
         'string; date takes an ISO date string (e.g. "2026-06-15"); status & select take the '
         "option name (must already exist on the database); number takes a number; checkbox a bool; "
         "multi_select a list of names; people/relation a list of UUIDs. For a page parent, the only "
-        'property is the title, keyed "title". Returns the created pages\' ids and urls.'
+        'property is the title, keyed "title". At most 25 pages per call. Pages are created '
+        "sequentially; if one fails partway, the response is status='partial' with the pages that "
+        "were created, failed_at (the index that failed), and the error — retry only the unwritten "
+        "tail. On full success the response is status='ok' with the created pages' ids and urls."
     ),
     input_schema={
         "type": "object",
@@ -269,7 +278,8 @@ _CREATE_PAGES_META = NativeToolMeta(
             },
             "pages": {
                 "type": "array",
-                "description": "Pages to create (one POST each).",
+                "description": "Pages to create (one POST each). At most 25 per call.",
+                "maxItems": 25,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -699,13 +709,15 @@ _UPLOAD_FILE_META = NativeToolMeta(
             "text_content": {
                 "type": "string",
                 "description": "Plain-text file contents. Mutually exclusive with content_base64.",
+                "maxLength": _MAX_UPLOAD_BYTES,
             },
             "content_base64": {
                 "type": "string",
                 "description": (
                     "Base64-encoded file bytes for binary files. Mutually exclusive with "
-                    "text_content."
+                    "text_content. Files up to 20 MiB (single-part upload)."
                 ),
+                "maxLength": _MAX_CONTENT_BASE64_CHARS,
             },
             "content_type": {
                 "type": "string",

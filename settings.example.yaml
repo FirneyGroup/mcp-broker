@@ -46,6 +46,12 @@ store:
   backend: sqlite
   sqlite:
     db_path: ./data/tokens.db
+  # For multi-instance Cloud Run deployments, use Firestore Native mode:
+  # backend: firestore
+  # firestore:
+  #   project_id: my-gcp-project    # GCP project ID
+  #   database: "(default)"          # Firestore database name
+  #   collection_prefix: "prod_"     # Optional prefix for all collections
 
 # Per-app auth config — scopes and connector access control.
 # API keys are managed via the admin API (POST /admin/keys), not stored in YAML.

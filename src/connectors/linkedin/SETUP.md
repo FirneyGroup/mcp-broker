@@ -30,7 +30,7 @@ When a user clicks "Connect LinkedIn":
    - Production: `https://your-broker-domain/oauth/linkedin/callback`
 6. Copy the **Client ID** and **Client Secret** from the Auth tab
 
-> **Note:** With just the self-serve products, 3 of 10 tools work: `get_me`, `create_post` (as member), `delete_post` (own posts). The remaining 7 tools (org posts, comments, reactions, analytics) require Community Management API approval, which typically takes 1–5 business days.
+> **Note:** With just the self-serve products, 3 of 10 tools work: `get_me`, `create_post` (as member), `delete_post` (own posts). The remaining 7 tools (org posts, comments, reactions, analytics) require Community Management API approval, which typically takes 1–5 business days. Until the org scopes are added to `_SCOPES` in `adapter.py`, those 7 tools are hidden from `tools/list` so the LLM never sees them; a direct call to one of them is rejected as an unknown tool, and the per-tool guard raises a clear error pointing here before any HTTP request — so they fail safely either way rather than with an opaque 403.
 
 ## 2. Configure Environment
 
@@ -132,11 +132,12 @@ curl -s -X POST \
 | **Auth method** | `client_secret_post` — credentials sent as form body params (broker default) |
 | **Authorize URL** | `https://www.linkedin.com/oauth/v2/authorization` |
 | **Token URL** | `https://www.linkedin.com/oauth/v2/accessToken` |
-| **Scopes** | `openid`, `profile`, `w_member_social`, `w_member_social_feed`, `r_organization_social`, `w_organization_social`, `r_organization_social_feed`, `w_organization_social_feed`, `rw_organization_admin` |
+| **Scopes (requested)** | `openid`, `profile`, `w_member_social` — self-serve only |
+| **Scopes (org tier)** | Add `r_organization_social`, `w_organization_social`, `r_organization_social_feed`, `w_organization_social_feed`, `rw_organization_admin` to `_SCOPES` in `adapter.py` after Community Management API approval; the org tools stay gated off until then |
 | **PKCE** | Disabled — LinkedIn's standard OAuth flow rejects `code_verifier` |
 | **Access token TTL** | 60 days |
 | **Refresh token TTL** | 365 days |
-| **API version header** | `Linkedin-Version: 202501` (required on all requests) |
+| **API version header** | `Linkedin-Version: 202601` (required on `/rest/` requests) |
 | **No Basic Auth override** | Unlike Twitter/Reddit, LinkedIn uses body params — no `build_token_request_auth` override needed |
 
 ## Troubleshooting

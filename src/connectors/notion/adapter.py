@@ -39,7 +39,7 @@ class NotionConnector(BaseConnector):
         # Static URLs kept for documentation — ignored when mcp_oauth_url is set
         oauth_authorize_url="https://mcp.notion.com/authorize",
         oauth_token_url="https://mcp.notion.com/token",  # noqa: S106 — endpoint URL, not a password
-        scopes=[],
+        scopes=(),
         # Discovery — triggers MCP OAuth flow (RFC 8414 + RFC 7591)
         mcp_oauth_url="https://mcp.notion.com",
     )
@@ -56,10 +56,11 @@ class NotionConnector(BaseConnector):
 
     def build_auth_header(self, access_token: str) -> dict[str, str]:
         """Notion MCP requires Notion-Version alongside the Bearer token."""
-        return {
-            "Authorization": f"Bearer {access_token}",
-            "Notion-Version": NOTION_API_VERSION,
-        }
+        # Delegate the Bearer header to the base class so its control-character
+        # check (header-injection guard) still runs; then add Notion-Version.
+        headers = super().build_auth_header(access_token)
+        headers["Notion-Version"] = NOTION_API_VERSION
+        return headers
 
     def parse_token_response(self, raw_response: dict) -> dict:
         """Extract standard OAuth2 fields from Notion's response.
@@ -78,6 +79,9 @@ class NotionConnector(BaseConnector):
         }
         if "refresh_token" in raw_response:
             parsed["refresh_token"] = raw_response["refresh_token"]
+        # The hosted mcp.notion.com AS issues expires_in, so pass it through when
+        # present. (Legacy api.notion.com omits it, which is why the notion_api
+        # connector injects a synthetic TTL — that workaround is deliberately absent here.)
         if "expires_in" in raw_response:
             parsed["expires_in"] = raw_response["expires_in"]
         return parsed

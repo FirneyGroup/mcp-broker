@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import time
 from pathlib import Path
@@ -383,6 +384,52 @@ class TestBearer401:
         )
         assert response.status_code == 401
         assert response.headers["www-authenticate"].startswith("Bearer ")
+
+    async def test_oversized_bearer_short_circuits_before_hashing(
+        self,
+        middleware: BrokerAuthMiddleware,
+        key_store: SQLiteBrokerKeyStore,
+        registry: BrokerClientRegistry,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Regression: a 16KB bearer token must be rejected BEFORE SHA-256.
+
+        Valid broker-issued bearer tokens are ~43 chars. Every other
+        attacker-controlled credential in the middleware (broker key, connect
+        token) is bounded by MAX_KEY_LENGTH before crypto; the bearer token was
+        not, so an oversized header was hashed unconditionally.
+
+        The defended property is that no hash is computed: with the guard the
+        `bearer_validate_fail` audit event carries an EMPTY hash_prefix; without
+        it the event would carry the 8-char prefix of the token's real SHA-256.
+        Asserting on the empty prefix is what fails if the guard is removed (the
+        coarse 401 body alone is identical with or without the fix, because an
+        unrecognised hash also collapses to `not_found`).
+        """
+        oversized_bearer = "mcp_at_" + ("A" * 16384)
+        with caplog.at_level(logging.INFO):
+            response = await _verify(
+                middleware,
+                path="/proxy/notion/mcp",
+                bearer=oversized_bearer,
+                key_store=key_store,
+                registry=registry,
+            )
+
+        _assert_invalid_token_challenge(response)
+        body = json.loads(response.body)
+        assert body["error_description"] == "bearer token invalid or expired"
+
+        audit_events = [
+            json.loads(record.getMessage().removeprefix("[OAuthAudit] "))
+            for record in caplog.records
+            if record.getMessage().startswith("[OAuthAudit]")
+        ]
+        fail_events = [evt for evt in audit_events if evt["event"] == "bearer_validate_fail"]
+        assert len(fail_events) == 1
+        # Empty prefix proves no SHA-256 ran. The real hash of the oversized
+        # token would produce a non-empty 8-char prefix here.
+        assert fail_events[0]["hash_prefix"] == ""
 
     async def test_unknown_connector_in_path_returns_challenge(
         self,

@@ -24,6 +24,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from starlette.datastructures import FormData
 
 from broker.api.oauth_server import (
     OAuthServerEndpoints,
@@ -107,10 +108,18 @@ def _request_with_json(body: dict[str, Any], client_ip: str = GENERIC_CLIENT_IP)
     return request
 
 
-def _request_with_form(form: dict[str, str], headers: dict[str, str] | None = None):
-    """Build a ``Request``-like mock for form-body endpoints (`/token`, `/revoke`)."""
+def _request_with_form(
+    form: dict[str, str] | list[tuple[str, str]], headers: dict[str, str] | None = None
+):
+    """Build a ``Request``-like mock for form-body endpoints (`/token`, `/revoke`).
+
+    Returns a real ``FormData`` so the endpoint's duplicate-parameter check
+    (``form.multi_items()``) runs against the genuine type. Pass a list of pairs
+    to model duplicate keys (RFC 6749 §3.1 forbids them).
+    """
+    items = list(form.items()) if isinstance(form, dict) else form
     request = MagicMock()
-    request.form = AsyncMock(return_value=form)
+    request.form = AsyncMock(return_value=FormData(items))
     request.headers = headers or {}
     request.query_params = {}
     request.client.host = GENERIC_CLIENT_IP
@@ -1006,6 +1015,59 @@ class TestRevoke:
 # =============================================================================
 
 
+class TestDuplicateFormParams:
+    """RFC 6749 §3.1: request parameters MUST NOT appear more than once.
+
+    The ``dict(form)`` collapse is last-one-wins, so a duplicate would silently
+    let an attacker shadow a parameter the server validated. These exercise the
+    real ``FormData.multi_items()`` duplicate check on each form endpoint.
+    """
+
+    async def test_token_duplicate_code_rejected(self, endpoints: OAuthServerEndpoints) -> None:
+        client_id, code = await _approve_to_get_code(endpoints)
+        # `code` appears twice — second value shadows the first under dict collapse.
+        token_request = _request_with_form(
+            [
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("code", "second-injected-code"),
+                ("redirect_uri", GENERIC_REDIRECT_URI),
+                ("code_verifier", _VALID_VERIFIER),
+                ("client_id", client_id),
+                ("resource", GENERIC_RESOURCE),
+            ]
+        )
+        response = await endpoints.token(token_request)
+        assert response.status_code == 400
+        assert _response_body(response)["error"] == "invalid_request"
+
+    async def test_authorize_post_duplicate_param_rejected(
+        self, endpoints: OAuthServerEndpoints
+    ) -> None:
+        client_id = await _register_public_client(endpoints)
+        params = _authorize_params(client_id) | {"action": "approve"}
+        form_pairs = list(params.items())
+        form_pairs.append(("state", "second-state"))  # duplicate state
+        response = await endpoints.authorize_post(_request_with_form(form_pairs))
+        assert response.status_code == 400
+        # Pre-redirect HTML rejection — must not 302 to the client callback.
+        assert "location" not in response.headers
+
+    async def test_revoke_duplicate_token_rejected(self, endpoints: OAuthServerEndpoints) -> None:
+        client_id, access, _ = await _mint_initial_pair(endpoints)
+        response = await endpoints.revoke(
+            _request_with_form(
+                [
+                    ("token", access),
+                    ("token", "second-token"),
+                    ("client_id", client_id),
+                ]
+            )
+        )
+        assert response.status_code == 400
+        assert _response_body(response)["error"] == "invalid_request"
+
+
 class TestDisabled:
     async def test_all_endpoints_404_when_disabled(
         self, store: SQLiteInboundAuthStore, connector_names: list[str]
@@ -1029,34 +1091,34 @@ class TestDisabled:
 
 
 class TestRateLimiter:
-    def test_under_cap_allows(self) -> None:
+    async def test_under_cap_allows(self) -> None:
         limiter = _DCRRateLimiter(max_per_window=3, window_seconds=10)
-        assert limiter.allow("client-a")
-        assert limiter.allow("client-a")
-        assert limiter.allow("client-a")
-        assert not limiter.allow("client-a")
+        assert await limiter.allow("client-a")
+        assert await limiter.allow("client-a")
+        assert await limiter.allow("client-a")
+        assert not await limiter.allow("client-a")
 
-    def test_separate_ips_independent(self) -> None:
+    async def test_separate_ips_independent(self) -> None:
         limiter = _DCRRateLimiter(max_per_window=1, window_seconds=10)
-        assert limiter.allow("client-a")
-        assert limiter.allow("client-b")
-        assert not limiter.allow("client-a")
+        assert await limiter.allow("client-a")
+        assert await limiter.allow("client-b")
+        assert not await limiter.allow("client-a")
 
-    def test_cleanup_drops_ips_whose_timestamps_have_aged_out(self) -> None:
+    async def test_cleanup_drops_ips_whose_timestamps_have_aged_out(self) -> None:
         """Regression: without periodic cleanup, every one-shot IP would leak
         a dict entry indefinitely — attacker-controlled memory growth."""
         limiter = _DCRRateLimiter(max_per_window=5, window_seconds=10)
-        limiter.allow("one-shot-ip")
+        await limiter.allow("one-shot-ip")
         # Force every timestamp to be ``window_seconds`` in the past.
         stale_ts = time.time() - 20
         limiter._events["one-shot-ip"] = [stale_ts]
-        limiter.cleanup_expired()
+        await limiter.cleanup_expired()
         assert "one-shot-ip" not in limiter._events
 
-    def test_cleanup_keeps_ips_with_live_timestamps(self) -> None:
+    async def test_cleanup_keeps_ips_with_live_timestamps(self) -> None:
         limiter = _DCRRateLimiter(max_per_window=5, window_seconds=10)
-        limiter.allow("recent-ip")
-        limiter.cleanup_expired()
+        await limiter.allow("recent-ip")
+        await limiter.cleanup_expired()
         assert "recent-ip" in limiter._events
 
 
@@ -1500,8 +1562,8 @@ class TestOAuthEndpointsSingleton:
         # Hit the limiter via two separate factory invocations — under the
         # original bug, each invocation would yield a fresh limiter and the
         # second call would see an empty `_events` dict for "1.2.3.4".
-        broker_main._get_oauth_endpoints()._dcr_rate_limiter.allow("1.2.3.4")
-        broker_main._get_oauth_endpoints()._dcr_rate_limiter.allow("1.2.3.4")
+        await broker_main._get_oauth_endpoints()._dcr_rate_limiter.allow("1.2.3.4")
+        await broker_main._get_oauth_endpoints()._dcr_rate_limiter.allow("1.2.3.4")
         assert len(singleton._dcr_rate_limiter._events["1.2.3.4"]) == 2
 
     async def test_factory_returns_none_when_oauth_disabled(

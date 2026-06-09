@@ -30,7 +30,7 @@ class BigQueryConnector(BaseConnector):
         auth_mode="broker",
         oauth_authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
         oauth_token_url="https://oauth2.googleapis.com/token",  # noqa: S106 — endpoint URL, not a password
-        scopes=["https://www.googleapis.com/auth/bigquery.readonly"],
+        scopes=("https://www.googleapis.com/auth/bigquery.readonly",),
     )
 
     def customize_authorize_params(self, params: dict[str, str]) -> dict[str, str]:

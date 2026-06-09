@@ -25,7 +25,7 @@ class HubSpotConnector(BaseConnector):
         mcp_transport="sse",
         oauth_authorize_url="https://mcp.hubspot.com/oauth/authorize",
         oauth_token_url="https://mcp.hubspot.com/oauth/v3/token",  # noqa: S106 — endpoint URL, not a password
-        scopes=[],
+        scopes=(),
     )
 
     # Standard OAuth2 with client_secret_post — no hook overrides needed

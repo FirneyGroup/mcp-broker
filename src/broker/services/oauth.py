@@ -5,7 +5,6 @@ Handles authorization URL generation, code exchange, and token refresh.
 Uses PKCE (S256) for all flows. State parameter signed with itsdangerous.
 """
 
-import asyncio
 import hashlib
 import logging
 import secrets
@@ -19,20 +18,16 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from broker.connectors.base import BaseConnector, filter_token_response
 from broker.models.connection import AppConnection
 from broker.models.connector_config import ResolvedOAuth
+from broker.services.auth_store_interfaces import OutboundOAuthStateStore
 
 logger = logging.getLogger(__name__)
 
-# Single-use nonces to prevent replay attacks.
-# WARNING: In-memory only — lost on process restart. Any OAuth flow in progress
-# during restart will fail ("PKCE verifier not found"), which also blocks replay.
-# Acceptable for single-instance deployment. Multi-instance requires shared store.
-_consumed_nonces: set[str] = set()
-_nonce_timestamps: dict[str, float] = {}
+# === CONSTANTS ===
 
-# PKCE verifiers stored by nonce for retrieval during callback
-_pkce_verifiers: dict[str, str] = {}
-
-# Nonce TTL — 15 minutes (generous for OAuth flows)
+# Nonce TTL — 15 minutes (generous for OAuth flows).
+# This is only a cleanup horizon for the in-memory store, NOT the replay bound:
+# the ≤10-minute single-use replay window is enforced by _STATE_MAX_AGE (the
+# itsdangerous signature max_age), so the TTL is intentionally longer.
 _NONCE_TTL = 900
 
 # State token expiry — decode_state uses shorter window to ensure
@@ -55,16 +50,78 @@ TOKEN_REFRESH_BUFFER = 60
 _HTTP_OK = 200
 
 
+# Single-use nonces to prevent replay attacks.
+# WARNING: In-memory only — lost on process restart. Any OAuth flow in progress
+# during restart will fail ("PKCE verifier not found"), which also blocks replay.
+# Acceptable for single-instance deployment. Multi-instance requires shared store.
+class _InMemoryOutboundOAuthStateStore(OutboundOAuthStateStore):
+    """In-memory implementation of outbound OAuth state store.
+
+    WARNING: Single-process only. With multiple uvicorn workers, a nonce
+    created in worker A is invisible to worker B. Multi-worker deployments
+    need a shared backing store (Redis) or sticky-session routing.
+    """
+
+    def __init__(self):
+        self._nonce_timestamps: dict[str, float] = {}
+        self._pkce_verifiers: dict[str, str] = {}
+
+    async def store_nonce(self, nonce: str) -> None:
+        """Store a nonce with current timestamp."""
+        self._nonce_timestamps[nonce] = time.time()
+
+    async def consume_nonce(self, nonce: str) -> bool:
+        """Consume (remove) a nonce. Returns True if found, False on replay.
+
+        ``_nonce_timestamps`` is the single source of truth: consuming removes
+        the nonce, so a replay's ``consume_nonce`` returns False. (A separate
+        consumed-set would be defeated by ``cleanup_expired`` — see git history.)
+        """
+        if nonce in self._nonce_timestamps:
+            del self._nonce_timestamps[nonce]
+            return True
+        return False
+
+    async def store_pkce_verifier(self, nonce: str, verifier: str) -> None:
+        """Store PKCE verifier associated with a nonce."""
+        self._pkce_verifiers[nonce] = verifier
+
+    async def get_and_remove_pkce_verifier(self, nonce: str) -> str | None:
+        """Get and remove PKCE verifier for a nonce."""
+        return self._pkce_verifiers.pop(nonce, None)
+
+    async def cleanup_expired(self, max_age_seconds: int = _NONCE_TTL) -> None:
+        """Remove expired nonces and associated PKCE verifiers."""
+        now = time.time()
+        expired_nonces = [
+            nonce
+            for nonce, timestamp in self._nonce_timestamps.items()
+            if now - timestamp > max_age_seconds
+        ]
+        for nonce in expired_nonces:
+            del self._nonce_timestamps[nonce]
+            self._pkce_verifiers.pop(nonce, None)
+
+
+# Global singleton instance
+_outbound_state_store = _InMemoryOutboundOAuthStateStore()
+
+
 class OAuthHandler:
     """OAuth 2.1 flow handler with PKCE and signed state."""
 
-    def __init__(self, state_secret: str) -> None:
+    def __init__(
+        self, state_secret: str, state_store: OutboundOAuthStateStore | None = None
+    ) -> None:
         self._serializer = URLSafeTimedSerializer(state_secret)
-        self._refresh_locks: dict[str, asyncio.Lock] = {}
+        # Default to the process-local in-memory store so the single-instance
+        # behaviour is unchanged; the lifespan injects a Firestore-backed store
+        # when ``store.backend == "firestore"`` for multi-instance deployments.
+        self._state_store = state_store or _outbound_state_store
 
     # --- Public API ---
 
-    def build_authorize_url(
+    async def build_authorize_url(
         self,
         connector: BaseConnector,
         app_key: str,
@@ -72,16 +129,16 @@ class OAuthHandler:
         callback_url: str,
     ) -> str:
         """Build OAuth authorization URL with PKCE + signed state."""
-        self._cleanup_expired_nonces()
+        await self._state_store.cleanup_expired(_NONCE_TTL)
 
         nonce = secrets.token_urlsafe(32)
         state = self._sign_oauth_state(app_key, connector.meta.name, nonce)
-        _nonce_timestamps[nonce] = time.time()
+        await self._state_store.store_nonce(nonce)
 
         code_challenge = None
         if connector.meta.supports_pkce:
             code_verifier, code_challenge = _generate_pkce_pair()
-            _pkce_verifiers[nonce] = code_verifier
+            await self._state_store.store_pkce_verifier(nonce, code_verifier)
 
         params = self._build_authorize_params(
             connector,
@@ -108,7 +165,7 @@ class OAuthHandler:
         Raises:
             ValueError: If state is invalid, expired, or replayed.
         """
-        decoded_state = self._validate_and_consume_state(state)
+        decoded_state = await self._validate_and_consume_state(state, connector.meta.name)
         app_key = decoded_state["app_key"]
 
         auth_headers, body_credentials = connector.build_token_request_auth(resolved.credentials)
@@ -119,7 +176,9 @@ class OAuthHandler:
             **body_credentials,
         }
         if connector.meta.supports_pkce:
-            code_verifier = _pkce_verifiers.pop(decoded_state["nonce"], None)
+            code_verifier = await self._state_store.get_and_remove_pkce_verifier(
+                decoded_state["nonce"]
+            )
             if not code_verifier:
                 raise ValueError("PKCE verifier not found for this OAuth flow")
             token_request_body["code_verifier"] = code_verifier
@@ -140,7 +199,8 @@ class OAuthHandler:
     ) -> AppConnection:
         """Refresh token if expired. Returns connection unchanged if not needed.
 
-        Uses per-connector lock to prevent concurrent refresh races.
+        Caller (proxy.get_valid_token) holds per-app-per-connector lock,
+        so refresh is serialized at the app+connector level.
         """
         if connection.expires_at is None or connection.refresh_token is None:
             return connection
@@ -149,9 +209,7 @@ class OAuthHandler:
         if connection.expires_at > time.time() + TOKEN_REFRESH_BUFFER:
             return connection
 
-        lock = self._refresh_locks.setdefault(connector.meta.name, asyncio.Lock())
-        async with lock:
-            return await self._do_refresh(connector, connection, resolved)
+        return await self._do_refresh(connector, connection, resolved)
 
     async def _do_refresh(
         self,
@@ -188,10 +246,13 @@ class OAuthHandler:
         """
         try:
             return self._serializer.loads(state, max_age=max_age)
+        # noqa justification (B904): the itsdangerous exception can embed the signed
+        # state payload in its repr; chaining it would leak that payload into
+        # tracebacks and logs, so the chain is deliberately dropped.
         except SignatureExpired:
-            raise ValueError("OAuth state expired")  # noqa: B904
+            raise ValueError("OAuth state expired")  # noqa: B904 — drop chain to avoid leaking signed state payload
         except BadSignature:
-            raise ValueError("Invalid OAuth state signature")  # noqa: B904
+            raise ValueError("Invalid OAuth state signature")  # noqa: B904 — drop chain to avoid leaking signed state payload
 
     # --- Internal ---
 
@@ -200,25 +261,38 @@ class OAuthHandler:
         decoded_state = {"app_key": app_key, "connector": connector_name, "nonce": nonce}
         return self._serializer.dumps(decoded_state)
 
-    def _validate_and_consume_state(self, state: str) -> dict:
-        """Validate signature, check nonce, return decoded decoded_state.
+    async def _validate_and_consume_state(self, state: str, connector_name: str) -> dict:
+        """Validate signature, check nonce + connector binding, consume nonce.
+
+        ``connector_name`` is the connector actually handling the callback. The
+        signed state carries the connector it was minted for; binding them here
+        stops a state minted for connector A from completing connector B's flow.
 
         Raises:
-            ValueError: If state is expired, invalid, or replayed.
+            ValueError: If state is expired, invalid, replayed, or was minted
+                for a different connector.
         """
         try:
             decoded_state = self._serializer.loads(state, max_age=_STATE_MAX_AGE)
+        # noqa justification (B904): the itsdangerous exception can embed the signed
+        # state payload in its repr; chaining it would leak that payload into
+        # tracebacks and logs, so the chain is deliberately dropped.
         except SignatureExpired:
-            raise ValueError("OAuth state expired")  # noqa: B904
+            raise ValueError("OAuth state expired")  # noqa: B904 — drop chain to avoid leaking signed state payload
         except BadSignature:
-            raise ValueError("Invalid OAuth state signature")  # noqa: B904
+            raise ValueError("Invalid OAuth state signature")  # noqa: B904 — drop chain to avoid leaking signed state payload
+
+        # Bind the signed connector to the one handling this callback. Checked
+        # after signature validation so an attacker can't probe this on forged state.
+        if decoded_state.get("connector") != connector_name:
+            raise ValueError("OAuth state connector mismatch")
 
         nonce = decoded_state["nonce"]
 
-        self._cleanup_expired_nonces()
-        if nonce in _consumed_nonces:
-            raise ValueError("OAuth state already used (replay)")
-        _consumed_nonces.add(nonce)
+        await self._state_store.cleanup_expired(_NONCE_TTL)
+        # Single-use: consume_nonce removes the nonce, so a replay finds it gone.
+        if not await self._state_store.consume_nonce(nonce):
+            raise ValueError("OAuth state already used (replay) or expired")
 
         return decoded_state
 
@@ -296,17 +370,6 @@ class OAuthHandler:
         parsed = connector.parse_token_response(response_body)
         return filter_token_response(parsed)
 
-    def _cleanup_expired_nonces(self) -> None:
-        """Remove nonces older than TTL."""
-        now = time.time()
-        expired = [
-            nonce for nonce, timestamp in _nonce_timestamps.items() if now - timestamp > _NONCE_TTL
-        ]
-        for nonce in expired:
-            _consumed_nonces.discard(nonce)
-            _nonce_timestamps.pop(nonce, None)
-            _pkce_verifiers.pop(nonce, None)
-
 
 # === Module-Level Helpers ===
 
@@ -359,6 +422,7 @@ def _build_connection_from_token(
         scopes=(
             token_response.get("scope", "").split()
             if token_response.get("scope")
-            else connector.meta.scopes
+            # meta.scopes is a tuple (frozen, immutable); AppConnection.scopes is list.
+            else list(connector.meta.scopes)
         ),
     )

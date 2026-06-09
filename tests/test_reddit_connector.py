@@ -260,11 +260,15 @@ class TestInputValidation:
 def _mock_httpx_response(
     status_code: int = 200, json_data: Any = None, headers: dict | None = None
 ) -> MagicMock:
-    """Create a mock httpx response (sync methods like .json() and .raise_for_status())."""
+    """Create a mock httpx response (sync methods like .json() and .is_error)."""
     response = MagicMock()
     response.status_code = status_code
     response.json.return_value = json_data or {}
     response.headers = headers or {}
+    # _raise_for_status_sanitized branches on is_error and _parse_json_body on content —
+    # set both so a bare MagicMock's truthy defaults don't misfire on success responses.
+    response.is_error = status_code >= 400  # noqa: PLR2004 — HTTP error threshold
+    response.content = b"{}"
     return response
 
 
@@ -357,6 +361,112 @@ class TestAsyncApiHelpers:
 
         call_kwargs = mock_client.post.call_args
         assert call_kwargs.kwargs["data"] == {"sr": "python", "title": "Test"}
+
+
+def _mock_error_response(
+    status_code: int,
+    *,
+    headers: dict | None = None,
+    content: bytes = b"",
+    text: str = "",
+    json_data: Any = None,
+) -> MagicMock:
+    """Mock an httpx.Response whose error-handling attributes are set explicitly.
+
+    The plain `_mock_httpx_response` leaves `.is_error`/`.content` as truthy Mocks,
+    which the sanitization and empty-body paths branch on — set them for real here.
+    """
+    response = MagicMock()
+    response.status_code = status_code
+    response.is_error = status_code >= 400  # noqa: PLR2004 — HTTP error threshold
+    response.headers = headers or {}
+    response.content = content
+    response.text = text
+    if json_data is None:
+        response.json.side_effect = json.JSONDecodeError("Expecting value", "", 0)
+    else:
+        response.json.return_value = json_data
+    return response
+
+
+def _patch_async_client(mock_client_cls: MagicMock, get_response: MagicMock) -> MagicMock:
+    """Wire a patched httpx.AsyncClient to return get_response from .get()."""
+    mock_client = AsyncMock()
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    mock_client.get = AsyncMock(return_value=get_response)
+    mock_client_cls.return_value = mock_client
+    return mock_client
+
+
+class TestRateLimitRetryAfter:
+    """Finding 1: an HTTP-date Retry-After must not crash the retry path."""
+
+    async def test_http_date_retry_after_uses_default_delay(self):
+        from connectors.reddit.adapter import DEFAULT_RETRY_AFTER_SECONDS, _reddit_get
+
+        # RFC 7231 permits an HTTP-date form — float() would raise ValueError on it.
+        mock_429 = _mock_error_response(
+            429, headers={"Retry-After": "Wed, 21 Oct 2025 07:28:00 GMT"}
+        )
+        mock_200 = _mock_httpx_response(200, {"ok": True})
+
+        with patch("connectors.reddit.adapter.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.get = AsyncMock(side_effect=[mock_429, mock_200])
+            mock_client_cls.return_value = mock_client
+
+            with patch(
+                "connectors.reddit.adapter.asyncio.sleep", new_callable=AsyncMock
+            ) as mock_sleep:
+                parsed = await _reddit_get("token", "/test")
+
+        # The retry happens with the default delay rather than crashing.
+        mock_sleep.assert_called_once_with(DEFAULT_RETRY_AFTER_SECONDS)
+        assert parsed == {"ok": True}
+
+
+class TestErrorUrlSanitization:
+    """Finding 2: error responses must not leak the request URL / query params."""
+
+    async def test_search_500_hides_url_and_query(self, reddit_connector):
+        from connectors.reddit.adapter import REDDIT_API_BASE
+
+        mock_500 = _mock_error_response(
+            500, text="Internal Server Error", content=b"Internal Server Error"
+        )
+
+        with patch("connectors.reddit.adapter.httpx.AsyncClient") as mock_client_cls:
+            _patch_async_client(mock_client_cls, mock_500)
+            with pytest.raises(ValueError) as exc_info:
+                await reddit_connector.search(access_token="token", query="secret query")
+
+        message = str(exc_info.value)
+        assert "500" in message
+        assert "secret query" not in message
+        assert REDDIT_API_BASE not in message
+        assert "search" not in message
+
+
+class TestEmptyBodyDelete:
+    """Finding 5: /api/del returns 200 with an empty body — must not crash on .json()."""
+
+    async def test_delete_succeeds_with_empty_body(self, reddit_connector):
+        mock_200_empty = _mock_error_response(200, content=b"")
+
+        with patch("connectors.reddit.adapter.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=False)
+            mock_client.post = AsyncMock(return_value=mock_200_empty)
+            mock_client_cls.return_value = mock_client
+
+            blocks = await reddit_connector.delete(access_token="token", fullname="t3_abc123")
+
+        payload = json.loads(blocks[0]["text"])
+        assert payload == {"fullname": "t3_abc123", "deleted": True}
 
 
 # =============================================================================
@@ -597,6 +707,25 @@ class TestSearch:
 
         assert mock_get.call_args.kwargs["limit"] == 100
 
+    async def test_skips_children_missing_data(self, reddit_connector):
+        # Finding 6: a malformed child with no "data" key must be skipped, not crash.
+        mock_listing = {
+            "kind": "Listing",
+            "data": {
+                "children": [
+                    {"kind": "t3", "data": {"id": "ok1", "title": "Valid"}},
+                    {"kind": "t3"},  # malformed — no "data"
+                    {"kind": "t3", "data": {"id": "ok2", "title": "Also valid"}},
+                ]
+            },
+        }
+        with patch("connectors.reddit.adapter._reddit_get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = mock_listing
+            blocks = await reddit_connector.search(access_token="fake", query="python")
+
+        posts = json.loads(blocks[0]["text"])
+        assert [post["id"] for post in posts] == ["ok1", "ok2"]
+
 
 # =============================================================================
 # TOOL: get_subreddit_posts
@@ -816,6 +945,20 @@ class TestSubmitPost:
                 kind="link",
             )
 
+    async def test_rejects_unknown_kind(self, reddit_connector):
+        # Finding 4: schema enums are advisory — an out-of-range kind must be rejected,
+        # not silently fall through to the link branch.
+        with patch("connectors.reddit.adapter._reddit_post", new_callable=AsyncMock) as mock_post:
+            with pytest.raises(ValueError, match="kind must be 'self' or 'link'"):
+                await reddit_connector.submit_post(
+                    access_token="fake",
+                    subreddit="test",
+                    title="Mystery",
+                    kind="video",
+                    url="https://example.com",
+                )
+        mock_post.assert_not_called()
+
     async def test_rejects_self_without_text(self, reddit_connector):
         with pytest.raises(ValueError, match="text is required"):
             await reddit_connector.submit_post(
@@ -986,6 +1129,8 @@ class TestToolDispatchErrors:
         assert response["error"]["code"] == -32602
 
     async def test_tool_exception_returns_is_error(self, reddit_connector):
+        # A non-ValueError exception returns isError=True with a generic message —
+        # the raw exception text is withheld (leak prevention); only the tool name leaks.
         with patch("connectors.reddit.adapter._reddit_get", new_callable=AsyncMock) as mock_get:
             mock_get.side_effect = RuntimeError("API error")
             response = await reddit_connector.handle_mcp_request(
@@ -996,4 +1141,6 @@ class TestToolDispatchErrors:
             )
 
         assert response["result"]["isError"] is True
-        assert "API error" in response["result"]["content"][0]["text"]
+        text = response["result"]["content"][0]["text"]
+        assert "API error" not in text
+        assert "get_me" in text

@@ -29,6 +29,14 @@ logger = logging.getLogger(__name__)
 class TokenStore(ABC):
     """Abstract token storage."""
 
+    @abstractmethod
+    async def setup(self) -> None:
+        """Initialize backing resources (e.g. acquire a client)."""
+
+    @abstractmethod
+    async def teardown(self) -> None:
+        """Release backing resources."""
+
     # --- Connections (per app + connector) ---
 
     @abstractmethod
@@ -120,6 +128,12 @@ class SQLiteTokenStore(TokenStore):
 
     def _get_conn(self) -> sqlite3.Connection:
         return sqlite3.connect(self._db_path)
+
+    async def setup(self) -> None:
+        """No-op — SQLite initializes its file and tables in __init__."""
+
+    async def teardown(self) -> None:
+        """No-op — connections are opened per-call."""
 
     # --- Connections ---
 
@@ -264,6 +278,14 @@ class EncryptedTokenStore(TokenStore):
         self._fernet = MultiFernet([Fernet(k) for k in keys])
         self._delegate = delegate
 
+    async def setup(self) -> None:
+        """Initialize the delegate store."""
+        await self._delegate.setup()
+
+    async def teardown(self) -> None:
+        """Cleanup the delegate store."""
+        await self._delegate.teardown()
+
     def _encrypt(self, value: str) -> str:
         """Encrypt a string value."""
         return self._fernet.encrypt(value.encode()).decode()
@@ -358,11 +380,23 @@ def create_token_store(store_config: StoreConfig, encryption_keys: list[str]) ->
         encryption_keys: MultiFernet keys from broker config.
 
     Returns:
-        TokenStore wrapped with encryption.
+        The selected backend's TokenStore, wrapped in EncryptedTokenStore (both backends).
     """
     if store_config.backend == "sqlite":
         delegate = SQLiteTokenStore(db_path=store_config.sqlite.db_path)
+        return EncryptedTokenStore(keys=encryption_keys, delegate=delegate)
+    elif store_config.backend == "firestore":
+        if store_config.firestore is None:
+            raise ValueError("firestore backend specified but firestore config is None")
+        from broker.services.firestore_token_store import FirestoreTokenStore
+
+        return EncryptedTokenStore(
+            keys=encryption_keys,
+            delegate=FirestoreTokenStore(
+                project_id=store_config.firestore.project_id,
+                database=store_config.firestore.database,
+                collection_prefix=store_config.firestore.collection_prefix,
+            ),
+        )
     else:
         raise ValueError(f"Unknown store backend: {store_config.backend}")
-
-    return EncryptedTokenStore(keys=encryption_keys, delegate=delegate)

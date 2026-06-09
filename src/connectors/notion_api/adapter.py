@@ -29,7 +29,6 @@ from broker.connectors.native import NativeConnector, native_tool
 from broker.models.connector_config import AppConnectorCredentials, ConnectorMeta
 from connectors.notion_api.client import (
     _HTTP_FORBIDDEN,
-    _HTTP_NOT_FOUND,
     _HTTP_OK,
     DEFAULT_MAX_COMMENTS,
     DEFAULT_MAX_ROWS,
@@ -200,6 +199,10 @@ def _build_filter(
     filters: list[dict[str, Any]], match: str, schema: dict[str, str]
 ) -> dict[str, Any] | None:
     """Combine simple filters into a Notion `filter` object (None when empty)."""
+    if match not in ("all", "any"):
+        # The schema advertises an enum, but JSON Schema is advisory here (not server-enforced), so
+        # an out-of-enum value would silently fall through to AND below — validate explicitly.
+        raise ValueError(f"match must be 'all' or 'any', got {match!r}")
     if not filters:
         return None
     conditions = [_build_condition(f, schema) for f in filters]
@@ -265,16 +268,21 @@ async def _query_pages(  # noqa: PLR0913 -- pagination needs client + auth + tar
     has_more = False
     while True:
         body = dict(body_base)
-        body["page_size"] = MAX_PAGE_SIZE
+        # Request only the rows still needed (capped at the API max). Asking for MAX_PAGE_SIZE
+        # unconditionally drops rows silently: a single page of >max_rows with has_more=False would
+        # be sliced below while the caller's truncated flag reports "nothing left".
+        body["page_size"] = min(MAX_PAGE_SIZE, max_rows - len(rows))
         if cursor:
             body["start_cursor"] = cursor
         page = await _request(
             client, access_token, "POST", f"/data_sources/{ds_id}/query", json_body=body
         )
-        rows.extend(_simplify_page(p) for p in page.get("results", []))
+        page_results = page.get("results", [])
+        rows.extend(_simplify_page(row) for row in page_results)
         has_more = bool(page.get("has_more"))
         cursor = page.get("next_cursor")
-        if not has_more or len(rows) >= max_rows or not cursor:
+        # An empty page with has_more=True would otherwise loop forever — break on no rows.
+        if not has_more or len(rows) >= max_rows or not cursor or not page_results:
             break
     return rows[:max_rows], has_more, cursor
 
@@ -404,6 +412,11 @@ async def _create_one_page(  # noqa: PLR0913 -- builder needs client + auth + pa
     }
     content = page.get("content")
     if content:
+        if len(content) > MAX_BLOCKS_PER_REQUEST:
+            raise ValueError(
+                f"page content has {len(content)} blocks; Notion accepts at most "
+                f"{MAX_BLOCKS_PER_REQUEST} children per create — split the content into smaller pages"
+            )
         body["children"] = _paragraph_blocks(content)
     created = await _request(client, access_token, "POST", "/pages", json_body=body)
     return _simplify_page(created)
@@ -435,6 +448,11 @@ async def _build_page_schema(
 
 # Notion caps block children at 100 per PATCH /v1/blocks/{id}/children request.
 MAX_BLOCKS_PER_REQUEST = 100
+
+# Cap on pages created per create_pages call. Each page is a sequential POST; an unbounded list
+# means a long-running call that can fail partway, leaving an opaque partial write. Bound it so the
+# caller chunks large batches and partial-failure reporting stays comprehensible.
+MAX_PAGES_PER_CALL = 25
 
 # Cap on first-level blocks scanned when searching for a find-and-replace target. A find-one
 # edit over a page with thousands of blocks is a sign of misuse; bound the read to stay cheap.
@@ -629,6 +647,11 @@ def _build_move_parent(new_parent: dict[str, Any]) -> dict[str, Any]:
 # (live-verified) — content_type is inferred from the filename via mimetypes, never a generic default.
 TEXT_UPLOAD_CONTENT_TYPE = "text/plain"
 
+# Notion's documented single-part upload limit. Enforced before any HTTP so an oversized payload
+# is rejected at the boundary instead of being buffered into memory (an OOM vector) and then
+# bounced by the API after the round-trip.
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+
 
 def _multipart_headers(access_token: str) -> dict[str, str]:
     """Auth + version headers for the multipart file-send step — NO Content-Type.
@@ -762,7 +785,7 @@ class NotionApiConnector(NativeConnector):
         display_name="Notion (REST)",
         oauth_authorize_url="https://api.notion.com/v1/oauth/authorize",
         oauth_token_url="https://api.notion.com/v1/oauth/token",  # noqa: S106 — endpoint URL, not a password
-        scopes=[],  # Notion uses integration-level capabilities (set in the dashboard), not OAuth scopes.
+        scopes=(),  # Notion uses integration-level capabilities (set in the dashboard), not OAuth scopes.
         supports_pkce=False,  # api.notion.com OAuth does not support PKCE S256; waives broker PKCE invariant.
     )
 
@@ -854,21 +877,22 @@ class NotionApiConnector(NativeConnector):
     ) -> list[dict[str, Any]]:
         """Retrieve a page with blocks, or resolve a data source schema.
 
-        Tries GET /v1/pages/{id} first. On 404 falls back to _resolve_ds_and_schema (which
-        also handles database IDs). This matches the adapter's own 404-branch pattern in
-        _resolve_ds_and_schema (lines 231-238) — use _send + manual status check, not _request.
+        Tries GET /v1/pages/{id} first. On any non-200 falls back to _resolve_ds_and_schema (which
+        also handles database IDs). Notion answers 400 (not 404) when an id is the WRONG object type
+        — e.g. a database/data-source id sent to GET /pages → 400 "is a database, not a page" — so a
+        404-only fallback never reaches the documented "pass a database id" path. Mirrors the non-200
+        probe in _resolve_ds_and_schema — use _send + manual status check, not _request.
         """
         capped = _clamp_max_rows(max_blocks)
         raw_id = _normalize_id(notion_id)
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
             page_response = await _send(client, access_token, "GET", f"/pages/{raw_id}")
-            if page_response.status_code == _HTTP_NOT_FOUND:
-                # Not a page — attempt to resolve as a database / data source
+            if page_response.status_code != _HTTP_OK:
+                # Not a page (any non-200) — attempt to resolve as a database / data source.
                 ds_id, schema = await _resolve_ds_and_schema(client, access_token, notion_id)
                 return _mcp_text_content(
                     {"kind": "data_source", "data_source_id": ds_id, "schema": schema}
                 )
-            _check_status(page_response)
             page = page_response.json()
             blocks_raw, has_more, _cursor = await _paginate_get(
                 client, access_token, f"/blocks/{raw_id}/children", capped
@@ -1001,17 +1025,10 @@ class NotionApiConnector(NativeConnector):
                     }
                 )
             _check_status(list_response)
-            first_page = list_response.json()
-            users = list(first_page.get("results", []))
-            has_more = bool(first_page.get("has_more"))
-            cursor: str | None = first_page.get("next_cursor")
-            while has_more and len(users) < capped:
-                params: dict[str, Any] = {"page_size": MAX_PAGE_SIZE, "start_cursor": cursor}
-                page = await _request(client, access_token, "GET", "/users", params=params)
-                users.extend(page.get("results", []))
-                has_more = bool(page.get("has_more"))
-                cursor = page.get("next_cursor")
-            users = users[:capped]
+            # The list 403-fallback above must short-circuit before paginating, so the first GET
+            # is consumed here rather than inside _paginate_get; from this point the shared
+            # paginator handles the page-size/empty-page/null-cursor correctness for us.
+            users, has_more, cursor = await _paginate_get(client, access_token, "/users", capped)
             me = await _request(client, access_token, "GET", "/users/me")
         return _mcp_text_content(
             {
@@ -1032,15 +1049,42 @@ class NotionApiConnector(NativeConnector):
         parent: str,
         pages: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Create one page per entry under a resolved parent; return created ids/urls."""
+        """Create one page per entry under a resolved parent; return created ids/urls.
+
+        Pages are POSTed sequentially — Notion has no batch-create endpoint. If a page partway
+        through the list fails, the pages already written stay written: the payload reports
+        status="partial" with the created pages, failed_at (the 0-based index that raised), and the
+        error, so the caller never loses the record of what landed and can retry only the tail.
+        """
+        if len(pages) > MAX_PAGES_PER_CALL:
+            raise ValueError(
+                f"create_pages got {len(pages)} pages; the limit is {MAX_PAGES_PER_CALL} per call — "
+                "split the batch into smaller calls"
+            )
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
             parent_payload, schema = await _resolve_parent(client, access_token, parent)
             effective_schema = schema if schema is not None else _PAGE_PARENT_SCHEMA
-            created = [
-                await _create_one_page(client, access_token, parent_payload, effective_schema, page)
-                for page in pages
-            ]
-        return _mcp_text_content({"count": len(created), "pages": created})
+            created: list[dict[str, Any]] = []
+            for index, page in enumerate(pages):
+                try:
+                    created.append(
+                        await _create_one_page(
+                            client, access_token, parent_payload, effective_schema, page
+                        )
+                    )
+                except (ValueError, httpx.HTTPError) as exc:
+                    # A mid-batch failure must not discard the pages already written. Surface what
+                    # landed plus the failing index so the caller can retry only the unwritten tail.
+                    return _mcp_text_content(
+                        {
+                            "status": "partial",
+                            "count": len(created),
+                            "pages": created,
+                            "failed_at": index,
+                            "error": str(exc),
+                        }
+                    )
+        return _mcp_text_content({"status": "ok", "count": len(created), "pages": created})
 
     @native_tool(_UPDATE_PAGE_PROPERTIES_META)
     async def update_page_properties(
@@ -1379,7 +1423,7 @@ class NotionApiConnector(NativeConnector):
             raw_comments, has_more, cursor = await _paginate_get(
                 client, access_token, "/comments", capped, extra_params={"block_id": block_id}
             )
-        comments = [_simplify_comment(c) for c in raw_comments]
+        comments = [_simplify_comment(comment) for comment in raw_comments]
         return _mcp_text_content(
             {
                 "page_id": block_id,
@@ -1404,6 +1448,11 @@ class NotionApiConnector(NativeConnector):
     ) -> list[dict[str, Any]]:
         """Single-part upload: create the upload, send the bytes, optionally attach to a page."""
         raw_bytes = _resolve_upload_bytes(content_base64, text_content)
+        if len(raw_bytes) > MAX_UPLOAD_BYTES:
+            raise ValueError(
+                f"file is {len(raw_bytes)} bytes; the single-part upload limit is "
+                f"{MAX_UPLOAD_BYTES} bytes (20 MiB) — split or compress the file"
+            )
         resolved_type = _resolve_content_type(filename, content_type, text_content is not None)
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
             created = await _create_file_upload(client, access_token, filename, resolved_type)

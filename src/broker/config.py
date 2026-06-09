@@ -12,11 +12,18 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -162,10 +169,36 @@ class SQLiteStoreConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
 
-class StoreConfig(BaseModel):
-    backend: str = "sqlite"
-    sqlite: SQLiteStoreConfig = SQLiteStoreConfig()
+class FirestoreStoreConfig(BaseModel):
+    """Firestore Native mode configuration for multi-instance Cloud Run deployments."""
+
+    project_id: str = Field(..., description="GCP project ID")
+    database: str = Field(
+        default="(default)",
+        description="Firestore database name (default: '(default)' for the default database)",
+    )
+    collection_prefix: str = Field(
+        default="",
+        description="Prefix for all collections (e.g. 'prod_', 'staging_')",
+    )
     model_config = ConfigDict(frozen=True, extra="forbid")
+
+
+class StoreConfig(BaseModel):
+    backend: Literal["sqlite", "firestore"] = "sqlite"
+    sqlite: SQLiteStoreConfig = SQLiteStoreConfig()
+    firestore: FirestoreStoreConfig | None = None
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    @model_validator(mode="after")
+    def _require_firestore_config(self) -> StoreConfig:
+        """Fail fast at config-load time when the firestore backend is selected
+        without a [store.firestore] section, instead of deep in the async lifespan."""
+        if self.backend == "firestore" and self.firestore is None:
+            raise ValueError(
+                "store.backend='firestore' requires a [store.firestore] section with project_id"
+            )
+        return self
 
 
 class BrokerSettings(BaseModel):
@@ -315,6 +348,31 @@ def _format_missing_vars(missing: list[tuple[str, tuple[str, ...]]]) -> str:
     )
 
 
+def _format_validation_error(validation_error: ValidationError) -> str:
+    """Render a Pydantic ValidationError without echoing any input values.
+
+    Only the field path (``loc``) and the constraint type (``type``) are
+    emitted. The ``input`` and ``ctx`` fields are deliberately omitted because
+    they can contain the rejected value, which may be a secret.
+    """
+    lines = [
+        "",
+        "Broker cannot start — settings.yaml failed validation:",
+        "",
+    ]
+    for error in validation_error.errors():
+        field_path = ".".join(str(part) for part in error["loc"]) or "(root)"
+        lines.append(f"  {field_path}: {error['type']}")
+    lines.extend(
+        [
+            "",
+            "Fix: correct the offending field(s) in settings.yaml or .env.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _format_var_block(var_name: str, paths: list[tuple[str, ...]]) -> list[str]:
     """Render one missing-var entry: the var name followed by each yaml path it occurs at."""
     lines = [f"  {var_name}"]
@@ -344,7 +402,15 @@ def load_settings(path: str | None = None) -> BrokerSettings:
         raw = yaml.safe_load(f) or {}
 
     resolved = _resolve_env_var_references(raw)
-    settings = BrokerSettings(**resolved)
+    try:
+        settings = BrokerSettings(**resolved)
+    except ValidationError as validation_error:
+        # `from None`: a Pydantic ValidationError's str() embeds the offending
+        # `input_value`, which for a secret field is the secret itself. Chaining
+        # it would leak that secret into the crash traceback, so we drop the
+        # chain and re-raise a SettingsError listing only field paths + the
+        # constraint type that failed.
+        raise SettingsError(_format_validation_error(validation_error)) from None
 
     logger.info(
         "[Config] Loaded settings: broker=%s:%s, store=%s, apps=%s clients",

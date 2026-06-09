@@ -32,13 +32,39 @@ MAX_RESULTS_CAP = 100
 DEFAULT_MAX_RESULTS = 10
 MAX_THREAD_TWEETS = 25  # cap sequential posts so a runaway thread can't drain the write quota
 
+# X wraps every URL in a t.co short link of fixed display length, so a URL of
+# any actual length counts as this many weighted characters.
+URL_WEIGHTED_LENGTH = 23
+# Code points outside URLs that weigh 1 in X's twitter-text v3 config; everything
+# else (CJK, emoji, symbols) weighs 2.
+DEFAULT_CHAR_WEIGHT = 1
+WIDE_CHAR_WEIGHT = 2
+# Inclusive code-point ranges that weigh 1 (twitter-text v3 default weight ranges).
+WEIGHT_ONE_RANGES = (
+    (0x0000, 0x10FF),
+    (0x2000, 0x200A),
+    (0x2010, 0x201F),
+    (0x2032, 0x2037),
+)
+_URL_RE = re.compile(r"https?://\S+")
+
+# X API per-endpoint minimums for max_results — sending below these 400s upstream.
+# Timeline (GET /2/users/:id/tweets) requires >= 5; recent search
+# (GET /2/tweets/search/recent) requires >= 10. xdk forwards max_results verbatim.
+MIN_TIMELINE_RESULTS = 5
+MIN_SEARCH_RESULTS = 10
+
 _TWEET_ID_RE = re.compile(r"^\d{1,20}$")
 
 # === TOOL METADATA ===
 
 _POST_TWEET_META = NativeToolMeta(
     name="post_tweet",
-    description="Post a tweet to X/Twitter. Text must be 280 characters or fewer.",
+    description=(
+        "Post a tweet to X/Twitter. Text must be 280 characters or fewer. "
+        "Returns the created tweet object {id, text}. Raises if X reports the "
+        "post failed."
+    ),
     input_schema={
         "type": "object",
         "properties": {
@@ -77,7 +103,7 @@ _GET_MY_TWEETS_META = NativeToolMeta(
         "properties": {
             "max_results": {
                 "type": "integer",
-                "description": "Number of tweets to return (1-100, default 10)",
+                "description": "Number of tweets to return (5-100, default 10)",
                 "default": 10,
             },
         },
@@ -93,7 +119,7 @@ _SEARCH_TWEETS_META = NativeToolMeta(
             "query": {"type": "string", "description": "Search query"},
             "max_results": {
                 "type": "integer",
-                "description": "Number of tweets to return (1-100, default 10)",
+                "description": "Number of tweets to return (10-100, default 10)",
                 "default": 10,
             },
         },
@@ -157,8 +183,18 @@ def _create_post(client: XClient, text: str, in_reply_to: str | None = None) -> 
 
 
 def _post_tweet_sync(access_token: str, text: str) -> dict[str, Any]:
-    """Post a tweet via xdk. Returns tweet data as a dict."""
-    return _create_post(XClient(access_token=access_token), text)
+    """Post a tweet via xdk. Returns the unwrapped tweet object ({id, text}).
+
+    X reports creation failures in the envelope's `errors` array (sometimes with
+    no usable `data`). When that happens, raise a sanitized ValueError — the
+    connector's documented client-facing error channel — rather than returning a
+    tweet object that was never actually posted.
+    """
+    envelope = _create_post(XClient(access_token=access_token), text)
+    tweet = envelope.get("data")
+    if tweet is None and envelope.get("errors"):
+        raise ValueError(_summarize_post_errors(envelope["errors"]))
+    return _model_to_dict(tweet)
 
 
 def _post_thread_sync(access_token: str, tweets: list[str]) -> dict[str, Any]:
@@ -249,6 +285,57 @@ def _model_to_dict(model: Any) -> Any:
     return dict(model)
 
 
+def _summarize_post_errors(errors: Any) -> str:
+    """Summarize X's `errors` array into a sanitized client-facing message.
+
+    Only the human-readable `title` of each error is surfaced. X error objects can
+    carry URLs and resource identifiers in other fields; those are dropped so the
+    ValueError stays free of URLs and tokens per the connector's error-channel rules.
+    """
+    titles = [
+        title for error in errors if isinstance(error, dict) and (title := error.get("title"))
+    ]
+    summary = "; ".join(titles) if titles else "unknown error"
+    return f"X rejected the tweet: {summary}"
+
+
+def _weighted_tweet_length(text: str) -> int:
+    """Compute X's weighted tweet length (twitter-text v3 config).
+
+    URLs with an explicit scheme count as a fixed 23 (t.co wrapping). Outside URLs,
+    code points in the ranges below weigh 1; everything else (CJK, emoji, symbols)
+    weighs 2.
+
+    Known approximations, both of which over-count and therefore REJECT early
+    rather than accept an invalid tweet (X's own response stays authoritative):
+    - Bare-domain URLs without a scheme (e.g. ``example.com``) are not detected as
+      URLs and are counted per character, over-counting versus X's 23.
+    - Multi-code-point emoji sequences (ZWJ joins, skin-tone modifiers) are counted
+      per code point at weight 2 each; X counts 2 per emoji grapheme, so we
+      over-count compound emoji.
+    """
+    weighted = 0
+    cursor = 0
+    for match in _URL_RE.finditer(text):
+        weighted += _weigh_plain_run(text[cursor : match.start()])
+        weighted += URL_WEIGHTED_LENGTH
+        cursor = match.end()
+    weighted += _weigh_plain_run(text[cursor:])
+    return weighted
+
+
+def _weigh_plain_run(run: str) -> int:
+    """Weight a non-URL text run per the twitter-text v3 weight-1 code point ranges."""
+    return sum(
+        DEFAULT_CHAR_WEIGHT if _is_weight_one(ord(char)) else WIDE_CHAR_WEIGHT for char in run
+    )
+
+
+def _is_weight_one(code_point: int) -> bool:
+    """Whether a code point falls in a twitter-text v3 weight-1 range."""
+    return any(low <= code_point <= high for low, high in WEIGHT_ONE_RANGES)
+
+
 def _extract_user_id(user_data: Any) -> str:
     """Extract user ID from get_me response data."""
     if isinstance(user_data, dict):
@@ -270,7 +357,8 @@ def _validate_thread_tweets(tweets: Any) -> None:
     """Pre-flight the whole batch before any tweet is posted.
 
     Validating up front turns avoidable mid-thread failures (e.g. an over-length tweet
-    halfway down) into a clean rejection with nothing posted.
+    halfway down) into a clean rejection with nothing posted. Uses X's weighted
+    length so wide characters and URLs are measured the same way as post_tweet.
     """
     if not isinstance(tweets, list) or not tweets:
         raise ValueError("tweets must be a non-empty list")
@@ -279,15 +367,21 @@ def _validate_thread_tweets(tweets: Any) -> None:
     for position, text in enumerate(tweets, start=1):
         if not isinstance(text, str) or not text.strip():
             raise ValueError(f"Tweet {position} is empty")
-        if len(text) > MAX_TWEET_LENGTH:
+        weighted_length = _weighted_tweet_length(text)
+        if weighted_length > MAX_TWEET_LENGTH:
             raise ValueError(
-                f"Tweet {position} exceeds {MAX_TWEET_LENGTH} characters ({len(text)} given)"
+                f"Tweet {position} exceeds {MAX_TWEET_LENGTH} characters "
+                f"({weighted_length} weighted given)"
             )
 
 
-def _clamp_max_results(max_results: int) -> int:
-    """Clamp max_results to the valid range [1, MAX_RESULTS_CAP]."""
-    return max(1, min(max_results, MAX_RESULTS_CAP))
+def _clamp_max_results(max_results: int, minimum: int) -> int:
+    """Clamp max_results to [minimum, MAX_RESULTS_CAP].
+
+    `minimum` is per-endpoint (timeline vs search) because the X API enforces
+    different floors and rejects values below them.
+    """
+    return max(minimum, min(max_results, MAX_RESULTS_CAP))
 
 
 def _mcp_text_content(payload: Any) -> list[dict[str, Any]]:
@@ -310,7 +404,7 @@ class TwitterConnector(NativeConnector):
         display_name="Twitter/X",
         oauth_authorize_url="https://x.com/i/oauth2/authorize",
         oauth_token_url="https://api.x.com/2/oauth2/token",  # noqa: S106 — endpoint URL, not a password
-        scopes=["tweet.read", "tweet.write", "users.read", "offline.access"],
+        scopes=("tweet.read", "tweet.write", "users.read", "offline.access"),
     )
 
     # --- OAuth override ---
@@ -329,11 +423,14 @@ class TwitterConnector(NativeConnector):
 
     @native_tool(_POST_TWEET_META)
     async def post_tweet(self, *, access_token: str, text: str) -> list[dict[str, Any]]:
-        """Post a tweet. Validates text is non-empty and within length before calling X API."""
+        """Post a tweet. Validates non-empty text and weighted length before calling X API."""
         if not text.strip():
             raise ValueError("Tweet text is empty")
-        if len(text) > MAX_TWEET_LENGTH:
-            raise ValueError(f"Tweet exceeds {MAX_TWEET_LENGTH} characters ({len(text)} given)")
+        weighted_length = _weighted_tweet_length(text)
+        if weighted_length > MAX_TWEET_LENGTH:
+            raise ValueError(
+                f"Tweet exceeds {MAX_TWEET_LENGTH} characters ({weighted_length} weighted given)"
+            )
         loop = asyncio.get_running_loop()
         tweet_response = await loop.run_in_executor(None, _post_tweet_sync, access_token, text)
         return _mcp_text_content(tweet_response)
@@ -359,7 +456,7 @@ class TwitterConnector(NativeConnector):
         self, *, access_token: str, max_results: int = DEFAULT_MAX_RESULTS
     ) -> list[dict[str, Any]]:
         """Get the authenticated user's recent tweets."""
-        clamped = _clamp_max_results(max_results)
+        clamped = _clamp_max_results(max_results, MIN_TIMELINE_RESULTS)
         loop = asyncio.get_running_loop()
         tweets = await loop.run_in_executor(None, _get_my_tweets_sync, access_token, clamped)
         return _mcp_text_content(tweets)
@@ -369,7 +466,7 @@ class TwitterConnector(NativeConnector):
         self, *, access_token: str, query: str, max_results: int = DEFAULT_MAX_RESULTS
     ) -> list[dict[str, Any]]:
         """Search recent tweets matching a query."""
-        clamped = _clamp_max_results(max_results)
+        clamped = _clamp_max_results(max_results, MIN_SEARCH_RESULTS)
         loop = asyncio.get_running_loop()
         tweets = await loop.run_in_executor(None, _search_tweets_sync, access_token, query, clamped)
         return _mcp_text_content(tweets)

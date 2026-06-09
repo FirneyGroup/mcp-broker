@@ -23,9 +23,10 @@ import httpx
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
+from starlette.responses import Response
 
 from broker.config import BrokerSettings
-from broker.connectors.base import _CONTROL_CHAR_PATTERN, BaseConnector
+from broker.connectors.base import BaseConnector, contains_control_chars
 from broker.connectors.native import NativeConnector
 from broker.connectors.registry import ConnectorRegistry
 from broker.models.connection import AppConnection
@@ -163,35 +164,42 @@ def _extract_app_key(request: Request) -> str | JSONResponse:
     return identity.app_key
 
 
-def _build_upstream_headers(
+def _build_forwarded_headers(
     request: Request,
-    connector: BaseConnector,
-    access_token: str,
     upstream_url: str,
+    auth_header: dict[str, str] | None = None,
 ) -> dict[str, str]:
-    """Build headers for upstream MCP request.
+    """Strip internal headers, set the upstream Host, and optionally inject auth.
 
-    Strips internal headers, injects OAuth auth, sets correct Host.
+    The strip-then-set-Host logic is security-relevant (it removes broker-internal
+    credentials and caller identity) so it lives here in exactly one place.
     """
     headers = {
         name: value
         for name, value in request.headers.items()
         if name.lower() not in _STRIP_REQUEST_HEADERS
     }
-    headers.update(connector.build_auth_header(access_token))
+    if auth_header:
+        headers.update(auth_header)
     headers["host"] = urlparse(upstream_url).netloc
     return headers
+
+
+def _build_upstream_headers(
+    request: Request,
+    connector: BaseConnector,
+    access_token: str,
+    upstream_url: str,
+) -> dict[str, str]:
+    """Build headers for upstream MCP request (OAuth auth injected)."""
+    return _build_forwarded_headers(
+        request, upstream_url, auth_header=connector.build_auth_header(access_token)
+    )
 
 
 def _build_passthrough_headers(request: Request, upstream_url: str) -> dict[str, str]:
     """Build headers for sidecar-managed connectors (no auth injection)."""
-    headers = {
-        name: value
-        for name, value in request.headers.items()
-        if name.lower() not in _STRIP_REQUEST_HEADERS
-    }
-    headers["host"] = urlparse(upstream_url).netloc
-    return headers
+    return _build_forwarded_headers(request, upstream_url)
 
 
 # =============================================================================
@@ -205,22 +213,24 @@ _ALLOWED_HTTP_METHODS = frozenset({"GET", "POST", "DELETE"})
 def _validate_mcp_payload(
     body: bytes,
     connector: BaseConnector,
-) -> JSONResponse | None:
-    """Validate JSON-RPC payload against connector's method allowlist.
+) -> tuple[dict | list | None, JSONResponse | None]:
+    """Parse and validate a JSON-RPC payload against the method allowlist.
 
-    Returns None if valid, or JSONResponse with error details if blocked.
+    Returns (parsed_payload, None) when valid, or (None, JSONResponse) when the
+    body is malformed or a method is blocked. The parsed payload is returned so
+    callers reuse it instead of parsing the body a second time.
     """
     try:
         payload = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return JSONResponse({"error": "Invalid JSON in request body"}, status_code=400)
+        return None, JSONResponse({"error": "Invalid JSON in request body"}, status_code=400)
 
     # JSON-RPC batch (array of requests) — validate each
     payloads = payload if isinstance(payload, list) else [payload]
 
     for entry in payloads:
         if not isinstance(entry, dict):
-            return JSONResponse({"error": "Invalid JSON-RPC 2.0 payload"}, status_code=400)
+            return None, JSONResponse({"error": "Invalid JSON-RPC 2.0 payload"}, status_code=400)
 
         method = entry.get("method", "")
         if method not in connector.meta.allowed_mcp_methods:
@@ -229,12 +239,21 @@ def _validate_mcp_payload(
                 method,
                 connector.meta.name,
             )
-            return JSONResponse(
+            return None, JSONResponse(
                 {"error": f"MCP method not allowed: {method}"},
                 status_code=403,
             )
 
-    return None
+    return payload, None
+
+
+def _method_not_allowed_response(method: str) -> JSONResponse:
+    """405 with an Allow header listing the supported HTTP methods."""
+    return JSONResponse(
+        {"error": f"HTTP method not allowed: {method}"},
+        status_code=405,
+        headers={"Allow": ", ".join(sorted(_ALLOWED_HTTP_METHODS))},
+    )
 
 
 # =============================================================================
@@ -246,26 +265,26 @@ async def _dispatch_native_request(
     request: Request,
     connector: NativeConnector,
     connection: AppConnection,
-) -> JSONResponse:
+) -> Response:
     """Dispatch JSON-RPC request to a native (in-process) connector.
 
     Parses the JSON-RPC body, delegates to connector.handle_mcp_request(),
     and returns the result as a JSONResponse. Token passed directly.
     """
+    # Native connectors bypass _build_and_stream, so the HTTP-method allowlist
+    # must be enforced here too — otherwise PUT would reach tool execution.
+    if request.method not in _ALLOWED_HTTP_METHODS:
+        return _method_not_allowed_response(request.method)
+
     body = await request.body()
     if len(body) > _MAX_BODY_BYTES:
         return JSONResponse(
             {"error": f"Request body too large ({len(body)} bytes, max {_MAX_BODY_BYTES})"},
             status_code=413,
         )
-    validation_error = _validate_mcp_payload(body, connector)
+    payload, validation_error = _validate_mcp_payload(body, connector)
     if validation_error:
         return validation_error
-
-    try:
-        payload = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return JSONResponse({"error": "Invalid JSON in request body"}, status_code=400)
 
     if not isinstance(payload, dict):
         return JSONResponse(
@@ -278,8 +297,10 @@ async def _dispatch_native_request(
         request_id=payload.get("id"),
         access_token=connection.access_token,
     )
-    if not mcp_response:
-        return JSONResponse(content="", status_code=204)
+    # handle_mcp_request returns None for notifications (no id) — JSON-RPC
+    # mandates no response body, so reply 204 with an empty body (not b'""').
+    if mcp_response is None:
+        return Response(status_code=204)
     return JSONResponse(mcp_response)
 
 
@@ -368,9 +389,7 @@ async def _build_and_stream(  # noqa: PLR0913 — path forwarding requires all p
     """
     # Reject unsupported HTTP methods
     if request.method not in _ALLOWED_HTTP_METHODS:
-        return JSONResponse(
-            {"error": f"HTTP method not allowed: {request.method}"}, status_code=405
-        )
+        return _method_not_allowed_response(request.method)
 
     # Validate path — reject traversal sequences that could escape the MCP endpoint
     if path and ".." in posixpath.normpath(path).split("/"):
@@ -386,7 +405,7 @@ async def _build_and_stream(  # noqa: PLR0913 — path forwarding requires all p
     upstream_url = f"{base_url}/{path}" if path else base_url
 
     if connection:
-        if _CONTROL_CHAR_PATTERN.search(connection.access_token):
+        if contains_control_chars(connection.access_token):
             return JSONResponse({"error": "Invalid token"}, status_code=422)
         headers = _build_upstream_headers(request, connector, connection.access_token, upstream_url)
     else:
@@ -408,7 +427,7 @@ async def _build_and_stream(  # noqa: PLR0913 — path forwarding requires all p
 
     # Validate JSON-RPC method on POST (GET/DELETE have no JSON-RPC payload)
     if request.method == "POST" and body:
-        validation_error = _validate_mcp_payload(body, connector)
+        _, validation_error = _validate_mcp_payload(body, connector)
         if validation_error:
             return validation_error
 
@@ -426,7 +445,7 @@ async def proxy_mcp_request(  # noqa: PLR0913
     settings: BrokerSettings,
     discovery: OAuthDiscovery | None = None,
     path: str = "",
-) -> StreamingResponse | JSONResponse:
+) -> Response:
     """Proxy an MCP request to a remote server with OAuth token injection.
 
     Sidecar-managed connectors skip token lookup — the sidecar handles auth internally.

@@ -15,6 +15,7 @@ import json
 import logging
 import re
 from base64 import b64encode
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -35,6 +36,7 @@ DEFAULT_LIMIT = 10
 MAX_LIMIT = 100
 MAX_COMMENT_DEPTH = 10
 RATE_LIMIT_RETRY_CAP_SECONDS = 30
+DEFAULT_RETRY_AFTER_SECONDS = 5.0
 
 # Input validation patterns (prevent path traversal in URL construction)
 _SUBREDDIT_RE = re.compile(r"^[A-Za-z0-9_]{1,50}$")
@@ -73,6 +75,15 @@ def _extract_listing_children(response: dict[str, Any]) -> list[dict[str, Any]]:
     Returns empty list for error responses or missing data — never raises.
     """
     return response.get("data", {}).get("children", [])
+
+
+def _as_listing(body: dict[str, Any] | list[Any]) -> dict[str, Any]:
+    """Narrow a Reddit response body to a listing dict.
+
+    Listing endpoints return a JSON object; a stray list (only /comments does this)
+    is not a listing, so treat it as empty rather than raising.
+    """
+    return body if isinstance(body, dict) else {}
 
 
 _POST_FIELDS = (
@@ -165,27 +176,70 @@ def _check_status(response: httpx.Response) -> None:
         raise ValueError("Reddit token expired or revoked — reconnect via /oauth/reddit/connect")
 
 
-async def _retry_on_rate_limit(response: httpx.Response, request_fn: Any) -> httpx.Response:
+def _raise_for_status_sanitized(response: httpx.Response) -> None:
+    """Raise on HTTP error with a status-only message.
+
+    httpx.HTTPStatusError.str() embeds the full request URL with query params
+    (user search queries), and the native dispatcher returns str(exc) to the MCP
+    client — so raise_for_status() would leak the query. Sanitize to status only.
+    """
+    if response.is_error:
+        logger.debug("[Reddit] API error %d: %s", response.status_code, response.text[:500])
+        raise ValueError(f"Reddit API error ({response.status_code})")
+
+
+def _parse_retry_after(response: httpx.Response) -> float:
+    """Read Retry-After as seconds, capped. Defaults to 5s if missing or malformed.
+
+    RFC 7231 permits an HTTP-date form (e.g. "Wed, 21 Oct 2025 07:28:00 GMT"),
+    which is not float-parseable — guard against it rather than crashing.
+    """
+    try:
+        retry_seconds = float(response.headers.get("Retry-After", ""))
+    except (ValueError, TypeError):
+        retry_seconds = DEFAULT_RETRY_AFTER_SECONDS
+    return max(0.0, min(retry_seconds, RATE_LIMIT_RETRY_CAP_SECONDS))
+
+
+async def _retry_on_rate_limit(
+    response: httpx.Response,
+    request_fn: Callable[[], Awaitable[httpx.Response]],
+) -> httpx.Response:
     """If 429, sleep Retry-After (capped) and retry once. Raises on second 429."""
     if response.status_code != 429:  # noqa: PLR2004 — HTTP status code
-        response.raise_for_status()
+        _raise_for_status_sanitized(response)
         return response
-    retry_after = min(
-        float(response.headers.get("Retry-After", "5")),
-        RATE_LIMIT_RETRY_CAP_SECONDS,
-    )
+    retry_after = _parse_retry_after(response)
     logger.warning("[Reddit] Rate limited, retrying after %.1fs", retry_after)
     await asyncio.sleep(retry_after)
     retry_response = await request_fn()
     _check_status(retry_response)
     if retry_response.status_code == 429:  # noqa: PLR2004 — HTTP status code
         raise ValueError("Rate limited by Reddit after retry — try again later")
-    retry_response.raise_for_status()
+    _raise_for_status_sanitized(retry_response)
     return retry_response
 
 
-async def _reddit_get(access_token: str, path: str, **params: Any) -> dict[str, Any]:
-    """GET request to Reddit API with auth, rate limiting, and retry."""
+def _parse_json_body(response: httpx.Response) -> dict[str, Any] | list[Any]:
+    """Parse the response body as JSON, tolerating an empty body.
+
+    Reddit's /api/del returns 200 with an empty body on success, so an
+    unconditional .json() would raise JSONDecodeError on a successful delete.
+    """
+    if not response.content:
+        return {}
+    try:
+        return response.json()
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Reddit returned a non-JSON response ({response.status_code})") from exc
+
+
+async def _reddit_get(access_token: str, path: str, **params: Any) -> dict[str, Any] | list[Any]:
+    """GET request to Reddit API with auth, rate limiting, and retry.
+
+    Most endpoints return a JSON object, but /comments/{post_id} returns a
+    two-element JSON list ([post_listing, comments_listing]) — hence the union.
+    """
     url = f"{REDDIT_API_BASE}{path}"
     headers = _build_headers(access_token)
     async with httpx.AsyncClient() as client:
@@ -194,7 +248,7 @@ async def _reddit_get(access_token: str, path: str, **params: Any) -> dict[str, 
         response = await _retry_on_rate_limit(
             response, lambda: client.get(url, headers=headers, params=params)
         )
-        return response.json()
+        return _parse_json_body(response)
 
 
 async def _reddit_post(access_token: str, path: str, form_fields: dict[str, Any]) -> dict[str, Any]:
@@ -207,7 +261,9 @@ async def _reddit_post(access_token: str, path: str, form_fields: dict[str, Any]
         response = await _retry_on_rate_limit(
             response, lambda: client.post(url, headers=headers, data=form_fields)
         )
-        return response.json()
+        body = _parse_json_body(response)
+        # POST endpoints always return an object; the list form is GET-only (/comments).
+        return body if isinstance(body, dict) else {}
 
 
 # === TOOL METADATA ===
@@ -390,7 +446,7 @@ class RedditConnector(NativeConnector):
         display_name="Reddit",
         oauth_authorize_url="https://www.reddit.com/api/v1/authorize",
         oauth_token_url="https://www.reddit.com/api/v1/access_token",  # noqa: S106 — endpoint URL, not a password
-        scopes=["identity", "read", "submit", "edit"],
+        scopes=("identity", "read", "submit", "edit"),
     )
 
     # --- OAuth overrides ---
@@ -442,8 +498,9 @@ class RedditConnector(NativeConnector):
             )
         else:
             listing = await _reddit_get(access_token, "/search", q=query, sort=sort, limit=clamped)
-        children = _extract_listing_children(listing)
-        posts = [_simplify_post(child["data"]) for child in children]
+        children = _extract_listing_children(_as_listing(listing))
+        # Skip malformed children missing "data" rather than raising KeyError.
+        posts = [_simplify_post(child["data"]) for child in children if "data" in child]
         return _mcp_text_content(posts)
 
     @native_tool(_GET_SUBREDDIT_POSTS_META)
@@ -459,8 +516,9 @@ class RedditConnector(NativeConnector):
         _validate_subreddit(subreddit)
         clamped = _clamp_limit(limit)
         listing = await _reddit_get(access_token, f"/r/{subreddit}", sort=sort, limit=clamped)
-        children = _extract_listing_children(listing)
-        posts = [_simplify_post(child["data"]) for child in children]
+        children = _extract_listing_children(_as_listing(listing))
+        # Skip malformed children missing "data" rather than raising KeyError.
+        posts = [_simplify_post(child["data"]) for child in children if "data" in child]
         return _mcp_text_content(posts)
 
     @native_tool(_GET_POST_COMMENTS_META)
@@ -486,9 +544,9 @@ class RedditConnector(NativeConnector):
             depth=clamped_depth,
         )
         if isinstance(response, list) and len(response) >= 2:  # noqa: PLR2004 — Reddit returns exactly 2 listings
-            comments_listing = response[1]  # type: ignore[index]  # Reddit returns [post, comments] list
+            comments_listing = _as_listing(response[1])
         else:
-            comments_listing = response
+            comments_listing = _as_listing(response)
         children = _extract_listing_children(comments_listing)
         comments = _build_comment_tree(children, clamped_depth)
         return _mcp_text_content(comments)
@@ -506,6 +564,11 @@ class RedditConnector(NativeConnector):
     ) -> list[dict[str, Any]]:
         """Submit a post to a subreddit."""
         _validate_subreddit(subreddit)
+        # Schema enums are advisory only — Reddit does not enforce them, so guard
+        # explicitly. Without this, an out-of-range kind reaches the else branch
+        # below and silently submits a malformed link post.
+        if kind not in ("self", "link"):
+            raise ValueError(f"kind must be 'self' or 'link', got {kind!r}")
         if len(title) > MAX_TITLE_LENGTH:
             raise ValueError(f"Title exceeds {MAX_TITLE_LENGTH} characters ({len(title)} given)")
         if kind == "link" and not url:

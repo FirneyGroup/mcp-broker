@@ -16,6 +16,7 @@ from abc import ABC, abstractmethod
 from pydantic import BaseModel, ConfigDict, Field
 
 from broker.config import DEFAULT_SCOPES
+from broker.services.auth_store_interfaces import ConnectTokenStoreABC
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +119,7 @@ class BrokerKeyStore(ABC):
 # =============================================================================
 
 
-class ConnectTokenStore:
+class ConnectTokenStore(ConnectTokenStoreABC):
     """Single-use, time-limited tokens for browser-initiated OAuth connect.
 
     Replaces raw broker_key in URL query params. Tokens are consumed on first
@@ -133,7 +134,7 @@ class ConnectTokenStore:
     def __init__(self) -> None:
         self._tokens: dict[str, tuple[str, float]] = {}  # token → (app_key, created_at)
 
-    def create(self, app_key: str) -> str:
+    async def create(self, app_key: str) -> str:
         """Create a single-use connect token for an app. Returns the token."""
         self._cleanup()
         token = f"{CONNECT_TOKEN_PREFIX}{secrets.token_urlsafe(KEY_BYTES)}"
@@ -141,7 +142,7 @@ class ConnectTokenStore:
         logger.info("[ConnectToken] Created for app: %s", app_key)
         return token
 
-    def consume(self, token: str) -> str | None:
+    async def consume(self, token: str) -> str | None:
         """Validate and consume a connect token. Returns app_key or None.
 
         Single-use: token is deleted after first successful validation.
