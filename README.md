@@ -260,9 +260,17 @@ broker:
   success_redirect_url: http://localhost:3000
 
 store:
-  backend: sqlite
+  backend: sqlite              # sqlite (default) | firestore
   sqlite:
     db_path: ./data/tokens.db
+  # For multi-instance deployments (e.g. Cloud Run), use Firestore Native mode —
+  # see "Scaling & Multi-Instance" below. Authenticates via Application Default
+  # Credentials; honours FIRESTORE_EMULATOR_HOST for local development.
+  # backend: firestore
+  # firestore:
+  #   project_id: my-gcp-project   # required
+  #   database: "(default)"        # optional — Firestore database name
+  #   collection_prefix: "prod_"   # optional — namespaces collections per environment
 
 # Per-app auth config — scopes and connector access control
 clients:
@@ -322,7 +330,7 @@ This is **opt-in** (`broker.oauth.enabled: false` by default). The existing `X-A
 ### Prerequisites
 
 - **Public HTTPS URL.** Anthropic egresses from `160.79.104.0/21`; the broker must be reachable from the public internet over HTTPS.
-- **Single-worker uvicorn.** The DCR rate limiter is in-memory. The broker aborts at startup if `WEB_CONCURRENCY > 1` and `oauth.enabled=true`.
+- **Single-worker uvicorn — unless on the Firestore backend.** With the default `sqlite` backend the DCR rate limiter and OAuth flow state are in-memory, so the broker aborts at startup if `WEB_CONCURRENCY > 1` and `oauth.enabled=true`. With `store.backend: firestore` that state is shared across workers and instances, multi-worker is supported, and the abort does not fire (see [Scaling & Multi-Instance](#scaling--multi-instance)).
 - **HTTP/1.1 origin protocol** if behind Cloudflare Tunnel. HTTP/2 lowercases header names; claude.ai does a case-sensitive lookup for `WWW-Authenticate` ([anthropics/claude-ai-mcp#219](https://github.com/anthropics/claude-ai-mcp/issues/219)) and silently fails discovery. In `cloudflared` config (or Zero Trust dashboard → Networks → Tunnels → Additional application settings → TLS):
 
   ```yaml
@@ -369,7 +377,7 @@ broker:
 
 The settings validator rejects an `app_key` that does not exist in `clients` (loud at startup).
 
-Restart the broker. Inbound OAuth state lives in `data/inbound_oauth.db`, separate from `data/broker_keys.db` and `data/tokens.db`.
+Restart the broker. Inbound OAuth state lives in `data/inbound_oauth.db`, separate from `data/broker_keys.db` and `data/tokens.db`. (On the Firestore backend it lives in Firestore collections instead and `db_path` is ignored.)
 
 ### Verification
 
@@ -420,8 +428,8 @@ If any public endpoint returns 403, the deployment's edge auth is blocking — e
 | claude.ai shows "Connection failed" with no further detail | Discovery silently failed. Check `WWW-Authenticate` case (`curl -v`). If lowercase, force HTTP/1.1 origin. |
 | `/oauth/authorize` returns 400 `invalid_target` | The `resource` parameter claude.ai sent does not match `{public_url}/proxy/{connector}`. Confirm `broker.public_url` matches the hostname you pasted into claude.ai (including scheme + trailing slash). |
 | `/oauth/token` returns 400 `invalid_grant` after a refresh | Either the refresh token expired, or replay was detected and the family was revoked. Reconnect from claude.ai to re-authorise. |
-| Broker aborts at startup with `OAuth enabled but WEB_CONCURRENCY > 1` | The in-memory DCR rate limiter requires single-worker uvicorn. Drop `--workers` to 1 or set `WEB_CONCURRENCY=1`. |
-| `/oauth/authorize` shows the consent page but POST fails | The consent page must reach the same broker instance (no load balancer in front splitting traffic). Single-instance only in v1. |
+| Broker aborts at startup with `OAuth enabled but WEB_CONCURRENCY > 1` | On the `sqlite` backend the in-memory DCR rate limiter requires single-worker uvicorn. Drop `--workers` to 1, set `WEB_CONCURRENCY=1`, or switch to `store.backend: firestore` (which shares that state and lifts the restriction). |
+| `/oauth/authorize` shows the consent page but POST fails | On the `sqlite` backend the consent page must reach the same broker instance (no load balancer in front splitting traffic) — single-instance only. On the Firestore backend flow state is shared, so any instance can serve the POST. |
 
 ### Known claude.ai bugs the broker works around
 
@@ -525,33 +533,43 @@ The broker implements defense-in-depth for OAuth credential management:
 
 ### Known Limitations
 
-- **No rate limiting** — Consider [slowapi](https://github.com/laurents/slowapi) or an upstream reverse proxy for production.
-- **Single-instance state** — OAuth nonces, PKCE verifiers, and connect tokens are in-memory. Multi-instance deployments require shared storage (see [Scaling & Multi-Instance](#scaling--multi-instance)).
+- **No rate limiting** — Consider [slowapi](https://github.com/laurents/slowapi) or an upstream reverse proxy for production. (Inbound DCR has its own per-IP limit; nothing else does.)
+- **Single-instance state on the default backend** — With `store.backend: sqlite`, OAuth nonces, PKCE verifiers, and connect tokens are in-memory and the broker must run as a single instance. The Firestore backend moves this state to shared storage (see [Scaling & Multi-Instance](#scaling--multi-instance)).
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 ## Scaling & Multi-Instance
 
-Current architecture is single-instance with SQLite. The `TokenStore` and `BrokerKeyStore` ABCs are designed for backend swapping.
+The broker has two storage backends, selected via `store.backend` in `settings.yaml`:
 
-### Current Architecture
+- **`sqlite`** (default) — zero-config, single-instance. State lives in local `.db` files plus in-memory dicts.
+- **`firestore`** — Firestore Native mode, for multi-instance deployments (e.g. Cloud Run with multiple replicas or `WEB_CONCURRENCY > 1`). All persistent and flow state is shared across instances. Authenticates via Application Default Credentials; the service account needs Firestore read/write (`roles/datastore.user`). Honours `FIRESTORE_EMULATOR_HOST` for local development.
 
-| Component | Implementation | Constraint |
-|-----------|---------------|------------|
-| Token store | SQLite + MultiFernet encryption | Single-instance |
-| Key store | SQLite + SHA-256 hashing | Single-instance |
-| Registration store | SQLite + MultiFernet encryption | Single-instance |
-| Refresh locks | `asyncio.Lock` | Single-process |
-| Nonce tracking | In-memory set | Single-process |
-| Connect tokens | In-memory dict | Single-process |
-| Discovery cache | In-memory dict | Per-instance |
+```yaml
+store:
+  backend: firestore
+  firestore:
+    project_id: my-gcp-project
+    database: "(default)"          # optional
+    collection_prefix: "prod_"     # optional — namespaces collections per environment
+```
 
-### Multi-Instance Path
+### State by Backend
 
-1. **Shared token + key store** — Implement the ABCs with PostgreSQL, Redis, or Firestore
-2. **Distributed locks** — Replace `asyncio.Lock` with database transactions or distributed locks
-3. **Shared nonce storage** — Move `_consumed_nonces` and `_pkce_verifiers` to shared store
-4. **Shared connect tokens** — Move `ConnectTokenStore` to shared store with TTL
+| Component | `sqlite` (default) | `firestore` |
+|-----------|--------------------|-------------|
+| Outbound token + registration store | SQLite + MultiFernet encryption, single-instance | Firestore + MultiFernet encryption, shared |
+| Broker key store | SQLite + SHA-256 hashing, single-instance | Firestore + SHA-256 hashing, shared |
+| Inbound OAuth store (codes, bearer/refresh tokens, DCR clients) | SQLite, single-instance | Firestore with atomic refresh rotation, shared |
+| Outbound OAuth nonces + PKCE verifiers | In-memory, single-process | Firestore, shared |
+| Connect tokens | In-memory, single-process | Firestore, shared |
+| DCR rate limiter | In-memory, single-process | Firestore, shared |
+| Token refresh locks | `asyncio.Lock`, per-process | `asyncio.Lock`, per-process |
+| Discovery metadata cache | In-memory, per-instance | In-memory, per-instance |
+
+The last two rows stay per-instance on both backends. The discovery cache is a pure cache — each instance re-fetches `.well-known` metadata independently. Refresh locks only serialize refreshes within one process; two instances can still refresh the same token concurrently, which is benign for providers that tolerate refresh-token reuse but may cause a transient `invalid_grant` (and re-auth) with strict-rotation providers.
+
+The startup abort for inbound OAuth (`broker.oauth.enabled=true` + `WEB_CONCURRENCY > 1`) fires only on non-Firestore backends — see [Inbound OAuth prerequisites](#prerequisites-1).
 
 ## API Stability
 
