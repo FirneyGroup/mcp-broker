@@ -5,12 +5,13 @@ existing TokenStore + SQLiteBrokerKeyStore patterns. Methods are async (for
 interface symmetry with other stores) but the underlying SQLite calls are
 synchronous.
 
-v1.0 ships a single concrete class — no abstraction layer. If/when a second
-backend is needed (Firestore, Postgres), an `InboundAuthStore` interface gets
-extracted at that time (YAGNI).
+This is the SQLite implementation of the `InboundAuthStore` ABC defined in
+`auth_store_interfaces.py`. A Firestore sibling for multi-instance Cloud Run
+lives in `firestore_inbound_auth_store.py`.
 
-WARNING: Single-process only. Multi-worker uvicorn deployments need either
-sticky-session routing or a shared backing store.
+WARNING: This SQLite backend is single-process only. Multi-worker uvicorn
+deployments need either sticky-session routing or a shared backing store (use
+the Firestore backend for horizontal scaling).
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ from broker.models.inbound_auth import (
     RegistrationResponse,
     RotatedTokenPair,
 )
+from broker.services.auth_store_interfaces import InboundAuthStore
 from broker.services.inbound_oauth_helpers import (
     ACCESS_TOKEN_PREFIX,
     CLIENT_ID_PREFIX,
@@ -58,10 +60,11 @@ REFRESH_TOKEN_BYTES = 32
 CLIENT_ID_BYTES = 32
 FAMILY_ID_BYTES = 16
 
-# Window after a refresh row's `expires_at` during which we retain rows with
+# Window after a refresh row's `used_at` during which we retain rows with
 # `used_at NOT NULL` so replay attempts past natural expiry still surface as
 # OAuth 2.1 §4.3.1 replay (family revoke) rather than fall through as "not
-# found". 7 days balances replay-window coverage against table growth.
+# found". `cleanup_expired` measures the window from `used_at`, not `expires_at`.
+# 7 days balances replay-window coverage against table growth.
 REPLAY_DETECTION_WINDOW_SECONDS = 7 * 24 * 3600
 
 # === INTERNAL ARG BUNDLES ===
@@ -101,6 +104,17 @@ class InvalidGrantError(RuntimeError):
     """
 
 
+class RotationContendedError(RuntimeError):
+    """Refresh rotation could not complete due to storage contention.
+
+    Distinct from `InvalidGrantError`: the refresh token is still LIVE (no replay,
+    no expiry) — the rotation just lost a storage race repeatedly. Callers should
+    surface a retryable 5xx, NOT `invalid_grant` (which would wrongly force a full
+    re-auth on a valid token). Only the optimistic Firestore backend can raise
+    this; the SQLite backend serializes via `BEGIN IMMEDIATE`.
+    """
+
+
 # === TOKEN GENERATION HELPERS ===
 
 
@@ -135,7 +149,7 @@ def generate_family_id() -> str:
 # === STORE ===
 
 
-class SQLiteInboundAuthStore:
+class SQLiteInboundAuthStore(InboundAuthStore):
     """OAuth 2.1 inbound auth store backed by SQLite.
 
     Three tables: `oauth_clients` (DCR), `oauth_codes` (authorization codes,

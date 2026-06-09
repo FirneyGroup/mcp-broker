@@ -69,7 +69,7 @@ class TemplateNativeConnector(NativeConnector):
         # TODO: OAuth endpoints for the provider.
         oauth_authorize_url="FILL_ME_IN",
         oauth_token_url="FILL_ME_IN",  # noqa: S106 -- endpoint URL, not a password
-        scopes=[],
+        scopes=(),
     )
 
     @native_tool(_EXAMPLE_TOOL_META)

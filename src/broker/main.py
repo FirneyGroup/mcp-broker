@@ -10,6 +10,7 @@ import contextlib
 import html
 import importlib
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from http import HTTPStatus
@@ -33,8 +34,20 @@ from broker.connectors.registry import ConnectorRegistry
 from broker.middleware.auth import BrokerAuthMiddleware
 from broker.models.connection import AppConnection
 from broker.services.api_key_store import BrokerKeyStore, ConnectTokenStore
+from broker.services.auth_store_interfaces import (
+    ConnectTokenStoreABC,
+    DCRRateLimiter,
+    InboundAuthStore,
+    OutboundOAuthStateStore,
+)
 from broker.services.client_registry import BrokerClientRegistry
 from broker.services.discovery import OAuthDiscovery, resolve_oauth
+from broker.services.firestore_broker_key_store import FirestoreBrokerKeyStore
+from broker.services.firestore_client import close_firestore_client
+from broker.services.firestore_connect_token_store import FirestoreConnectTokenStore
+from broker.services.firestore_dcr_rate_limiter import FirestoreDCRRateLimiter
+from broker.services.firestore_inbound_auth_store import FirestoreInboundAuthStore
+from broker.services.firestore_outbound_state_store import FirestoreOutboundOAuthStateStore
 from broker.services.inbound_auth_store import SQLiteInboundAuthStore
 from broker.services.oauth import OAuthHandler
 from broker.services.proxy import clients, get_valid_token, proxy_mcp_request
@@ -43,6 +56,11 @@ from broker.services.store import TokenStore, create_token_store
 
 logger = logging.getLogger(__name__)
 
+# How far ahead of expiry the maintenance loop refreshes outbound tokens.
+# Matches the default window of ``TokenStore.list_expiring`` so the loop
+# refreshes exactly the connections the store reports as expiring.
+TOKEN_REFRESH_BUFFER_SECONDS = 600
+
 # Module-level references (set during lifespan startup)
 _store: TokenStore | None = None
 _oauth_handler: OAuthHandler | None = None
@@ -50,8 +68,8 @@ _settings: BrokerSettings | None = None
 _discovery: OAuthDiscovery | None = None
 _key_store: BrokerKeyStore | None = None
 _client_registry: BrokerClientRegistry | None = None
-_connect_token_store: ConnectTokenStore | None = None
-_inbound_auth_store: SQLiteInboundAuthStore | None = None
+_connect_token_store: ConnectTokenStoreABC | None = None
+_inbound_auth_store: InboundAuthStore | None = None
 _oauth_endpoints: OAuthServerEndpoints | None = None
 
 
@@ -91,12 +109,12 @@ def _get_client_registry() -> BrokerClientRegistry | None:
     return _client_registry
 
 
-def _get_connect_token_store() -> ConnectTokenStore | None:
+def _get_connect_token_store() -> ConnectTokenStoreABC | None:
     """Return connect token store (None before lifespan init — middleware returns 503)."""
     return _connect_token_store
 
 
-def _get_inbound_auth_store() -> SQLiteInboundAuthStore | None:
+def _get_inbound_auth_store() -> InboundAuthStore | None:
     """Return inbound OAuth auth store (None when ``broker.oauth.enabled=false``).
 
     Middleware fails closed on ``None`` only when ``oauth_enabled`` is also true;
@@ -108,6 +126,85 @@ def _get_inbound_auth_store() -> SQLiteInboundAuthStore | None:
 # =============================================================================
 # LIFESPAN HELPERS
 # =============================================================================
+
+
+def _abort_if_multiworker_with_oauth(oauth_enabled: bool, store_backend: str = "sqlite") -> None:
+    """Refuse to start under multi-worker uvicorn when inbound OAuth is on AND
+    the store backend keeps OAuth state process-local.
+
+    With the default (sqlite / in-memory) backend the DCR rate limiter and the
+    outbound nonce/PKCE state are per-process: ``WEB_CONCURRENCY > 1`` would make
+    the limiter cap (cap × N) and let per-flow state land on a different worker
+    than the one that issued it. With ``store.backend == "firestore"`` all of
+    that state is shared across instances (inbound auth store, connect tokens,
+    outbound nonce/PKCE, and the DCR limiter), so multi-worker is legal.
+
+    This runs inside lifespan startup so the invariant holds for ANY launch
+    shape — including the production Dockerfile, which runs
+    ``uvicorn broker.main:app`` directly and never calls ``__main__.main()``.
+    ``__main__`` performs the same check pre-uvicorn so the ``./start`` dev
+    path fails fast with a friendly ``SystemExit`` before a worker spins up;
+    both checks exist because neither entrypoint is guaranteed to run.
+    """
+    if not oauth_enabled or store_backend == "firestore":
+        return
+    workers = int(os.environ.get("WEB_CONCURRENCY", "1"))
+    if workers > 1:
+        raise RuntimeError(
+            "broker.oauth.enabled=true is incompatible with WEB_CONCURRENCY="
+            f"{workers} on the '{store_backend}' store backend. The DCR rate "
+            "limiter and outbound OAuth state are per-process. Set "
+            "WEB_CONCURRENCY=1, switch store.backend to 'firestore' for "
+            "multi-worker, or disable broker.oauth in settings.yaml."
+        )
+
+
+async def _build_connect_token_store(settings: BrokerSettings) -> ConnectTokenStoreABC:
+    """Connect token store: Firestore (shared) on the firestore backend, else in-memory."""
+    if settings.store.backend == "firestore" and settings.store.firestore is not None:
+        fs = settings.store.firestore
+        store = FirestoreConnectTokenStore(
+            project_id=fs.project_id, database=fs.database, collection_prefix=fs.collection_prefix
+        )
+        await store.setup()
+        return store
+    return ConnectTokenStore()
+
+
+async def _build_outbound_state_store(settings: BrokerSettings) -> OutboundOAuthStateStore | None:
+    """Outbound OAuth state store: Firestore (shared) on the firestore backend.
+
+    Returns None for non-Firestore backends so OAuthHandler falls back to its
+    in-memory module singleton (preserving the single-instance default).
+    """
+    if settings.store.backend == "firestore" and settings.store.firestore is not None:
+        fs = settings.store.firestore
+        store = FirestoreOutboundOAuthStateStore(
+            project_id=fs.project_id, database=fs.database, collection_prefix=fs.collection_prefix
+        )
+        await store.setup()
+        return store
+    return None
+
+
+async def _build_dcr_rate_limiter(settings: BrokerSettings) -> DCRRateLimiter | None:
+    """DCR rate limiter: Firestore (shared) on the firestore backend.
+
+    Returns None for non-Firestore backends so OAuthServerEndpoints constructs
+    its in-memory default (preserving the single-worker invariant).
+    """
+    if settings.store.backend == "firestore" and settings.store.firestore is not None:
+        fs = settings.store.firestore
+        limiter = FirestoreDCRRateLimiter(
+            max_per_window=settings.broker.oauth.dcr_rate_limit_per_ip,
+            window_seconds=settings.broker.oauth.dcr_rate_limit_window_seconds,
+            project_id=fs.project_id,
+            database=fs.database,
+            collection_prefix=fs.collection_prefix,
+        )
+        await limiter.setup()
+        return limiter
+    return None
 
 
 def _load_connectors(connector_names: list[str]) -> None:
@@ -160,7 +257,7 @@ async def _run_discovery(discovery: OAuthDiscovery, connectors: list[BaseConnect
             continue
         try:
             await discovery.discover_metadata(connector.meta.name, mcp_oauth_url)
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 -- startup continues if one connector's discovery fails; only its /connect breaks, not the whole broker
             logger.exception(
                 "[Broker] Discovery failed for %s — /connect will fail", connector.meta.name
             )
@@ -191,6 +288,12 @@ async def lifespan(app: FastAPI):  # noqa: PLR0915 — startup sequence, all ste
     #    propagate — uvicorn will log it and restart the worker.
     _settings = load_settings()
 
+    # 1b. Enforce the single-worker inbound-OAuth invariant for every launch
+    #     shape. __main__ checks this pre-uvicorn, but the production Dockerfile
+    #     runs `uvicorn broker.main:app` directly and bypasses __main__ — so the
+    #     check must also live here, on the actual startup path.
+    _abort_if_multiworker_with_oauth(_settings.broker.oauth.enabled, _settings.store.backend)
+
     # 2. Configure logging from settings
     logging.basicConfig(
         level=getattr(logging, _settings.broker.log_level.upper(), logging.INFO),
@@ -201,8 +304,14 @@ async def lifespan(app: FastAPI):  # noqa: PLR0915 — startup sequence, all ste
     # 3. Build client registry from YAML clients config
     _client_registry = BrokerClientRegistry(_settings.clients)
 
-    # 4. Create and initialize API key store
-    key_store = SQLiteBrokerKeyStore(db_path=_settings.store.sqlite.key_db_path)
+    # 4. Create and initialize API key store (backend-aware).
+    if _settings.store.backend == "firestore" and _settings.store.firestore is not None:
+        fs = _settings.store.firestore
+        key_store: BrokerKeyStore = FirestoreBrokerKeyStore(
+            project_id=fs.project_id, database=fs.database, collection_prefix=fs.collection_prefix
+        )
+    else:
+        key_store = SQLiteBrokerKeyStore(db_path=_settings.store.sqlite.key_db_path)
     await key_store.setup()
     _key_store = key_store
 
@@ -210,22 +319,34 @@ async def lifespan(app: FastAPI):  # noqa: PLR0915 — startup sequence, all ste
     #     Leaving it None keeps the broker's surface area unchanged for users
     #     who haven't flipped `broker.oauth.enabled`.
     if _settings.broker.oauth.enabled:
-        inbound_store = SQLiteInboundAuthStore(db_path=_settings.broker.oauth.db_path)
+        if _settings.store.backend == "firestore" and _settings.store.firestore is not None:
+            fs_oauth = _settings.store.firestore
+            inbound_store: InboundAuthStore = FirestoreInboundAuthStore(
+                project_id=fs_oauth.project_id,
+                database=fs_oauth.database,
+                collection_prefix=fs_oauth.collection_prefix,
+            )
+        else:
+            inbound_store = SQLiteInboundAuthStore(db_path=_settings.broker.oauth.db_path)
         await inbound_store.setup()
         _inbound_auth_store = inbound_store
-        # OAuthServerEndpoints owns the in-memory `_DCRRateLimiter` — it MUST be
-        # a singleton across requests, otherwise the rate-limiter's `_events`
-        # dict resets on every call and the 10/15min/IP cap is unenforceable.
+        # The DCR rate limiter MUST be a singleton across requests so its counter
+        # accumulates. On Firestore it is shared across instances (so multi-worker
+        # is legal); otherwise the in-memory default is constructed inside
+        # OAuthServerEndpoints and the single-worker invariant applies.
+        rate_limiter = await _build_dcr_rate_limiter(_settings)
         _oauth_endpoints = OAuthServerEndpoints(
             inbound_auth_store=inbound_store,
             config=_settings.broker.oauth,
             connector_names_provider=ConnectorRegistry.list_names,
             public_url=_settings.broker.public_url,
+            rate_limiter=rate_limiter,
         )
         logger.info("[Broker] Inbound OAuth enabled (db=%s)", _settings.broker.oauth.db_path)
 
-    # 5. Create connect token store (in-memory, single-use tokens for browser OAuth)
-    _connect_token_store = ConnectTokenStore()
+    # 5. Create connect token store: Firestore (shared, single-use across
+    #    instances) or the in-memory default (single-process).
+    _connect_token_store = await _build_connect_token_store(_settings)
 
     # 6. Import connector modules — config-driven discovery
     _load_connectors(_settings.broker.connectors)
@@ -245,9 +366,15 @@ async def lifespan(app: FastAPI):  # noqa: PLR0915 — startup sequence, all ste
 
     # 8. Create token store
     _store = create_token_store(_settings.store, _settings.broker.encryption_keys)
+    # Initialize the store (Firestore acquires its client; SQLite is a no-op).
+    await _store.setup()
 
-    # 9. Create OAuth handler
-    _oauth_handler = OAuthHandler(state_secret=_settings.broker.state_secret)
+    # 9. Create OAuth handler. On Firestore the outbound nonce/PKCE state is
+    #    shared across instances; otherwise the in-memory default is used.
+    outbound_state_store = await _build_outbound_state_store(_settings)
+    _oauth_handler = OAuthHandler(
+        state_secret=_settings.broker.state_secret, state_store=outbound_state_store
+    )
 
     # 10. Create discovery + discover metadata for discovery-enabled connectors
     _discovery = OAuthDiscovery()
@@ -273,6 +400,9 @@ async def lifespan(app: FastAPI):  # noqa: PLR0915 — startup sequence, all ste
             await refresh_task
     if _key_store:
         await _key_store.teardown()
+    if _store:
+        await _store.teardown()
+    await close_firestore_client()
     for client in clients.values():
         await client.aclose()
     clients.clear()
@@ -622,7 +752,7 @@ async def oauth_connect(
     except KeyError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
 
-    url = _get_oauth_handler().build_authorize_url(
+    url = await _get_oauth_handler().build_authorize_url(
         connector, identity.app_key, resolved, callback_url
     )
     return RedirectResponse(url)
@@ -656,13 +786,40 @@ async def _exchange_and_store_token(  # noqa: PLR0913 — OAuth exchange needs a
 
 
 @app.get("/oauth/{connector_name}/callback")
-async def oauth_callback(connector_name: str, code: str, state: str, request: Request):
+async def oauth_callback(  # noqa: PLR0913 -- FastAPI binds each callback query param positionally; the OAuth 2 success and error redirects together carry all six
+    connector_name: str,
+    request: Request,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    error_description: str | None = None,
+):
     """OAuth callback — exchange code, store token, show success page.
 
     No auth needed — callback is from OAuth provider. Signed state protects it.
+
+    Providers signal user denial / errors with ``?error=...&state=...`` and no
+    ``code`` (RFC 6749 §4.1.2.1). These params are optional so FastAPI does not
+    422 on that legitimate shape; we detect it below and return the same
+    400 "Connection failed" page the exchange-failure path uses.
     """
     connector = _get_connector_or_404(connector_name)
     _reject_sidecar_managed(connector)
+
+    # Provider-reported error, or a malformed callback missing code/state.
+    # error_description is provider-supplied free text — log it for diagnostics
+    # but it carries no secret (the authorization code never reaches this branch).
+    if error or not code or not state:
+        logger.warning(
+            "[Broker] OAuth callback rejected for %s: error=%s description=%s",
+            connector_name,
+            error,
+            error_description,
+        )
+        return HTMLResponse(
+            "<h1>Connection failed</h1><p>Authentication failed. Please try again.</p>",
+            status_code=400,
+        )
 
     try:
         returned_app_key = await _exchange_and_store_token(
@@ -676,7 +833,7 @@ async def oauth_callback(connector_name: str, code: str, state: str, request: Re
             "<h1>Connection failed</h1><p>Authentication failed. Please try again.</p>",
             status_code=400,
         )
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 -- callback returns a 500 page for any unexpected exchange failure rather than surfacing a traceback to the browser
         logger.exception("[Broker] OAuth callback error")
         return HTMLResponse(
             "<h1>Connection failed</h1><p>Unexpected error — check broker logs.</p>",
@@ -739,7 +896,7 @@ async def _refresh_single_connection(  # noqa: PLR0913 — refresh needs all ser
         if refreshed and refreshed.access_token != connection.access_token:
             return "refreshed"
         return "skipped"
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 -- the refresh loop must not die on one connection; mark it failed and continue with the rest
         logger.exception("[Refresh] Failed: %s/%s", app_key, connector_name)
         return "failed"
 
@@ -754,7 +911,7 @@ async def _refresh_expiring_tokens(base_url: str) -> dict[str, int]:
     settings = _get_settings()
     discovery = _get_discovery()
 
-    expiring = await store.list_expiring(buffer_seconds=600)
+    expiring = await store.list_expiring(buffer_seconds=TOKEN_REFRESH_BUFFER_SECONDS)
     results: dict[str, int] = {"refreshed": 0, "failed": 0, "skipped": 0}
 
     for app_key, connector_name, connection in expiring:
@@ -803,7 +960,7 @@ async def _maintenance_loop(base_url: str, interval_seconds: int) -> None:
             if _inbound_auth_store is not None:
                 await _inbound_auth_store.cleanup_expired()
             if _oauth_endpoints is not None:
-                _oauth_endpoints.cleanup_rate_limiter()
+                await _oauth_endpoints.cleanup_rate_limiter()
         except Exception:  # noqa: BLE001 -- background loop swallows all to keep ticking
             logger.exception("[Maintenance] Unexpected error in loop")
         await asyncio.sleep(interval_seconds)

@@ -29,10 +29,12 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import Response
+from starlette.types import ASGIApp
 
+from broker.services.api_key_store import BrokerAppIdentity
 from broker.services.inbound_oauth_helpers import (
     audit_log_oauth_event,
     build_bearer_challenge,
@@ -45,7 +47,8 @@ from broker.services.inbound_oauth_helpers import (
 
 if TYPE_CHECKING:
     from broker.models.inbound_auth import InboundToken
-    from broker.services.api_key_store import BrokerAppIdentity, BrokerKeyStore, ConnectTokenStore
+    from broker.services.api_key_store import BrokerKeyStore
+    from broker.services.auth_store_interfaces import ConnectTokenStoreABC
     from broker.services.client_registry import BrokerClientRegistry
 
 logger = logging.getLogger(__name__)
@@ -91,10 +94,10 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
 
     def __init__(  # noqa: PLR0913 — middleware init needs all deps; new args default to disabled
         self,
-        app,
+        app: ASGIApp,
         get_key_store: Callable[[], BrokerKeyStore | None],
         get_client_registry: Callable[[], BrokerClientRegistry | None],
-        get_connect_token_store: Callable[[], ConnectTokenStore | None],
+        get_connect_token_store: Callable[[], ConnectTokenStoreABC | None],
         exempt_prefixes: tuple[str, ...] = ("/health", "/admin"),
         exempt_paths: tuple[str, ...] = (),
         *,
@@ -118,7 +121,7 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
         self._get_inbound_auth_store = get_inbound_auth_store
         self._get_connector_names = get_connector_names
 
-    async def dispatch(self, request: Request, call_next):
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         """Validate auth or skip for exempt paths."""
         path = request.url.path
 
@@ -191,7 +194,7 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
 
         # Browser OAuth connect — use single-use connect token (not raw broker key)
         if not app_key_claim and _OAUTH_CONNECT_PATTERN.match(path):
-            return self._verify_connect_token(request, client_registry)
+            return await self._verify_connect_token(request, client_registry)
 
         if not app_key_claim or not broker_key:
             return self._unauthorized_for_path(path)
@@ -235,17 +238,29 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
         # legacy key auth → silent 403, breaking interop without diagnostics.
         if not authz.lower().startswith("bearer "):
             return None
-        return await self._verify_bearer(request, path, authz, client_registry)
+        raw_token = authz[len("Bearer ") :].strip()
+
+        # Bound the token before hashing — valid broker-issued bearer tokens are
+        # ~43 chars (32 random bytes, base64url). An oversized value is never a
+        # real token, so skip the SHA-256 and route through the coarse failure
+        # path (no oracle, empty hash prefix in the audit log). Matches the
+        # MAX_KEY_LENGTH guard on the broker key and connect token.
+        if len(raw_token) > MAX_KEY_LENGTH:
+            return self._bearer_audit_fail(path, "", "not_found")
+        return await self._verify_bearer(request, path, raw_token, client_registry)
 
     async def _verify_bearer(
         self,
         request: Request,
         path: str,
-        authz_header: str,
+        raw_token: str,
         client_registry: BrokerClientRegistry,
     ) -> BrokerAppIdentity | Response:
-        """Validate a bearer token, enforce audience, and build identity."""
-        raw_token = authz_header[len("Bearer ") :].strip()
+        """Validate a bearer token, enforce audience, and build identity.
+
+        Caller MUST have bounded ``raw_token`` to ``MAX_KEY_LENGTH`` — this
+        method hashes it unconditionally.
+        """
         token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
 
         store = self._get_inbound_auth_store()
@@ -315,8 +330,6 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
         Caller MUST have verified ``client_registry.get(token_row.app_key)`` is
         non-None — this method assumes the lookup succeeds.
         """
-        from broker.services.api_key_store import BrokerAppIdentity
-
         app_config = client_registry.get(token_row.app_key)
         assert app_config is not None  # noqa: S101 -- caller guarantees per docstring
         return BrokerAppIdentity(
@@ -376,7 +389,7 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
             return f"{public_url}/.well-known/oauth-protected-resource"
         return f"{public_url}/.well-known/oauth-protected-resource/proxy/{connector_name}"
 
-    def _verify_connect_token(
+    async def _verify_connect_token(
         self,
         request: Request,
         client_registry: BrokerClientRegistry,
@@ -391,7 +404,7 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
             return _service_unavailable()
 
         # Consume token (single-use — deleted after validation)
-        verified_app_key = token_store.consume(connect_token)
+        verified_app_key = await token_store.consume(connect_token)
         if not verified_app_key:
             return _unauthorized()
 
@@ -403,8 +416,6 @@ class BrokerAuthMiddleware(BaseHTTPMiddleware):
         client_registry: BrokerClientRegistry,
     ) -> BrokerAppIdentity | Response:
         """Look up app config and construct identity. Returns 401 if app not found."""
-        from broker.services.api_key_store import BrokerAppIdentity
-
         app_config = client_registry.get(verified_app_key)
         if not app_config:
             return _unauthorized()

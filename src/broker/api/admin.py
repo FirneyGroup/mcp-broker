@@ -25,11 +25,13 @@ from typing import TYPE_CHECKING
 from fastapi import Request
 from starlette.responses import Response
 
+from broker.services.api_key_store import CONNECT_TOKEN_TTL
+
 if TYPE_CHECKING:
     from broker.connectors.base import BaseConnector
-    from broker.services.api_key_store import BrokerKeyStore, ConnectTokenStore
+    from broker.services.api_key_store import BrokerKeyStore
+    from broker.services.auth_store_interfaces import ConnectTokenStoreABC, InboundAuthStore
     from broker.services.client_registry import BrokerClientRegistry
-    from broker.services.inbound_auth_store import SQLiteInboundAuthStore
     from broker.services.store import TokenStore
 
 # Type for the refresh callback injected from main.py
@@ -78,10 +80,10 @@ class AdminEndpoints:
         key_store: BrokerKeyStore,
         admin_key: str,
         client_registry: BrokerClientRegistry,
-        connect_token_store: ConnectTokenStore,
+        connect_token_store: ConnectTokenStoreABC,
         token_store: TokenStore | None = None,
         refresh_callback: RefreshCallback | None = None,
-        inbound_auth_store: SQLiteInboundAuthStore | None = None,
+        inbound_auth_store: InboundAuthStore | None = None,
         connector_lookup: Callable[[str], BaseConnector | None] | None = None,
     ) -> None:
         self._key_store = key_store
@@ -132,6 +134,15 @@ class AdminEndpoints:
         app_key, error_response = await self._parse_validated_app_key(request)
         if error_response:
             return error_response
+
+        # Purge-on-create, gated on has_key so a live app's tokens are never wiped
+        # before the 409: re-provisioning an app_key must not inherit a prior
+        # incarnation's tokens, even if a past delete-cascade was interrupted.
+        if not await self._key_store.has_key(app_key):
+            if self._token_store is not None:
+                await self._token_store.delete_all_for_app(app_key)
+            if self._inbound_auth_store is not None:
+                await self._inbound_auth_store.delete_all_for_app(app_key)
 
         try:
             raw_key = await self._key_store.create_key(app_key)
@@ -191,7 +202,7 @@ class AdminEndpoints:
         a key under the same app_key cannot silently regain access to
         previously-linked third-party accounts. Cascade covers BOTH outbound
         OAuth tokens (``TokenStore``) AND inbound OAuth state (``oauth_codes``
-        + ``inbound_tokens`` via ``SQLiteInboundAuthStore.delete_all_for_app``)
+        + ``inbound_tokens`` via ``InboundAuthStore.delete_all_for_app``)
         per AGENTS.md Known Gotcha #2.
         """
         if not self._verify_admin(request):
@@ -231,8 +242,10 @@ class AdminEndpoints:
                 400, {"error": f"App '{app_key}' has no API key — create one first"}
             )
 
-        token = self._connect_token_store.create(app_key)
-        return _json_response(201, {"app_key": app_key, "connect_token": token, "ttl_seconds": 300})
+        token = await self._connect_token_store.create(app_key)
+        return _json_response(
+            201, {"app_key": app_key, "connect_token": token, "ttl_seconds": CONNECT_TOKEN_TTL}
+        )
 
     async def refresh_tokens(self, request: Request) -> Response:
         """Proactively refresh expiring tokens."""

@@ -4,9 +4,10 @@ This module implements the AS role. The broker is both AS and resource server
 (co-located per claude.ai bug #82 — claude.ai derives /authorize from the MCP
 base URL rather than reading authorization_servers from AS metadata).
 
-WARNING: The in-memory DCR rate limiter is single-process. Multi-worker
-deployments need a shared backing store; ``broker/__main__.py`` aborts startup
-when ``WEB_CONCURRENCY > 1`` AND ``broker.oauth.enabled`` is true.
+WARNING: The default in-memory DCR rate limiter is single-process. The lifespan
+injects a Firestore-backed limiter when ``store.backend == "firestore"`` so the
+cap holds across instances; with any other backend, ``broker/__main__.py`` and
+the lifespan abort startup when ``WEB_CONCURRENCY > 1`` AND ``broker.oauth.enabled``.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from urllib.parse import urlencode
 from fastapi import Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, ConfigDict
+from starlette.datastructures import FormData
 
 from broker.config import OAuthInboundConfig
 from broker.models.inbound_auth import (
@@ -35,9 +37,10 @@ from broker.models.inbound_auth import (
     RotatedTokenPair,
     TokenResponse,
 )
+from broker.services.auth_store_interfaces import DCRRateLimiter, InboundAuthStore
 from broker.services.inbound_auth_store import (
     InvalidGrantError,
-    SQLiteInboundAuthStore,
+    RotationContendedError,
     generate_access_token,
     generate_family_id,
     generate_refresh_token,
@@ -144,7 +147,7 @@ _NO_STORE_HEADERS = {
 # === RATE LIMITER ===
 
 
-class _DCRRateLimiter:
+class _DCRRateLimiter(DCRRateLimiter):
     """In-memory sliding-window rate limiter for /oauth/register.
 
     Single-process only — mirrors ``ConnectTokenStore`` caveat. Multi-worker
@@ -163,7 +166,7 @@ class _DCRRateLimiter:
         self._window_seconds = window_seconds
         self._events: dict[str, list[float]] = {}
 
-    def allow(self, client_ip: str) -> bool:
+    async def allow(self, client_ip: str) -> bool:
         """True if the IP is under the cap; records the event when True."""
         now_ts = time.time()
         events = [
@@ -176,7 +179,7 @@ class _DCRRateLimiter:
         self._events[client_ip] = events
         return True
 
-    def cleanup_expired(self) -> None:
+    async def cleanup_expired(self) -> None:
         """Drop per-IP entries whose timestamps have all aged out of the window.
 
         Called from the broker's background maintenance loop. Cheap O(N) walk —
@@ -224,10 +227,11 @@ class OAuthServerEndpoints:
 
     def __init__(  # noqa: PLR0913 -- constructor binds all collaborators; one-time wiring, not a hot path
         self,
-        inbound_auth_store: SQLiteInboundAuthStore,
+        inbound_auth_store: InboundAuthStore,
         config: OAuthInboundConfig,
         connector_names_provider: Callable[[], list[str]],
         public_url: str,
+        rate_limiter: DCRRateLimiter | None = None,
     ) -> None:
         self._inbound_auth_store = inbound_auth_store
         self._config = config
@@ -235,20 +239,23 @@ class OAuthServerEndpoints:
         # ``public_url`` carries the operator's trailing slash for OAuth-callback
         # concatenation; we want the bare issuer form here.
         self._public_url = public_url.rstrip("/")
-        self._dcr_rate_limiter = _DCRRateLimiter(
+        # Default to the process-local in-memory limiter so single-instance
+        # behaviour is unchanged; the lifespan injects a Firestore-backed limiter
+        # when ``store.backend == "firestore"`` so the cap holds across instances.
+        self._dcr_rate_limiter = rate_limiter or _DCRRateLimiter(
             max_per_window=config.dcr_rate_limit_per_ip,
             window_seconds=config.dcr_rate_limit_window_seconds,
         )
 
     # --- BACKGROUND MAINTENANCE ---
 
-    def cleanup_rate_limiter(self) -> None:
+    async def cleanup_rate_limiter(self) -> None:
         """Reap stale per-IP entries from the DCR rate limiter.
 
-        Wired into the broker's maintenance loop so the limiter's dict doesn't
-        grow indefinitely as one-shot IPs come and go.
+        Wired into the broker's maintenance loop so the limiter's dict (or
+        Firestore docs) doesn't grow indefinitely as one-shot IPs come and go.
         """
-        self._dcr_rate_limiter.cleanup_expired()
+        await self._dcr_rate_limiter.cleanup_expired()
 
     # --- /oauth/register ---
 
@@ -257,7 +264,7 @@ class OAuthServerEndpoints:
         if not self._config.enabled:
             return _not_found()
         client_ip = self._client_ip(request)
-        rate_error = self._check_dcr_rate_limit(client_ip)
+        rate_error = await self._check_dcr_rate_limit(client_ip)
         if rate_error is not None:
             return rate_error
         registration, parse_error = await _parse_registration_request(request)
@@ -278,9 +285,9 @@ class OAuthServerEndpoints:
             headers=_NO_STORE_HEADERS,
         )
 
-    def _check_dcr_rate_limit(self, client_ip: str) -> Response | None:
+    async def _check_dcr_rate_limit(self, client_ip: str) -> Response | None:
         """Return a 429 ``_oauth_error`` if this IP is over the DCR cap, else ``None``."""
-        if self._dcr_rate_limiter.allow(client_ip):
+        if await self._dcr_rate_limiter.allow(client_ip):
             return None
         return _oauth_error(
             HTTPStatus.TOO_MANY_REQUESTS, "invalid_request", "registration rate limit exceeded"
@@ -318,6 +325,10 @@ class OAuthServerEndpoints:
         if not self._config.enabled:
             return _not_found()
         body = await request.form()
+        if _has_duplicate_form_params(body):
+            # Duplicates void the request (RFC 6749 §3.1). 400 pre-redirect:
+            # a malformed request must not be reflected back to the client.
+            return _bad_request_html("duplicate parameter")
         params = {key: str(value) for key, value in body.items()}
         client_or_error = await self._resolve_pre_redirect(params)
         if isinstance(client_or_error, Response):
@@ -351,6 +362,8 @@ class OAuthServerEndpoints:
         if not self._config.enabled:
             return _not_found()
         form = await request.form()
+        if _has_duplicate_form_params(form):
+            return _oauth_error(HTTPStatus.BAD_REQUEST, "invalid_request", "duplicate parameter")
         params = {key: str(value) for key, value in form.items()}
         grant_type = params.get("grant_type", "")
         client_or_error = await self._authenticate_token_client(request, params)
@@ -398,6 +411,10 @@ class OAuthServerEndpoints:
         if not self._config.enabled:
             return _not_found()
         form = await request.form()
+        if _has_duplicate_form_params(form):
+            # Duplicate params void the request (RFC 6749 §3.1). This is a
+            # malformed request, distinct from RFC 7009 §2.2's 200-on-invalid-client.
+            return _oauth_error(HTTPStatus.BAD_REQUEST, "invalid_request", "duplicate parameter")
         params = {key: str(value) for key, value in form.items()}
         client_or_error = await self._authenticate_token_client(request, params)
         if isinstance(client_or_error, Response):
@@ -594,6 +611,14 @@ class OAuthServerEndpoints:
         explicit ``invalid_scope``. client_id mismatch returns the SAME
         error as "not found" so the response shape can't be used as a
         confirmation oracle for whether a hash exists in the store.
+
+        Concurrency sharpness: rotation is single-use (OAuth 2.1 §4.3.1). Two
+        concurrent *legitimate* refreshes with the same refresh_token both pass
+        the ``used_at IS NULL`` precheck; the storage layer's atomic UPDATE lets
+        exactly one win, and the loser is treated as a replay → the whole token
+        family is revoked. Clients MUST serialize their refreshes; a client that
+        fires two in parallel will lose its session. This is intended OAuth 2.1
+        behaviour, documented here so it isn't mistaken for a bug.
         """
         prior_row = await self._inbound_auth_store.get_refresh_row(token_hash)
         if prior_row is None or prior_row.client_id != client_id:
@@ -606,6 +631,12 @@ class OAuthServerEndpoints:
         rotation_request = self._build_rotation_request(prior_row, client_id, scope_or_error)
         try:
             return await self._inbound_auth_store.rotate_refresh(rotation_request)
+        except RotationContendedError:
+            # Refresh is still live; the rotation lost a storage race. Retryable 5xx,
+            # NOT invalid_grant (which would wrongly force the client to re-auth).
+            return _oauth_error(
+                HTTPStatus.SERVICE_UNAVAILABLE, "server_error", "rotation contended; retry"
+            )
         except InvalidGrantError:
             # Coarse, hash-blind message — must match the pre-check replay
             # path and the "not found" path so a client cannot distinguish
@@ -768,6 +799,17 @@ def _not_found() -> Response:
     """404 used when ``broker.oauth.enabled=false`` — keeps the OAuth surface
     invisible to clients that probe without checking ``.well-known/`` first."""
     return JSONResponse({"error": "not_found"}, status_code=HTTPStatus.NOT_FOUND)
+
+
+def _has_duplicate_form_params(form: FormData) -> bool:
+    """Detect duplicate parameters in a parsed form body.
+
+    RFC 6749 §3.1: request parameters MUST NOT be included more than once. The
+    last-one-wins ``dict(form)`` collapse silently hides a duplicate, so compare
+    the raw multi-item count against the de-duplicated count instead.
+    """
+    items = form.multi_items()
+    return len(items) != len({key for key, _ in items})
 
 
 def _oauth_error(status_code: int, code: str, description: str) -> Response:

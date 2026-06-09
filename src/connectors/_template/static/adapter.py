@@ -34,8 +34,8 @@ class TemplateStaticConnector(BaseConnector):
         oauth_authorize_url="FILL_ME_IN",
         # TODO: OAuth token endpoint from the provider's docs.
         oauth_token_url="FILL_ME_IN",  # noqa: S106 -- endpoint URL, not a password
-        # TODO: minimum necessary scopes. Empty list means the provider decides.
-        scopes=[],
+        # TODO: minimum necessary scopes. Empty means the provider decides.
+        scopes=(),
     )
 
     # === HOOK OVERRIDES (uncomment only if the provider deviates from standard OAuth 2.1) ===

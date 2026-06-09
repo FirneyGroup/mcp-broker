@@ -22,6 +22,12 @@ if TYPE_CHECKING:
 # Control characters that must never appear in URL fields (header injection prevention)
 _CONTROL_CHAR_PATTERN = re.compile(r"[\x00-\x1f\x7f]")
 
+
+def contains_control_chars(value: str) -> bool:
+    """Return True if the string contains control characters (header-injection risk)."""
+    return _CONTROL_CHAR_PATTERN.search(value) is not None
+
+
 # OAuth token response fields the broker stores — everything else is discarded
 _ALLOWED_TOKEN_FIELDS = {"access_token", "refresh_token", "expires_in", "token_type", "scope"}
 
@@ -30,7 +36,7 @@ def _validate_meta_urls(meta: ConnectorMeta) -> None:
     """Reject ConnectorMeta with URLs containing control characters."""
     for field_name in ("mcp_url", "oauth_authorize_url", "oauth_token_url", "mcp_oauth_url"):
         url = getattr(meta, field_name)
-        if url and _CONTROL_CHAR_PATTERN.search(url):
+        if url and contains_control_chars(url):
             raise ValueError(f"ConnectorMeta.{field_name} contains control characters: {meta.name}")
 
 
@@ -75,7 +81,7 @@ class BaseConnector:
 
     def build_auth_header(self, access_token: str) -> dict[str, str]:
         """Build the auth header for MCP requests. Default: Bearer token."""
-        if _CONTROL_CHAR_PATTERN.search(access_token):
+        if contains_control_chars(access_token):
             raise ValueError("access_token contains control characters (possible header injection)")
         return {"Authorization": f"Bearer {access_token}"}
 

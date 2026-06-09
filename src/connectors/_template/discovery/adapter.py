@@ -35,7 +35,7 @@ class TemplateDiscoveryConnector(BaseConnector):
         # Kept as documentation of the underlying OAuth server.
         oauth_authorize_url="FILL_ME_IN",
         oauth_token_url="FILL_ME_IN",  # noqa: S106 -- endpoint URL, not a password
-        scopes=[],
+        scopes=(),
         # TODO: base URL the broker hits to discover OAuth endpoints.
         # Usually the MCP server's origin (no path). Must respond at
         # /.well-known/oauth-authorization-server.

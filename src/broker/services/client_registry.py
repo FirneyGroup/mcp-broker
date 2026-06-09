@@ -12,6 +12,7 @@ class BrokerClientRegistry:
     """Resolves compound app_keys (client_id:app_id) to BrokerAppConfig."""
 
     def __init__(self, clients: dict[str, dict[str, BrokerAppConfig]]) -> None:
+        """Flatten nested {client: {app: config}} into compound app_key lookups."""
         self._apps: dict[str, BrokerAppConfig] = {}
         for client_name, apps in clients.items():
             if ":" in client_name:

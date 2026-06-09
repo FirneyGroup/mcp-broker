@@ -35,6 +35,59 @@ def test_validate_https_url_blocks_unspecified():
         _validate_https_url("https://0.0.0.0/path", "test")
 
 
+def test_connector_meta_rejects_non_https_mcp_oauth_url():
+    """Discovery base URL feeds startup discovery fetches — must be HTTPS (SSRF)."""
+    from pydantic import ValidationError
+
+    from broker.models.connector_config import ConnectorMeta
+
+    with pytest.raises(ValidationError, match="mcp_oauth_url must use HTTPS"):
+        ConnectorMeta(
+            name="evil",
+            display_name="Evil",
+            mcp_url="https://mcp.evil.com/mcp",
+            oauth_authorize_url="https://evil.com/authorize",
+            oauth_token_url="https://evil.com/token",
+            mcp_oauth_url="http://169.254.169.254",
+        )
+
+
+async def test_discover_metadata_rejects_non_https_oauth_url():
+    """Defense in depth: discovery itself rejects a non-HTTPS base URL before fetching."""
+    from broker.services.discovery import OAuthDiscovery
+
+    with pytest.raises(ValueError, match="mcp_oauth_url must use HTTPS"):
+        await OAuthDiscovery().discover_metadata("evil", "http://internal-service/")
+
+
+def test_is_internal_url_classification_is_case_insensitive():
+    """Uppercase LOCALHOST must classify the same as lowercase — case variance
+    cannot flip an internal URL into an external (HTTPS-required) one."""
+    from broker.models.connector_config import _is_internal_url
+
+    assert _is_internal_url("http://LOCALHOST/x") is True
+    assert _is_internal_url("http://localhost/x") is True
+
+
+def test_connector_meta_scopes_is_immutable_tuple():
+    """scopes feed the authorize URL; frozen ConnectorMeta must not allow the
+    list contents to be mutated by reference. A list is coerced to a tuple."""
+    from broker.models.connector_config import ConnectorMeta
+
+    meta = ConnectorMeta(
+        name="scoped",
+        display_name="Scoped",
+        mcp_url="https://mcp.scoped.com/mcp",
+        oauth_authorize_url="https://scoped.com/authorize",
+        oauth_token_url="https://scoped.com/token",
+        scopes=["read", "write"],
+    )
+    assert meta.scopes == ("read", "write")
+    assert isinstance(meta.scopes, tuple)
+    with pytest.raises(TypeError):
+        meta.scopes[0] = "admin"  # type: ignore[index] -- proving tuple immutability
+
+
 def test_unregistered_connector_returns_404(client):
     """Primary XSS defense: unregistered connector names hit 404, never reach HTML."""
     response = client.get("/oauth/bad<name>/callback?code=123&state=abc")

@@ -419,6 +419,60 @@ class TestCache:
             await slack_connector._cached_list("xoxb-x", "users.list", "members")
         assert api.call_count == 2
 
+    async def test_expired_entry_is_removed_on_access(self, slack_connector):
+        """A lookup that finds an expired entry deletes it (not just refetches).
+
+        Without the delete-on-access fix, the stale tuple lingers in self._cache
+        until overwritten, so a token that goes idle never frees its slot.
+        """
+        import time as real_time
+
+        with patch("connectors.slack.adapter._slack_paginate", new=AsyncMock()) as api:
+            api.return_value = [{"id": "U1"}]
+            await slack_connector._cached_list("xoxb-x", "users.list", "members")
+            key = next(iter(slack_connector._cache))
+            _, items = slack_connector._cache[key]
+            slack_connector._cache[key] = (real_time.monotonic() - 1.0, items)
+            # Block the refetch mid-flight so we can observe the cache between the
+            # stale-entry deletion and the repopulation.
+            populating = asyncio.Event()
+            release = asyncio.Event()
+
+            async def slow_paginate(*_args, **_kwargs):
+                populating.set()
+                await release.wait()
+                return [{"id": "U1"}]
+
+            api.side_effect = slow_paginate
+            task = asyncio.create_task(
+                slack_connector._cached_list("xoxb-x", "users.list", "members")
+            )
+            await populating.wait()
+            assert key not in slack_connector._cache
+            release.set()
+            await task
+
+    async def test_cache_bounded_under_many_token_hashes(self, slack_connector):
+        from connectors.slack.adapter import MAX_CACHE_ENTRIES
+
+        with patch("connectors.slack.adapter._slack_paginate", new=AsyncMock()) as api:
+            api.return_value = [{"id": "U1"}]
+            # Each distinct token mints a fresh token_hash → a new cache entry.
+            for token_index in range(MAX_CACHE_ENTRIES + 50):
+                await slack_connector._cached_list(f"xoxb-{token_index}", "users.list", "members")
+        assert len(slack_connector._cache) <= MAX_CACHE_ENTRIES
+
+    async def test_lock_map_shrinks_after_eviction(self, slack_connector):
+        from connectors.slack.adapter import MAX_CACHE_ENTRIES
+
+        with patch("connectors.slack.adapter._slack_paginate", new=AsyncMock()) as api:
+            api.return_value = [{"id": "U1"}]
+            for token_index in range(MAX_CACHE_ENTRIES + 50):
+                await slack_connector._cached_list(f"xoxb-{token_index}", "users.list", "members")
+        # Orphan locks for evicted token hashes are dropped, so the lock map
+        # never outgrows the bounded cache.
+        assert len(slack_connector._cache_locks) <= MAX_CACHE_ENTRIES
+
     async def test_concurrent_misses_share_one_fetch(self, slack_connector):
         """Per-token lock prevents thundering herd on cache-miss."""
         fetch_started = asyncio.Event()
@@ -546,6 +600,25 @@ class TestFindUser:
     async def test_rejects_empty_or_sigil_only_query(self, slack_connector, query):
         with pytest.raises(ValueError, match="query must not be empty"):
             await slack_connector.find_user(access_token="xoxb-x", query=query)
+
+
+class TestIsActiveHuman:
+    """The shared active-human predicate used by both _match_users and find_user."""
+
+    def test_active_human_is_true(self):
+        from connectors.slack.adapter import _is_active_human
+
+        assert _is_active_human({"id": "U1", "name": "alex"}) is True
+
+    def test_deleted_user_is_not_active(self):
+        from connectors.slack.adapter import _is_active_human
+
+        assert not _is_active_human({"id": "U1", "deleted": True})
+
+    def test_bot_user_is_not_active(self):
+        from connectors.slack.adapter import _is_active_human
+
+        assert not _is_active_human({"id": "U1", "is_bot": True})
 
 
 class TestFindChannel:

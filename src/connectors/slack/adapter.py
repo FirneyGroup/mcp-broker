@@ -43,6 +43,12 @@ MAX_CANDIDATES = 10
 # are ~20/min; caching keeps chatty agents well inside that window.
 CACHE_TTL_SECONDS = 300
 
+# Upper bound on cached (token_hash, method) entries. Every token rotation mints
+# a fresh token_hash, so without a cap the cache (and its per-hash locks) grow
+# unbounded in a long-lived broker. At 2 list methods per workspace this holds
+# ~64 distinct tokens before eviction kicks in.
+MAX_CACHE_ENTRIES = 128
+
 # Pagination: Slack's cursor pagination recommends limit=200 per page. 10 pages
 # is a safety cap for pathological workspaces — logs a warning if hit.
 PAGE_SIZE = 200
@@ -343,14 +349,14 @@ class SlackConnector(NativeConnector):
         display_name="Slack",
         oauth_authorize_url="https://slack.com/oauth/v2/authorize",
         oauth_token_url="https://slack.com/api/oauth.v2.access",  # noqa: S106 — endpoint URL, not a password
-        scopes=[
+        scopes=(
             "chat:write",
             "chat:write.public",
             "im:write",
             "users:read",
             "channels:read",
             "groups:read",
-        ],
+        ),
     )
 
     def __init__(self) -> None:
@@ -365,12 +371,12 @@ class SlackConnector(NativeConnector):
     # --- Cache ---
 
     def _get_lock(self, token_hash: str) -> asyncio.Lock:
-        """Return the per-token cache-population lock, creating it lazily."""
-        lock = self._cache_locks.get(token_hash)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._cache_locks[token_hash] = lock
-        return lock
+        """Return the per-token cache-population lock, creating it lazily.
+
+        setdefault is atomic under the GIL, so two coroutines racing the first
+        miss for a token still share a single lock instance.
+        """
+        return self._cache_locks.setdefault(token_hash, asyncio.Lock())
 
     async def _cached_list(
         self, access_token: str, method: str, key: str, **params: Any
@@ -382,6 +388,10 @@ class SlackConnector(NativeConnector):
         cached = self._cache.get(cache_key)
         if cached and cached[0] > now:
             return cached[1]
+        # Drop the stale entry on access so a token that stops being used
+        # eventually frees its slot even without an eviction sweep.
+        if cached:
+            del self._cache[cache_key]
         async with self._get_lock(token_hash):
             # Re-check inside the lock — another coroutine may have populated it.
             cached = self._cache.get(cache_key)
@@ -389,7 +399,37 @@ class SlackConnector(NativeConnector):
                 return cached[1]
             items = await _slack_paginate(method, access_token, key, **params)
             self._cache[cache_key] = (time.monotonic() + CACHE_TTL_SECONDS, items)
+            self._evict_if_oversized()
             return items
+
+    def _evict_if_oversized(self) -> None:
+        """Bound cache + lock growth. No-op until the cache exceeds MAX_CACHE_ENTRIES."""
+        if len(self._cache) <= MAX_CACHE_ENTRIES:
+            return
+        now = time.monotonic()
+        # First pass: drop everything already expired.
+        for cache_key in [key for key, (expires_at, _) in self._cache.items() if expires_at <= now]:
+            del self._cache[cache_key]
+        # Still over budget: drop oldest by expiry until back under the cap.
+        if len(self._cache) > MAX_CACHE_ENTRIES:
+            by_expiry = sorted(self._cache.items(), key=lambda entry: entry[1][0])
+            for cache_key, _ in by_expiry[: len(self._cache) - MAX_CACHE_ENTRIES]:
+                del self._cache[cache_key]
+        self._evict_orphan_locks()
+
+    def _evict_orphan_locks(self) -> None:
+        """Drop locks whose token_hash has no live cache entry and isn't held.
+
+        Deleting an unheld lock at worst causes one duplicate fetch for that
+        token (a fresh lock is minted on the next miss) — never corruption.
+        """
+        live_hashes = {cache_key.split(":", 1)[0] for cache_key in self._cache}
+        for token_hash in [
+            existing
+            for existing, lock in self._cache_locks.items()
+            if existing not in live_hashes and not lock.locked()
+        ]:
+            del self._cache_locks[token_hash]
 
     # --- Resolvers ---
 
@@ -536,8 +576,7 @@ class SlackConnector(NativeConnector):
         matches = [
             user
             for user in users
-            if not user.get("deleted")
-            and not user.get("is_bot")
+            if _is_active_human(user)
             and (
                 needle in user.get("name", "").lower()
                 or needle in user.get("real_name", "").lower()
@@ -584,12 +623,17 @@ class SlackConnector(NativeConnector):
 # === PRIVATE HELPERS ===
 
 
+def _is_active_human(user: dict[str, Any]) -> bool:
+    """True for a Slack user that is neither deleted nor a bot."""
+    return not user.get("deleted") and not user.get("is_bot")
+
+
 def _match_users(users: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
     """Exact-match users by @handle (if query starts with @) or real/display name.
 
     Filters out deleted + bot users. Caller decides what to do with 0 / 1 / N matches.
     """
-    active = [user for user in users if not user.get("deleted") and not user.get("is_bot")]
+    active = [user for user in users if _is_active_human(user)]
     if query.startswith("@"):
         handle = query[1:].lower()
         return [user for user in active if user.get("name", "").lower() == handle]

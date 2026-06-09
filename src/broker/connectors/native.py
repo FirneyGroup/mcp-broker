@@ -108,6 +108,19 @@ class NativeConnector(BaseConnector):
                 )
         super().__init_subclass__(**kwargs)
 
+    # --- Tool availability ---
+
+    def is_tool_available(self, tool_name: str) -> bool:
+        """Whether a registered tool should be exposed on this request.
+
+        Defaults to True -- every registered tool is available. Connectors whose
+        tool tiers depend on granted OAuth scopes override this to return False
+        for tools the current connection cannot use, so those tools never reach
+        the LLM's tool menu via tools/list (and calling them is rejected exactly
+        like an unknown tool). The default keeps existing connectors unchanged.
+        """
+        return True
+
     # --- MCP JSON-RPC dispatch ---
 
     async def handle_mcp_request(
@@ -117,8 +130,19 @@ class NativeConnector(BaseConnector):
         params: dict,
         request_id: Any,
         access_token: str,
-    ) -> dict:
-        """Handle an MCP JSON-RPC request. Token passed directly as argument."""
+    ) -> dict | None:
+        """Handle an MCP JSON-RPC request. Token passed directly as argument.
+
+        Returns None when the payload is a JSON-RPC notification (no ``id``):
+        the spec mandates that notifications receive NO response, so the caller
+        replies 204 with an empty body rather than emitting an error.
+        """
+        # JSON-RPC notifications carry no id. They MUST NOT get a response body —
+        # not even an error — so allowlisted notifications (initialized/cancelled
+        # are no-ops) are acknowledged with None and the caller returns 204.
+        if request_id is None:
+            return None
+
         match method:
             case "initialize":
                 return _jsonrpc_ok(
@@ -129,8 +153,6 @@ class NativeConnector(BaseConnector):
                         "serverInfo": {"name": self.meta.name, "version": "1.0.0"},
                     },
                 )
-            case "notifications/initialized":
-                return {}  # Empty dict signals "no response" — caller returns 204
             case "tools/list":
                 return _jsonrpc_ok(
                     request_id,
@@ -142,6 +164,7 @@ class NativeConnector(BaseConnector):
                                 "inputSchema": tool.meta.input_schema,
                             }
                             for tool in self._tools.values()
+                            if self.is_tool_available(tool.meta.name)
                         ],
                     },
                 )
@@ -171,21 +194,38 @@ async def _dispatch_tool(
 
     if not isinstance(arguments, dict):
         return _jsonrpc_error(request_id, -32602, "Tool arguments must be an object")
-    arguments.pop("access_token", None)
+    # Strip a spoofed access_token from untrusted client args without mutating
+    # the caller's dict — the broker injects the real token below.
+    tool_arguments = {key: value for key, value in arguments.items() if key != "access_token"}
 
     registered = connector._tools.get(tool_name)
-    if not registered:
+    # An unavailable tool was filtered out of tools/list, so to the client it
+    # never existed. Return the SAME unknown-tool error to keep availability
+    # indistinguishable from nonexistence -- a client that guesses the name
+    # learns nothing about which scope tier is enabled.
+    if not registered or not connector.is_tool_available(tool_name):
         return _jsonrpc_error(request_id, -32602, f"Unknown tool: {tool_name}")
     try:
         handler = getattr(connector, registered.handler_name)
-        content = await handler(access_token=access_token, **arguments)
+        content = await handler(access_token=access_token, **tool_arguments)
+    except ValueError as validation_error:
+        # ValueError is the connector-authored, pre-sanitized error channel —
+        # its message is intended for the remote client. Any other exception type
+        # may embed SDK response bodies/URLs/tokens, so only ValueError passes through.
+        logger.exception("[%s] Tool %s failed", connector.meta.name, tool_name)
+        return _tool_error(request_id, str(validation_error))
     except Exception as exc:
         logger.exception("[%s] Tool %s failed", connector.meta.name, tool_name)
-        return _jsonrpc_ok(
-            request_id,
-            {
-                "content": [{"type": "text", "text": str(exc)}],
-                "isError": True,
-            },
-        )
+        return _tool_error(request_id, f"{tool_name} tool failed: {type(exc).__name__}")
     return _jsonrpc_ok(request_id, {"content": content})
+
+
+def _tool_error(request_id: Any, message: str) -> dict:
+    """Build a tools/call result marked isError with a single text content block."""
+    return _jsonrpc_ok(
+        request_id,
+        {
+            "content": [{"type": "text", "text": message}],
+            "isError": True,
+        },
+    )

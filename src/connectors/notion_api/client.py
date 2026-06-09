@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -101,7 +102,9 @@ def _check_status(response: httpx.Response) -> None:
         raise ValueError(f"Notion API error ({response.status_code}): {message[:300]}")
 
 
-async def _retry_on_rate_limit(response: httpx.Response, request_fn: Any) -> httpx.Response:
+async def _retry_on_rate_limit(
+    response: httpx.Response, request_fn: Callable[[], Awaitable[httpx.Response]]
+) -> httpx.Response:
     """If 429, sleep Retry-After (capped) and retry once. Raises on a second 429."""
     if response.status_code != _HTTP_RATE_LIMITED:
         return response
@@ -111,7 +114,9 @@ async def _retry_on_rate_limit(response: httpx.Response, request_fn: Any) -> htt
     except ValueError:
         # Missing or non-numeric (RFC 7231 permits an HTTP-date form) — use a safe default.
         retry_seconds = DEFAULT_RETRY_AFTER_SECONDS
-    retry_after = min(retry_seconds, RATE_LIMIT_RETRY_CAP_SECONDS)
+    # Floor at 0: a malicious/buggy upstream can send a negative Retry-After, which would slip
+    # under min() and reach asyncio.sleep() as a negative delay (a ValueError on some loops).
+    retry_after = max(0.0, min(retry_seconds, RATE_LIMIT_RETRY_CAP_SECONDS))
     logger.warning("[Notion API] Rate limited, retrying after %.1fs", retry_after)
     await asyncio.sleep(retry_after)
     retry_response = await request_fn()
@@ -184,14 +189,20 @@ async def _paginate_get(  # noqa: PLR0913 -- pagination needs client + auth + pa
     has_more = False
     while True:
         params = dict(extra_params or {})
-        params["page_size"] = MAX_PAGE_SIZE
+        # Request only what's still needed, never more than the API cap. Asking for MAX_PAGE_SIZE
+        # unconditionally drops rows silently: if the server returns >max_items in one page with
+        # has_more=False, the slice below trims them while has_more reports "nothing left".
+        params["page_size"] = min(MAX_PAGE_SIZE, max_items - len(items))
         if cursor:
             params["start_cursor"] = cursor
         page = await _request(client, access_token, "GET", path, params=params)
-        items.extend(page.get("results", []))
+        page_results = page.get("results", [])
+        items.extend(page_results)
         has_more = bool(page.get("has_more"))
         cursor = page.get("next_cursor")
-        if not has_more or len(items) >= max_items or not cursor:
+        # An empty page with has_more=True can otherwise loop forever (server returns no rows but
+        # keeps claiming more) — break to guarantee termination.
+        if not has_more or len(items) >= max_items or not cursor or not page_results:
             break
     return items[:max_items], has_more, cursor
 
@@ -266,9 +277,11 @@ async def _search_pages(  # noqa: PLR0913 -- search needs client + auth + query 
         if cursor:
             body["start_cursor"] = cursor
         page = await _request(client, access_token, "POST", "/search", json_body=body)
-        hits.extend(page.get("results", []))
+        page_results = page.get("results", [])
+        hits.extend(page_results)
         has_more = bool(page.get("has_more"))
         cursor = page.get("next_cursor")
-        if not has_more or len(hits) >= max_results or not cursor:
+        # An empty page with has_more=True would otherwise loop forever — break on no rows.
+        if not has_more or len(hits) >= max_results or not cursor or not page_results:
             break
     return hits[:max_results], has_more, cursor

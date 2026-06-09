@@ -350,7 +350,7 @@ class TestEncryptedTokenStore:
 
 
 class TestOAuthHandler:
-    def test_build_authorize_url_has_pkce(
+    async def test_build_authorize_url_has_pkce(
         self,
         oauth_handler: OAuthHandler,
         test_meta: ConnectorMeta,
@@ -361,7 +361,7 @@ class TestOAuthHandler:
 
         connector = ConnectorRegistry.get("test_connector")
         assert connector is not None
-        url = oauth_handler.build_authorize_url(
+        url = await oauth_handler.build_authorize_url(
             connector, "app:test", test_resolved, "http://localhost/callback"
         )
 
@@ -375,7 +375,7 @@ class TestOAuthHandler:
         assert "state" in params
         assert params["scope"] == ["read write"]
 
-    def test_build_authorize_url_calls_hook(
+    async def test_build_authorize_url_calls_hook(
         self, oauth_handler: OAuthHandler, test_credentials: AppConnectorCredentials
     ) -> None:
         """Connector's customize_authorize_params hook is called."""
@@ -405,7 +405,7 @@ class TestOAuthHandler:
             token_url=hook_meta.oauth_token_url,
             credentials=test_credentials,
         )
-        url = oauth_handler.build_authorize_url(
+        url = await oauth_handler.build_authorize_url(
             connector, "app:test", resolved, "http://localhost/callback"
         )
         assert hook_called
@@ -1319,7 +1319,7 @@ class TestNonceSingleUse:
         assert connector is not None
 
         # Build authorize URL — generates nonce + state
-        url = oauth_handler.build_authorize_url(
+        url = await oauth_handler.build_authorize_url(
             connector, "app:test", test_resolved, "http://localhost/callback"
         )
         parsed = urlparse(url)
@@ -1512,7 +1512,11 @@ class TestListExpiringBoundary:
 
 
 class TestMcpMethodValidation:
-    """Tests for _validate_mcp_payload — JSON-RPC method allowlist enforcement."""
+    """Tests for _validate_mcp_payload — JSON-RPC method allowlist enforcement.
+
+    _validate_mcp_payload now returns (parsed_payload, error) so callers parse
+    the body once; a None error means the payload is valid.
+    """
 
     def test_allowed_method_passes(self, test_meta: ConnectorMeta) -> None:
         """Standard MCP methods in the default allowlist pass validation."""
@@ -1522,7 +1526,9 @@ class TestMcpMethodValidation:
         connector.meta = test_meta
 
         payload = b'{"jsonrpc":"2.0","method":"tools/list","id":1}'
-        assert _validate_mcp_payload(payload, connector) is None
+        parsed, error_response = _validate_mcp_payload(payload, connector)
+        assert error_response is None
+        assert parsed == {"jsonrpc": "2.0", "method": "tools/list", "id": 1}
 
     def test_blocked_method_returns_403(self, test_meta: ConnectorMeta) -> None:
         """Methods outside the allowlist are rejected with 403."""
@@ -1532,7 +1538,7 @@ class TestMcpMethodValidation:
         connector.meta = test_meta
 
         payload = b'{"jsonrpc":"2.0","method":"resources/list","id":1}'
-        error_response = _validate_mcp_payload(payload, connector)
+        _, error_response = _validate_mcp_payload(payload, connector)
         assert error_response is not None
         assert error_response.status_code == 403
 
@@ -1544,7 +1550,7 @@ class TestMcpMethodValidation:
         connector.meta = test_meta
 
         payload = b'[{"jsonrpc":"2.0","method":"tools/list","id":1},{"jsonrpc":"2.0","method":"resources/read","id":2}]'
-        error_response = _validate_mcp_payload(payload, connector)
+        _, error_response = _validate_mcp_payload(payload, connector)
         assert error_response is not None
         assert error_response.status_code == 403
 
@@ -1556,7 +1562,8 @@ class TestMcpMethodValidation:
         connector.meta = test_meta
 
         payload = b'[{"jsonrpc":"2.0","method":"tools/list","id":1},{"jsonrpc":"2.0","method":"tools/call","id":2}]'
-        assert _validate_mcp_payload(payload, connector) is None
+        _, error_response = _validate_mcp_payload(payload, connector)
+        assert error_response is None
 
     def test_invalid_json_returns_400(self, test_meta: ConnectorMeta) -> None:
         """Malformed JSON body returns 400."""
@@ -1565,7 +1572,7 @@ class TestMcpMethodValidation:
         connector = MagicMock()
         connector.meta = test_meta
 
-        error_response = _validate_mcp_payload(b"not json", connector)
+        _, error_response = _validate_mcp_payload(b"not json", connector)
         assert error_response is not None
         assert error_response.status_code == 400
 
@@ -1577,7 +1584,7 @@ class TestMcpMethodValidation:
         connector.meta = test_meta
 
         payload = b'["not a dict"]'
-        error_response = _validate_mcp_payload(payload, connector)
+        _, error_response = _validate_mcp_payload(payload, connector)
         assert error_response is not None
         assert error_response.status_code == 400
 
@@ -1589,7 +1596,7 @@ class TestMcpMethodValidation:
         connector.meta = test_meta
 
         payload = b'{"jsonrpc":"2.0","id":1}'
-        error_response = _validate_mcp_payload(payload, connector)
+        _, error_response = _validate_mcp_payload(payload, connector)
         assert error_response is not None
         assert error_response.status_code == 403
 
@@ -1622,6 +1629,145 @@ class TestHttpMethodValidation:
 
         error_response = await _build_and_stream(request, connector, "test", connection=connection)
         assert error_response.status_code == 405
+
+
+# =============================================================================
+# NATIVE CONNECTOR DISPATCH — proxy-level regressions (findings 1–4)
+# =============================================================================
+
+
+def _native_connection() -> AppConnection:
+    return AppConnection(connector_name="native_test", access_token="native_tok")
+
+
+def _make_native_request(method: str, body: bytes) -> MagicMock:
+    request = MagicMock()
+    request.method = method
+    request.body = AsyncMock(return_value=body)
+    return request
+
+
+class TestNativeDispatchRegressions:
+    """Regressions for _dispatch_native_request: empty 204 body, HTTP-method
+    allowlist on the native path, and JSON-RPC notification handling."""
+
+    def _build_native_connector(self):
+        from broker.connectors.native import NativeConnector, NativeToolMeta, native_tool
+
+        class NativeRegressionConnector(NativeConnector):
+            meta = ConnectorMeta(
+                name="native_test",
+                display_name="Native Test",
+                oauth_authorize_url="https://native.test/authorize",
+                oauth_token_url="https://native.test/token",
+            )
+
+            @native_tool(
+                NativeToolMeta(
+                    name="boom",
+                    description="A tool that raises",
+                    input_schema={"type": "object"},
+                )
+            )
+            async def boom(self, *, access_token: str, leak: str = "no") -> list[dict[str, Any]]:
+                if leak == "value":
+                    raise ValueError("user-facing message")
+                raise RuntimeError("Bearer secret123 leaked")
+
+        return ConnectorRegistry.get("native_test")
+
+    async def test_notification_initialized_returns_204_empty_body(self) -> None:
+        """notifications/initialized (no id) → 204 with a truly empty body (finding 1+3)."""
+        from broker.services.proxy import _dispatch_native_request
+
+        connector = self._build_native_connector()
+        body = b'{"jsonrpc":"2.0","method":"notifications/initialized"}'
+        request = _make_native_request("POST", body)
+
+        response = await _dispatch_native_request(request, connector, _native_connection())
+        assert response.status_code == 204
+        assert response.body == b""
+
+    async def test_notification_cancelled_returns_204_empty_body(self) -> None:
+        """notifications/cancelled is allowlisted but a notification → 204, no error body."""
+        from broker.services.proxy import _dispatch_native_request
+
+        connector = self._build_native_connector()
+        body = b'{"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}'
+        request = _make_native_request("POST", body)
+
+        response = await _dispatch_native_request(request, connector, _native_connection())
+        assert response.status_code == 204
+        assert response.body == b""
+
+    async def test_unknown_method_with_id_returns_method_not_found(self) -> None:
+        """A request (id present) for an allowlisted-but-unhandled method → 200 with -32601.
+
+        notifications/cancelled is in the method allowlist so it clears proxy
+        validation, but the connector only no-ops it as a notification. With an
+        explicit id it is a *request*, so it must get a JSON-RPC error (finding 3
+        — the request/notification distinction is the id, not the method name)."""
+        import json
+
+        from broker.services.proxy import _dispatch_native_request
+
+        connector = self._build_native_connector()
+        body = b'{"jsonrpc":"2.0","method":"notifications/cancelled","id":7}'
+        request = _make_native_request("POST", body)
+        response = await _dispatch_native_request(request, connector, _native_connection())
+        assert response.status_code == 200
+        decoded = json.loads(response.body)
+        assert decoded["id"] == 7
+        assert decoded["error"]["code"] == -32601
+
+    async def test_put_on_native_path_returns_405_with_allow_header(self) -> None:
+        """PUT must be rejected before native dispatch executes tools (finding 2)."""
+        from broker.services.proxy import _dispatch_native_request
+
+        connector = self._build_native_connector()
+        body = b'{"jsonrpc":"2.0","method":"tools/list","id":1}'
+        request = _make_native_request("PUT", body)
+
+        response = await _dispatch_native_request(request, connector, _native_connection())
+        assert response.status_code == 405
+        assert "Allow" in response.headers
+
+    async def test_value_error_message_passes_through(self) -> None:
+        """A tool raising ValueError surfaces its message (sanitized channel) (finding 4)."""
+        import json
+
+        from broker.services.proxy import _dispatch_native_request
+
+        connector = self._build_native_connector()
+        body = (
+            b'{"jsonrpc":"2.0","method":"tools/call","id":3,'
+            b'"params":{"name":"boom","arguments":{"leak":"value"}}}'
+        )
+        request = _make_native_request("POST", body)
+        response = await _dispatch_native_request(request, connector, _native_connection())
+        decoded = json.loads(response.body)
+        assert decoded["result"]["isError"] is True
+        assert decoded["result"]["content"][0]["text"] == "user-facing message"
+
+    async def test_generic_exception_message_is_sanitized(self) -> None:
+        """A non-ValueError exception must NOT leak its message; only the tool name (finding 4)."""
+        import json
+
+        from broker.services.proxy import _dispatch_native_request
+
+        connector = self._build_native_connector()
+        body = (
+            b'{"jsonrpc":"2.0","method":"tools/call","id":4,'
+            b'"params":{"name":"boom","arguments":{}}}'
+        )
+        request = _make_native_request("POST", body)
+        response = await _dispatch_native_request(request, connector, _native_connection())
+        decoded = json.loads(response.body)
+        assert decoded["result"]["isError"] is True
+        text = decoded["result"]["content"][0]["text"]
+        assert "secret123" not in text
+        assert "Bearer secret123 leaked" not in text
+        assert "boom" in text
 
 
 class TestBodySizeLimit:
@@ -1995,3 +2141,220 @@ class TestOAuthSuccessPage:
         client = TestClient(app)
         response = client.get("/oauth/success?connector=notion")
         assert response.status_code == 200
+
+
+# =============================================================================
+# OAUTH CALLBACK — provider-reported error / malformed callback (finding 1)
+# =============================================================================
+
+
+class TestOAuthCallbackProviderError:
+    """The callback must render the 400 'Connection failed' page — not a raw
+    422 — when the provider redirects back with ``?error=...`` and no ``code``,
+    or when required params are missing entirely. FastAPI would 422 on the
+    missing required ``code``/``state`` before the handler ran; making them
+    optional plus an explicit guard is what produces the 400 page.
+    """
+
+    def _broker_managed_connector(self) -> MagicMock:
+        connector = MagicMock()
+        connector.meta.is_sidecar_managed = False
+        return connector
+
+    def test_provider_error_returns_400_html_not_422(self, caplog) -> None:
+        """GET callback with ?error=access_denied&state=x → 400 HTML, warning logged."""
+        import logging
+
+        from fastapi.testclient import TestClient
+
+        from broker.main import app
+
+        client = TestClient(app)
+        with (
+            patch(
+                "broker.main._get_connector_or_404",
+                return_value=self._broker_managed_connector(),
+            ),
+            caplog.at_level(logging.WARNING, logger="broker.main"),
+        ):
+            response = client.get(
+                "/oauth/notion/callback?error=access_denied"
+                "&error_description=User+denied+access&state=abc"
+            )
+
+        assert response.status_code == 400
+        assert response.headers["content-type"].startswith("text/html")
+        assert "Connection failed" in response.text
+        assert any("access_denied" in record.message for record in caplog.records)
+
+    def test_missing_all_params_returns_400_html(self) -> None:
+        """GET callback with no params at all → 400 HTML (not 422)."""
+        from fastapi.testclient import TestClient
+
+        from broker.main import app
+
+        client = TestClient(app)
+        with patch(
+            "broker.main._get_connector_or_404",
+            return_value=self._broker_managed_connector(),
+        ):
+            response = client.get("/oauth/notion/callback")
+
+        assert response.status_code == 400
+        assert response.headers["content-type"].startswith("text/html")
+        assert "Connection failed" in response.text
+
+
+# =============================================================================
+# SINGLE-WORKER INBOUND-OAUTH INVARIANT — enforced in lifespan (finding 2)
+# =============================================================================
+
+
+def _oauth_enabled_settings() -> BrokerSettings:
+    """Minimal settings with inbound OAuth enabled (passes cross-field validation)."""
+    return BrokerSettings(
+        broker=BrokerConfig(
+            admin_key="test-admin-key-long",
+            encryption_keys=[Fernet.generate_key().decode()],
+            state_secret="test-state-secret-key",
+            oauth=OAuthInboundConfig(enabled=True, app_key="acme:claude_ai"),
+        ),
+        clients={"acme": {"claude_ai": BrokerAppConfig()}},
+    )
+
+
+class TestSingleWorkerOAuthInvariant:
+    """AGENTS.md: startup aborts when broker.oauth.enabled=true AND
+    WEB_CONCURRENCY>1. The abort must live on the actual startup path
+    (lifespan) — not only in __main__ — because the production Dockerfile runs
+    ``uvicorn broker.main:app`` directly and never calls __main__.main().
+    """
+
+    async def test_lifespan_aborts_when_multiworker_and_oauth_enabled(self, monkeypatch) -> None:
+        """Driving the real lifespan with WEB_CONCURRENCY=2 + OAuth on (sqlite) raises."""
+        import broker.main as broker_main
+
+        monkeypatch.setenv("WEB_CONCURRENCY", "2")
+        monkeypatch.setattr(broker_main, "load_settings", _oauth_enabled_settings)
+
+        with pytest.raises(RuntimeError, match="WEB_CONCURRENCY"):
+            async with broker_main.lifespan(broker_main.app):
+                pass
+
+    def test_helper_does_not_abort_with_single_worker(self, monkeypatch) -> None:
+        """WEB_CONCURRENCY=1 + OAuth on → no abort (the startup path proceeds)."""
+        import broker.main as broker_main
+
+        monkeypatch.setenv("WEB_CONCURRENCY", "1")
+        # Must not raise.
+        broker_main._abort_if_multiworker_with_oauth(oauth_enabled=True)
+
+    def test_helper_ignores_concurrency_when_oauth_disabled(self, monkeypatch) -> None:
+        """WEB_CONCURRENCY>1 is fine as long as inbound OAuth is off."""
+        import broker.main as broker_main
+
+        monkeypatch.setenv("WEB_CONCURRENCY", "4")
+        # Must not raise.
+        broker_main._abort_if_multiworker_with_oauth(oauth_enabled=False)
+
+    def test_helper_aborts_on_sqlite_backend_multiworker(self, monkeypatch) -> None:
+        """The sqlite backend keeps OAuth state process-local → multi-worker aborts."""
+        import broker.main as broker_main
+
+        monkeypatch.setenv("WEB_CONCURRENCY", "2")
+        with pytest.raises(RuntimeError, match="WEB_CONCURRENCY"):
+            broker_main._abort_if_multiworker_with_oauth(oauth_enabled=True, store_backend="sqlite")
+
+    def test_helper_allows_multiworker_on_firestore_backend(self, monkeypatch) -> None:
+        """Firestore shares all OAuth state across instances → multi-worker is legal.
+
+        Regression for the firestore-migration goal: this fails (RuntimeError)
+        without the backend-aware abort, since the old helper aborted on
+        WEB_CONCURRENCY>1 regardless of backend.
+        """
+        import broker.main as broker_main
+
+        monkeypatch.setenv("WEB_CONCURRENCY", "2")
+        # Must not raise — the firestore backend lifts the single-worker invariant.
+        broker_main._abort_if_multiworker_with_oauth(oauth_enabled=True, store_backend="firestore")
+
+    def test_main_helper_allows_multiworker_on_firestore_backend(self, monkeypatch) -> None:
+        """``__main__`` pre-uvicorn check is also backend-aware (firestore → no SystemExit)."""
+        from broker.__main__ import _abort_if_multiworker_with_oauth as main_abort
+
+        monkeypatch.setenv("WEB_CONCURRENCY", "2")
+        # Must not raise SystemExit.
+        main_abort(oauth_enabled=True, store_backend="firestore")
+
+    def test_main_helper_aborts_on_sqlite_backend_multiworker(self, monkeypatch) -> None:
+        """``__main__`` still SystemExits on the sqlite backend under multi-worker."""
+        from broker.__main__ import _abort_if_multiworker_with_oauth as main_abort
+
+        monkeypatch.setenv("WEB_CONCURRENCY", "2")
+        with pytest.raises(SystemExit, match="WEB_CONCURRENCY"):
+            main_abort(oauth_enabled=True, store_backend="sqlite")
+
+
+# =============================================================================
+# ADMIN CONNECT-TOKEN TTL uses the shared constant (finding 5)
+# =============================================================================
+
+
+class TestConnectTokenTtlConstant:
+    async def test_ttl_seconds_matches_store_constant(self) -> None:
+        """The connect-token response ttl_seconds equals CONNECT_TOKEN_TTL —
+        no duplicated literal that could drift from the store's expiry."""
+        import json
+
+        from broker.api.admin import AdminEndpoints
+        from broker.services.api_key_store import CONNECT_TOKEN_TTL
+
+        key_store = MagicMock()
+        key_store.has_key = AsyncMock(return_value=True)
+        connect_token_store = MagicMock()
+        connect_token_store.create = AsyncMock(return_value="connect-token-value")
+        client_registry = MagicMock()
+        client_registry.get.return_value = MagicMock()
+
+        endpoints = AdminEndpoints(
+            key_store=key_store,
+            admin_key="test-admin-key-long",
+            client_registry=client_registry,
+            connect_token_store=connect_token_store,
+        )
+
+        request = MagicMock()
+        request.headers = {"x-admin-key": "test-admin-key-long"}
+        request.json = AsyncMock(return_value={"app_key": "acme:claude_ai"})
+
+        response = await endpoints.create_connect_token(request)
+        assert response.status_code == 201
+        body = json.loads(response.body)
+        assert body["ttl_seconds"] == CONNECT_TOKEN_TTL
+
+
+# =============================================================================
+# __main__ — clean SystemExit on bad integer env vars (finding 6)
+# =============================================================================
+
+
+class TestIntEnvCleanExit:
+    def test_non_numeric_value_raises_systemexit(self, monkeypatch) -> None:
+        """A non-numeric env value exits cleanly instead of a bare ValueError."""
+        from broker.__main__ import _int_env
+
+        monkeypatch.setenv("BROKER_PORT", "not-a-number")
+        with pytest.raises(SystemExit, match="BROKER_PORT"):
+            _int_env("BROKER_PORT", 8002)
+
+    def test_missing_value_uses_default(self, monkeypatch) -> None:
+        from broker.__main__ import _int_env
+
+        monkeypatch.delenv("BROKER_PORT", raising=False)
+        assert _int_env("BROKER_PORT", 8002) == 8002
+
+    def test_valid_value_is_parsed(self, monkeypatch) -> None:
+        from broker.__main__ import _int_env
+
+        monkeypatch.setenv("WEB_CONCURRENCY", "3")
+        assert _int_env("WEB_CONCURRENCY", 1) == 3

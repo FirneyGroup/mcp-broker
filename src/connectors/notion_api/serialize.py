@@ -47,7 +47,7 @@ def _simplify_page(page: dict[str, Any]) -> dict[str, Any]:
         "url": page.get("url"),
         "properties": {name: _simplify_property(prop) for name, prop in props.items()},
     }
-    title = next((name for name, p in props.items() if p.get("type") == "title"), None)
+    title = next((name for name, prop in props.items() if prop.get("type") == "title"), None)
     if title:
         simplified["title"] = simplified["properties"].get(title)
     return simplified

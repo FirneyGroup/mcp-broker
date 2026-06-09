@@ -40,6 +40,61 @@ RATE_LIMIT_RETRY_CAP_SECONDS = 30
 # LinkedIn daily quotas have long retry windows -- don't wait, just fail fast
 DAILY_QUOTA_THRESHOLD_SECONDS = 300
 
+# === SCOPES ===
+
+# OAuth scopes requested for every LinkedIn connection. Self-serve products only
+# (Share on LinkedIn + Sign In with OpenID Connect), which is what an app gets
+# without LinkedIn review.
+#
+# To enable the organization tools (get_org_posts, get_managed_orgs,
+# create_comment, react_to_post, get_post_comments, get_org_analytics,
+# get_post_analytics) apply for the Community Management API at
+# developer.linkedin.com, then add the org scopes here:
+#   "r_organization_social", "w_organization_social",
+#   "r_organization_social_feed", "w_organization_social_feed",
+#   "rw_organization_admin"
+_SCOPES = (
+    "openid",
+    "profile",
+    "w_member_social",
+)
+
+# Org tools call /rest/ Community Management endpoints. Without the org scopes
+# above those calls are guaranteed 403s, so we guard the tools on this flag and
+# raise an actionable error instead. Derived from _SCOPES so the gate flips
+# automatically once the org scopes are added.
+_ORG_TOOLS_ENABLED = "r_organization_social" in _SCOPES
+
+# The 7 org-tier tools, gated behind the Community Management scopes. Used by
+# is_tool_available to hide them from tools/list (and reject direct calls) until
+# _ORG_TOOLS_ENABLED flips. Kept in sync with the org tools listed in _SCOPES.
+_ORG_TOOL_NAMES = frozenset(
+    {
+        "get_org_posts",
+        "get_managed_orgs",
+        "create_comment",
+        "react_to_post",
+        "get_post_comments",
+        "get_org_analytics",
+        "get_post_analytics",
+    }
+)
+
+# Raised by org tools when the Community Management scopes are not configured.
+_ORG_TOOLS_DISABLED_ERROR = (
+    "LinkedIn organization tools require the Community Management API "
+    "(r_organization_social scope) -- see src/connectors/linkedin/SETUP.md"
+)
+
+
+def _require_org_tools() -> None:
+    """Guard org-only tools. Raises a clear error before any HTTP call when the
+    Community Management scopes are not configured (the calls would 403 anyway).
+    """
+    if not _ORG_TOOLS_ENABLED:
+        raise ValueError(_ORG_TOOLS_DISABLED_ERROR)
+
+
 # === INPUT VALIDATION ===
 
 # URN regexes prevent path traversal in URL construction
@@ -159,6 +214,16 @@ def _extract_org_id_from_urn(org_urn: str) -> str:
 # === ASYNC API HELPERS ===
 
 
+class _SessionError(ValueError):
+    """A failure that invalidates the whole session, not just one resource.
+
+    Raised for token expiry (401) and exhausted rate limits. Subclasses
+    ValueError so existing `except ValueError` handlers keep working, but lets
+    per-resource degradation loops (e.g. _batch_fetch_orgs) re-raise it instead
+    of masking token expiry as a missing name.
+    """
+
+
 def _build_headers(access_token: str, *, versioned: bool = True) -> dict[str, str]:
     """Build headers for LinkedIn API requests.
 
@@ -177,7 +242,7 @@ def _build_headers(access_token: str, *, versioned: bool = True) -> dict[str, st
 def _check_status(response: httpx.Response) -> None:
     """Check response for auth and permission errors. Raises with sanitized messages."""
     if response.status_code == 401:  # noqa: PLR2004 -- HTTP status code
-        raise ValueError(
+        raise _SessionError(
             "LinkedIn token expired or revoked -- reconnect via /oauth/linkedin/connect"
         )
     if response.status_code == 403:  # noqa: PLR2004 -- HTTP status code
@@ -201,13 +266,21 @@ def _check_status(response: httpx.Response) -> None:
 async def _handle_response(
     response: httpx.Response,
     retry_fn: Callable[[], Awaitable[httpx.Response]],
+    *,
+    idempotent: bool = True,
 ) -> httpx.Response:
     """Handle rate limiting and status checking in correct order.
 
-    Bug fix: _check_status must NOT run before retry logic, because it raises
-    on 429 and would prevent the retry from ever executing.
+    _check_status must NOT run before retry logic, because it raises on 429
+    and would prevent the retry from ever executing.
+
+    idempotent=False (POST creates): never retry. Re-issuing a create after a
+    429 risks a double-post / double-comment, so we surface the rate limit
+    immediately instead.
     """
     if response.status_code == 429:  # noqa: PLR2004 -- HTTP status code
+        if not idempotent:
+            raise _SessionError("Rate limited by LinkedIn -- try again later")
         return await _retry_on_rate_limit(response, retry_fn)
     _check_status(response)
     return response
@@ -227,13 +300,13 @@ async def _retry_on_rate_limit(
     except (ValueError, TypeError):
         retry_after = 5.0  # HTTP spec allows date format — fall back to safe default
     if retry_after > DAILY_QUOTA_THRESHOLD_SECONDS:
-        raise ValueError("LinkedIn daily quota exceeded -- try again tomorrow")
+        raise _SessionError("LinkedIn daily quota exceeded -- try again tomorrow")
     capped = min(retry_after, RATE_LIMIT_RETRY_CAP_SECONDS)
     logger.warning("[LinkedIn] Rate limited, retrying after %.1fs", capped)
     await asyncio.sleep(capped)
     retry_response = await request_fn()
     if retry_response.status_code == 429:  # noqa: PLR2004 -- HTTP status code
-        raise ValueError("Rate limited by LinkedIn after retry -- try again later")
+        raise _SessionError("Rate limited by LinkedIn after retry -- try again later")
     _check_status(retry_response)
     return retry_response
 
@@ -277,9 +350,12 @@ async def _linkedin_post(  # noqa: PLR0913 -- all params required
             json=json_body,
             params=extra_params,
         )
+        # idempotent=False -- POST creates are not retried; the retry_fn is never
+        # invoked but the signature still requires a callable.
         response = await _handle_response(
             response,
             lambda: client.post(url, headers=headers, json=json_body, params=extra_params),
+            idempotent=False,
         )
         if response.content:
             return response.json()
@@ -532,31 +608,12 @@ class LinkedInConnector(NativeConnector):
         display_name="LinkedIn",
         oauth_authorize_url="https://www.linkedin.com/oauth/v2/authorization",
         oauth_token_url="https://www.linkedin.com/oauth/v2/accessToken",  # noqa: S106 -- endpoint URL, not a password
-        # Self-serve scopes only (Share on LinkedIn + Sign In).
-        # Add org scopes after Community Management API approval:
-        #   "r_organization_social", "w_organization_social",
-        #   "r_organization_social_feed", "w_organization_social_feed",
-        #   "rw_organization_admin",
-        scopes=[
-            "openid",
-            "profile",
-            "w_member_social",
-        ],
+        scopes=_SCOPES,
         supports_pkce=False,  # LinkedIn's standard OAuth flow rejects code_verifier
     )
 
     # No build_token_request_auth override — LinkedIn uses client_secret_post
     # (client_id + client_secret in POST body), which is the broker default.
-
-    @property
-    def _use_rest_api(self) -> bool:
-        """Whether Community Management API scopes are configured.
-
-        Determines which API to use:
-        - True: /rest/ versioned endpoints (Community Management API)
-        - False: /v2/ legacy endpoints (Share on LinkedIn product)
-        """
-        return "r_organization_social" in self.meta.scopes
 
     # --- MCP tools ---
 
@@ -579,7 +636,9 @@ class LinkedInConnector(NativeConnector):
         if len(text) > MAX_POST_LENGTH:
             raise ValueError(f"Post text exceeds {MAX_POST_LENGTH} characters ({len(text)} given)")
         resolved_urn = await _resolve_author_urn(access_token, author_urn)
-        if self._use_rest_api:
+        # /rest/ posting (org tier) is only reachable with the Community Management
+        # scopes; without them the v2 Share-on-LinkedIn path is the only one that works.
+        if _ORG_TOOLS_ENABLED:
             created = await _create_post_rest(access_token, resolved_urn, text, visibility)
         else:
             created = await _create_post_v2(access_token, resolved_urn, text, visibility)
@@ -590,7 +649,9 @@ class LinkedInConnector(NativeConnector):
         """Delete a LinkedIn post by URN."""
         _validate_post_urn(post_urn)
         encoded_urn = quote(post_urn, safe="")
-        if self._use_rest_api:
+        # /rest/ deletion (org tier) requires the Community Management scopes;
+        # otherwise delete via the v2 Share-on-LinkedIn path.
+        if _ORG_TOOLS_ENABLED:
             await _linkedin_delete(access_token, f"/rest/posts/{encoded_urn}")
         else:
             await _linkedin_delete(access_token, f"/v2/ugcPosts/{encoded_urn}", versioned=False)
@@ -605,6 +666,7 @@ class LinkedInConnector(NativeConnector):
         count: int = DEFAULT_LIMIT,
     ) -> list[dict[str, Any]]:
         """Get recent posts for a LinkedIn organization page."""
+        _require_org_tools()
         _validate_org_id(org_id)
         clamped = _clamp_limit(count)
         org_urn = f"urn:li:organization:{org_id}"
@@ -629,6 +691,7 @@ class LinkedInConnector(NativeConnector):
         The /rest/ API doesn't support Rest.li v1 projections (~dereference),
         so we make a follow-up call to /rest/organizations for names.
         """
+        _require_org_tools()
         acl_response = await _linkedin_get(
             access_token,
             "/rest/organizationAcls",
@@ -654,8 +717,10 @@ class LinkedInConnector(NativeConnector):
     ) -> list[dict[str, Any]]:
         """Add a comment to a LinkedIn post.
 
-        # socialActions endpoint on deprecation path -- monitor Linkedin-Version updates
+        Note: the socialActions endpoint is on a deprecation path -- monitor
+        Linkedin-Version updates.
         """
+        _require_org_tools()
         _validate_post_urn(post_urn)
         if len(text) > MAX_COMMENT_LENGTH:
             raise ValueError(f"Comment exceeds {MAX_COMMENT_LENGTH} characters ({len(text)} given)")
@@ -679,6 +744,7 @@ class LinkedInConnector(NativeConnector):
         reaction_type: str,
     ) -> list[dict[str, Any]]:
         """React to a LinkedIn post."""
+        _require_org_tools()
         _validate_post_urn(post_urn)
         person_urn = await _get_person_urn(access_token)
         body = {
@@ -704,18 +770,22 @@ class LinkedInConnector(NativeConnector):
     ) -> list[dict[str, Any]]:
         """Get comments on a LinkedIn post.
 
-        # socialActions endpoint on deprecation path -- monitor Linkedin-Version updates
+        Note: the socialActions endpoint is on a deprecation path -- monitor
+        Linkedin-Version updates.
         """
+        _require_org_tools()
         _validate_post_urn(post_urn)
         clamped = _clamp_limit(count)
         encoded_urn = quote(post_urn, safe="")
+        # X-RestLi-Method: FINDER required for finder requests on /rest/ endpoints
         response = await _linkedin_get(
             access_token,
             f"/rest/socialActions/{encoded_urn}/comments",
+            restli_method="FINDER",
             count=clamped,
         )
         elements = response.get("elements", [])
-        comments = [_simplify_comment(c) for c in elements]
+        comments = [_simplify_comment(comment) for comment in elements]
         return _mcp_text_content(comments)
 
     @native_tool(_GET_ORG_ANALYTICS_META)
@@ -730,6 +800,7 @@ class LinkedInConnector(NativeConnector):
 
         The period param is metadata-only -- LinkedIn returns lifetime stats.
         """
+        _require_org_tools()
         _validate_org_id(org_id)
         org_urn = f"urn:li:organization:{org_id}"
         follower_stats, page_stats = await _fetch_org_analytics(access_token, org_urn, period)
@@ -750,6 +821,7 @@ class LinkedInConnector(NativeConnector):
         post_urns: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Get impression and engagement stats for org posts."""
+        _require_org_tools()
         _validate_org_id(org_id)
         org_urn = f"urn:li:organization:{org_id}"
         params: dict[str, Any] = {"q": "organizationalEntity", "organizationalEntity": org_urn}
@@ -763,6 +835,21 @@ class LinkedInConnector(NativeConnector):
         )
         stats = [_simplify_share_stats(el) for el in response.get("elements", [])]
         return _mcp_text_content({"org_id": org_id, "post_stats": stats})
+
+    def is_tool_available(self, tool_name: str) -> bool:
+        """Hide the 7 org-tier tools from tools/list until the Community
+        Management scopes are configured.
+
+        Without the org scopes those tools are guaranteed 403s, so advertising
+        them to the LLM only invites doomed calls. Returning False here filters
+        them out of tools/list and makes the dispatcher reject direct calls with
+        the unknown-tool error. The per-tool _require_org_tools() call-time guard
+        stays in place as defense in depth -- if a tool's availability and its
+        guard ever drift, the guard still blocks the actual HTTP request.
+        """
+        if not _ORG_TOOLS_ENABLED and tool_name in _ORG_TOOL_NAMES:
+            return False
+        return super().is_tool_available(tool_name)
 
     @classmethod
     def tool_prompt_instructions(cls) -> str:
@@ -879,13 +966,21 @@ def _extract_org_ids_from_acls(elements: list[dict[str, Any]]) -> list[str]:
 
     ACL elements use 'organization' or 'organizationTarget' depending on
     the response format -- handle both.
+
+    Each extracted ID is validated against _ORG_ID_RE before use. The ID comes
+    from LinkedIn's response but is interpolated into a URL path downstream
+    (/rest/organizations/{id}); a malformed URN like
+    urn:li:organization:123/../evil would otherwise inject path segments.
     """
     org_ids: list[str] = []
     seen: set[str] = set()
     for acl in elements:
         org_urn = acl.get("organizationTarget") or acl.get("organization", "")
         org_id = _extract_org_id_from_urn(org_urn)
-        if org_id and org_id not in seen:
+        if not _ORG_ID_RE.match(org_id):
+            logger.debug("[LinkedIn] Skipping malformed org URN in ACLs: %r", org_urn)
+            continue
+        if org_id not in seen:
             seen.add(org_id)
             org_ids.append(org_id)
     return org_ids
@@ -903,6 +998,10 @@ async def _batch_fetch_orgs(
     for org_id in org_ids:
         try:
             raw = await _linkedin_get(access_token, f"/rest/organizations/{org_id}")
+        except _SessionError:
+            # Token expiry / exhausted rate limit affects every org -- surface it
+            # instead of silently degrading each row to a missing name.
+            raise
         except ValueError:
             # Graceful degradation -- return URN even if name lookup fails
             orgs.append(
