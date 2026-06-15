@@ -125,6 +125,11 @@ class ConnectTokenStoreABC(ABC):
     """
 
     @abstractmethod
+    async def setup(self) -> None:
+        """Initialize backing storage (no-op for the in-memory default)."""
+        ...
+
+    @abstractmethod
     async def create(self, app_key: str) -> str:
         """Create a single-use connect token. Returns the token."""
         ...
@@ -148,6 +153,11 @@ class OutboundOAuthStateStore(ABC):
     across instances; the in-memory default satisfies the contract without
     awaiting.
     """
+
+    @abstractmethod
+    async def setup(self) -> None:
+        """Initialize backing storage (no-op for the in-memory default)."""
+        ...
 
     @abstractmethod
     async def store_nonce(self, nonce: str) -> None:
@@ -187,6 +197,11 @@ class DCRRateLimiter(ABC):
     across instances (transactional read-modify-write per IP); the in-memory
     default satisfies the contract without awaiting.
     """
+
+    @abstractmethod
+    async def setup(self) -> None:
+        """Initialize backing storage (no-op for the in-memory default)."""
+        ...
 
     @abstractmethod
     async def allow(self, client_ip: str) -> bool:

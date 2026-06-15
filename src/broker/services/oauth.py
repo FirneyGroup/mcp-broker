@@ -66,6 +66,9 @@ class _InMemoryOutboundOAuthStateStore(OutboundOAuthStateStore):
         self._nonce_timestamps: dict[str, float] = {}
         self._pkce_verifiers: dict[str, str] = {}
 
+    async def setup(self) -> None:
+        """No-op — in-memory state needs no initialization."""
+
     async def store_nonce(self, nonce: str) -> None:
         """Store a nonce with current timestamp."""
         self._nonce_timestamps[nonce] = time.time()

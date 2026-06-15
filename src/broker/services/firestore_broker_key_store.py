@@ -114,12 +114,15 @@ class FirestoreBrokerKeyStore(BrokerKeyStore):
         keys: list[dict] = []
         async for doc in self._db.collection(self._collection).stream():
             key_record = doc.to_dict()
-            if key_record is None:
+            if key_record is None or "app_key" not in key_record:
+                # Mirror verify(): a malformed key doc must not break the admin
+                # listing — skip it and surface the doc id (never the key hash).
+                logger.warning("[FirestoreKeyStore] Key doc %s missing app_key; skipping", doc.id)
                 continue
             keys.append(
                 {
                     "app_key": key_record["app_key"],
-                    "created_at": key_record["created_at"],
+                    "created_at": key_record.get("created_at"),
                     "rotated_at": key_record.get("rotated_at"),
                 }
             )

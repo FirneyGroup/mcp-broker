@@ -134,6 +134,9 @@ class ConnectTokenStore(ConnectTokenStoreABC):
     def __init__(self) -> None:
         self._tokens: dict[str, tuple[str, float]] = {}  # token → (app_key, created_at)
 
+    async def setup(self) -> None:
+        """No-op — in-memory tokens need no initialization."""
+
     async def create(self, app_key: str) -> str:
         """Create a single-use connect token for an app. Returns the token."""
         self._cleanup()
