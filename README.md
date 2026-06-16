@@ -531,6 +531,18 @@ The broker implements defense-in-depth for OAuth credential management:
 - **Timing-safe comparison** — `hmac.compare_digest` for admin key validation
 - **SSRF prevention** — Discovery rejects private/loopback addresses
 
+### Securing the Admin API
+
+The public OAuth and proxy endpoints (`/oauth/*`, `/proxy/*`) are built to face the internet directly — every request carries its own cryptographic auth (PKCE, bearer / broker-key, signed state). **`/admin/*` is not.** It bypasses the broker-key middleware and is gated only by a single static `X-Admin-Key` (timing-safe comparison), with **no rate limiting or lockout**. Those endpoints mint, rotate, and **delete** broker keys, mint connect tokens, and trigger token maintenance — i.e. full control over every app's access.
+
+**Always keep `/admin/*` behind a network or identity gate. Never expose it raw to the public internet.** Choose one:
+
+- **Edge zero-trust** — e.g. Cloudflare Access with a service-token policy (the broker forwards `CF-Access-Client-*` headers for trusted internal callers; see [Inbound OAuth → Verification](#verification)).
+- **Platform IAM** — on Cloud Run, require an OIDC token (do not `allow-unauthenticated`), or set ingress to internal / internal-and-load-balancing so `/admin` is unreachable from the open internet. Drive any scheduled admin calls (e.g. `POST /admin/refresh`) with a Cloud Scheduler OIDC token rather than the static admin key alone.
+- **Reverse proxy** — an IP allowlist and/or auth layer in front of `/admin/*`.
+
+Use a strong random `BROKER_ADMIN_KEY` (the [Quickstart](#quickstart) generates one) and store/rotate it via a secrets manager — it is the one credential that, alone, grants full administrative control.
+
 ### Known Limitations
 
 - **No rate limiting** — Consider [slowapi](https://github.com/laurents/slowapi) or an upstream reverse proxy for production. (Inbound DCR has its own per-IP limit; nothing else does.)
