@@ -138,6 +138,11 @@ class TestCallbackParams:
     def test_no_realm_returns_empty(self, qbo_connector):
         assert qbo_connector.parse_callback_params({"code": "abc", "state": "xyz"}) == {}
 
+    def test_non_numeric_realm_rejected(self, qbo_connector):
+        # Intuit realm IDs are numeric; a malformed value must not reach the URL path.
+        assert qbo_connector.parse_callback_params({"realmId": "12/../admin"}) == {}
+        assert qbo_connector.parse_callback_params({"realmId": "abc"}) == {}
+
 
 # =============================================================================
 # MCP DISPATCH

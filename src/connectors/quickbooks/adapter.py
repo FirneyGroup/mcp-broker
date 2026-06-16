@@ -108,10 +108,14 @@ class QuickBooksConnector(NativeConnector):
 
         Every QBO REST call is scoped to one company (``/v3/company/{realmId}/...``),
         and the realmId arrives only on the callback redirect — not in the token
-        response — so it is captured here into provider_metadata.
+        response — so it is captured here into provider_metadata. Intuit realm IDs
+        are numeric; validating the shape at this trust boundary keeps a malformed
+        value out of the request path and fails fast on a bad callback.
         """
         realm_id = query_params.get("realmId")
-        return {"realm_id": realm_id} if realm_id else {}
+        if not realm_id or not realm_id.isdigit():
+            return {}
+        return {"realm_id": realm_id}
 
     # --- Internal ---
 
