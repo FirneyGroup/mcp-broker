@@ -19,8 +19,8 @@ import respx
 
 from broker.connectors.registry import ConnectorRegistry
 
-# Sandbox host is the client default with no QUICKBOOKS_* env set.
-_QBO = "https://sandbox-quickbooks.api.intuit.com/v3/company"
+# Production host is the client default (no QUICKBOOKS_API_BASE_URL set).
+_QBO = "https://quickbooks.api.intuit.com/v3/company"
 
 EXPECTED_TOOLS = {
     "get_profit_and_loss",

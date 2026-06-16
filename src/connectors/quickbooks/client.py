@@ -26,9 +26,9 @@ logger = logging.getLogger(__name__)
 
 # === CONSTANTS ===
 
-# QBO API hosts. Sandbox companies (dev) and production companies live on
-# different hosts; the OAuth endpoints are identical for both.
-_SANDBOX_BASE_URL = "https://sandbox-quickbooks.api.intuit.com"
+# QBO API host. Production by default; set QUICKBOOKS_API_BASE_URL to the sandbox
+# host (https://sandbox-quickbooks.api.intuit.com) for dev/CI. The OAuth endpoints
+# are identical for both.
 _PRODUCTION_BASE_URL = "https://quickbooks.api.intuit.com"
 
 # Pins the API field set so responses don't shift under us. Intuit deprecated
@@ -47,18 +47,15 @@ _HTTP_NOT_FOUND = 404
 
 
 def _resolve_base_url() -> str:
-    """Resolve the QBO API base URL from the environment.
+    """Resolve the QBO API base URL.
 
-    ``QUICKBOOKS_API_BASE_URL`` takes precedence (used to point at a local stub in
-    tests / live checks); otherwise ``QUICKBOOKS_ENVIRONMENT`` selects sandbox
-    (default) vs production. This is a deployment-environment selector, not a
-    secret, so it lives in the environment rather than settings.yaml.
+    Defaults to the production host. Set ``QUICKBOOKS_API_BASE_URL`` to target the
+    sandbox host (``https://sandbox-quickbooks.api.intuit.com``) or a local stub in
+    tests/CI. Using a single env override — rather than a separate non-secret
+    ``QUICKBOOKS_ENVIRONMENT`` value — keeps deployment config out of ``.env`` per
+    the broker's config contract while remaining a documented escape hatch.
     """
-    override = os.getenv("QUICKBOOKS_API_BASE_URL")
-    if override:
-        return override.rstrip("/")
-    environment = os.getenv("QUICKBOOKS_ENVIRONMENT", "sandbox").strip().lower()
-    return _PRODUCTION_BASE_URL if environment == "production" else _SANDBOX_BASE_URL
+    return os.getenv("QUICKBOOKS_API_BASE_URL", _PRODUCTION_BASE_URL).rstrip("/")
 
 
 class QboContext(BaseModel):

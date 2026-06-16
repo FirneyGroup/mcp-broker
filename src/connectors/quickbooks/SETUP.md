@@ -53,11 +53,11 @@ id (`realmId`) is captured from the OAuth callback into the connection's
 
 ## Operational notes / limits
 
-- **Environment is fixed at startup.** `QUICKBOOKS_ENVIRONMENT` (and the
-  `QUICKBOOKS_API_BASE_URL` override) are read once when the connector is
-  constructed — connectors are process-wide singletons. Changing them requires a
-  **broker restart**, and one broker instance serves a single QBO environment
-  (all-sandbox or all-production), not a per-tenant mix.
+- **Host is fixed at startup.** The base URL (the production host by default, or
+  `QUICKBOOKS_API_BASE_URL` if set) is read once when the connector is constructed
+  — connectors are process-wide singletons. Changing it requires a **broker
+  restart**, and one broker instance serves a single QBO environment
+  (all-production or all-sandbox), not a per-tenant mix.
 - **Lists are capped, not paginated.** Lookup tools return at most 100 rows and do
   not page (`MAXRESULTS` only, no `STARTPOSITION`). For a company with more rows,
   the result is silently truncated to the first 100 in this read-only v1 —
@@ -70,8 +70,9 @@ id (`realmId`) is captured from the OAuth callback into the connection's
 ```bash
 QUICKBOOKS_CLIENT_ID=<your-client-id>
 QUICKBOOKS_CLIENT_SECRET=<your-client-secret>
-# sandbox (default) | production — selects the QBO API host
-QUICKBOOKS_ENVIRONMENT=sandbox
+# Optional: the connector defaults to the production QBO host. For sandbox/CI,
+# point it at the sandbox host (non-secret escape hatch):
+# QUICKBOOKS_API_BASE_URL=https://sandbox-quickbooks.api.intuit.com
 ```
 
 `settings.yaml`:
