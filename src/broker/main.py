@@ -61,6 +61,11 @@ logger = logging.getLogger(__name__)
 # refreshes exactly the connections the store reports as expiring.
 TOKEN_REFRESH_BUFFER_SECONDS = 600
 
+# OAuth callback query params stripped before a connector's parse_callback_params
+# hook sees them — a connector must never receive (or be able to persist) the
+# single-use authorization code or the signed state.
+_OAUTH_CALLBACK_PARAMS = frozenset({"code", "state", "error", "error_description"})
+
 # Module-level references (set during lifespan startup)
 _store: TokenStore | None = None
 _oauth_handler: OAuthHandler | None = None
@@ -758,6 +763,30 @@ async def oauth_connect(
     return RedirectResponse(url)
 
 
+def _capture_provider_metadata(
+    connector: BaseConnector, query_params: dict[str, str]
+) -> dict[str, str]:
+    """Extract a connector's non-secret callback metadata, safely.
+
+    OAuth params (code/state/error*) are stripped first so a connector hook never
+    sees — let alone persists — the single-use authorization code. The hook is
+    guarded so a faulty connector implementation cannot lose an already-exchanged
+    token: on failure we log and return {} so the connection is still saved.
+    """
+    safe_params = {
+        key: value for key, value in query_params.items() if key not in _OAUTH_CALLBACK_PARAMS
+    }
+    try:
+        return connector.parse_callback_params(safe_params)
+    except Exception:  # noqa: BLE001 -- a faulty hook must not lose an already-exchanged token
+        logger.warning(
+            "[Broker] parse_callback_params failed for %s; storing connection without metadata",
+            connector.meta.name,
+            exc_info=True,
+        )
+        return {}
+
+
 async def _exchange_and_store_token(  # noqa: PLR0913 — OAuth exchange needs all context
     connector: BaseConnector,
     connector_name: str,
@@ -782,9 +811,9 @@ async def _exchange_and_store_token(  # noqa: PLR0913 — OAuth exchange needs a
     )
 
     # Capture non-secret provider identifiers that arrive on the callback redirect
-    # rather than in the token response (e.g. QuickBooks' realmId). Default hook
-    # returns {} so connectors that don't override it are unaffected.
-    provider_metadata = connector.parse_callback_params(dict(request.query_params))
+    # rather than in the token response (e.g. QuickBooks' realmId). OAuth params are
+    # stripped and the hook is guarded — see _capture_provider_metadata.
+    provider_metadata = _capture_provider_metadata(connector, dict(request.query_params))
     if provider_metadata:
         connection = connection.model_copy(update={"provider_metadata": provider_metadata})
 

@@ -63,6 +63,34 @@ class _PlainConnector(NativeConnector):
         return [{"type": "text", "text": "ok"}]
 
 
+class _CallbackSpyConnector(NativeConnector):
+    """Echoes back which callback params reached parse_callback_params."""
+
+    meta = ConnectorMeta(
+        name="cb_spy_test",
+        display_name="Callback Spy",
+        oauth_authorize_url="https://example.com/authorize",
+        oauth_token_url="https://example.com/token",  # noqa: S106 -- endpoint URL
+    )
+
+    def parse_callback_params(self, query_params: dict[str, str]) -> dict[str, str]:
+        return {"seen": ",".join(sorted(query_params))}
+
+
+class _RaisingCallbackConnector(NativeConnector):
+    """A connector whose callback hook raises (simulates a buggy implementation)."""
+
+    meta = ConnectorMeta(
+        name="cb_raise_test",
+        display_name="Callback Raiser",
+        oauth_authorize_url="https://example.com/authorize",
+        oauth_token_url="https://example.com/token",  # noqa: S106 -- endpoint URL
+    )
+
+    def parse_callback_params(self, query_params: dict[str, str]) -> dict[str, str]:
+        raise RuntimeError("boom")
+
+
 # === storage round-trip ===
 
 
@@ -140,6 +168,28 @@ class TestOptInDispatch:
 
     def test_parse_callback_params_default_is_empty(self):
         assert _PlainConnector().parse_callback_params({"realmId": "x"}) == {}
+
+
+# === callback metadata capture (strip OAuth params + guard the hook) ===
+
+
+class TestCaptureProviderMetadata:
+    def test_strips_oauth_params_before_hook(self):
+        from broker.main import _capture_provider_metadata
+
+        seen = _capture_provider_metadata(
+            _CallbackSpyConnector(),
+            {"code": "c", "state": "s", "error": "e", "error_description": "d", "realmId": "1"},
+        )["seen"].split(",")
+        assert "realmId" in seen
+        # The single-use authorization code (and state/error) never reach the hook.
+        assert not ({"code", "state", "error", "error_description"} & set(seen))
+
+    def test_faulty_hook_returns_empty_so_connection_is_still_saved(self):
+        from broker.main import _capture_provider_metadata
+
+        # A raising hook must not propagate — the token was already exchanged.
+        assert _capture_provider_metadata(_RaisingCallbackConnector(), {"realmId": "1"}) == {}
 
 
 @pytest.fixture(autouse=True)
