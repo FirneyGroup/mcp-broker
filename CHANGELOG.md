@@ -37,6 +37,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Security
 
+- **Dependency CVE fixes** — bumped `cryptography` 46.0.7→49.0.0 (GHSA-537c-gmf6-5ccf), `python-multipart` 0.0.28→0.0.32 (CVE-2026-53538 / -53539 / -53540), `starlette` 1.1.0→1.3.1 (CVE-2026-54282 / -54283; pinned directly as a security floor since it is a transitive dependency of FastAPI), and `pip` 26.1.1→26.1.2 (PYSEC-2026-196). `pip-audit` now reports no known vulnerabilities.
 - Inbound bearer tokens, refresh tokens, and DCR client secrets are SHA-256-hashed at rest; raw values surface only at issuance and never again. Token comparison uses `hmac.compare_digest`.
 - Inbound `Authorization: Bearer` header is removed from the request before any downstream handler runs (defense in depth on top of the existing proxy strip list).
 - Refresh-token replay triggers immediate cascade revoke of every token in the family.
