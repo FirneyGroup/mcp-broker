@@ -8,6 +8,7 @@ broker:
     - notion_api
     - slack
     - workspace_mcp
+    - quickbooks
   admin_key: ${BROKER_ADMIN_KEY}           # For /admin/* endpoints (X-Admin-Key header)
   encryption_keys:
     - ${BROKER_ENCRYPTION_KEY}
@@ -60,7 +61,7 @@ clients:
   my_company:
     app1:
       scopes: [proxy, status]                              # Available scopes: proxy, status
-      allowed_connectors: [hubspot, notion, notion_api, slack, workspace_mcp] # Empty list = all connectors
+      allowed_connectors: [hubspot, notion, notion_api, slack, workspace_mcp, quickbooks] # Empty list = all connectors
 
 # Only needed for static connectors (discovery connectors get credentials automatically)
 apps:
@@ -81,3 +82,6 @@ apps:
       slack:
         client_id: ${SLACK_CLIENT_ID}
         client_secret: ${SLACK_CLIENT_SECRET}
+      quickbooks:
+        client_id: ${QUICKBOOKS_CLIENT_ID}
+        client_secret: ${QUICKBOOKS_CLIENT_SECRET}

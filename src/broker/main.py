@@ -781,6 +781,13 @@ async def _exchange_and_store_token(  # noqa: PLR0913 — OAuth exchange needs a
         connector, code, state, resolved, callback_url
     )
 
+    # Capture non-secret provider identifiers that arrive on the callback redirect
+    # rather than in the token response (e.g. QuickBooks' realmId). Default hook
+    # returns {} so connectors that don't override it are unaffected.
+    provider_metadata = connector.parse_callback_params(dict(request.query_params))
+    if provider_metadata:
+        connection = connection.model_copy(update={"provider_metadata": provider_metadata})
+
     await store.save(returned_app_key, connector_name, connection)
     return returned_app_key
 

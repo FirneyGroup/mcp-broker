@@ -11,6 +11,7 @@ in __init_subclass__, dispatch via handler lookup.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from collections.abc import Callable
 from typing import Any, ClassVar
@@ -42,6 +43,10 @@ class _RegisteredTool(BaseModel):
 
     meta: NativeToolMeta
     handler_name: str
+    # Whether the handler declares a `provider_metadata` parameter. Detected once at
+    # registration so dispatch only forwards metadata to handlers that opted in —
+    # handlers without it (e.g. every Twitter tool) keep their original signature.
+    accepts_metadata: bool = False
     model_config = ConfigDict(frozen=True)
 
 
@@ -66,7 +71,14 @@ def _jsonrpc_error(request_id: Any, code: int, message: str) -> dict:
 
 
 def native_tool(meta: NativeToolMeta) -> Callable:
-    """Mark a method as a native MCP tool. Collected by __init_subclass__."""
+    """Mark a method as a native MCP tool. Collected by __init_subclass__.
+
+    MUST return the handler unwrapped (or, if ever wrapped, set ``__wrapped__``):
+    __init_subclass__ uses ``inspect.signature`` on the handler to detect whether
+    it opts into ``provider_metadata``. A wrapper without ``__wrapped__`` would hide
+    the real signature and silently stop metadata (e.g. QuickBooks' realmId) from
+    being forwarded.
+    """
 
     def decorator(fn: Any) -> Any:
         fn._tool_meta = meta
@@ -105,6 +117,7 @@ class NativeConnector(BaseConnector):
                 cls._tools[tool_meta.name] = _RegisteredTool(
                     meta=tool_meta,
                     handler_name=attr_name,
+                    accepts_metadata="provider_metadata" in inspect.signature(method).parameters,
                 )
         super().__init_subclass__(**kwargs)
 
@@ -123,15 +136,20 @@ class NativeConnector(BaseConnector):
 
     # --- MCP JSON-RPC dispatch ---
 
-    async def handle_mcp_request(
+    async def handle_mcp_request(  # noqa: PLR0913 -- MCP dispatch needs method/params/request_id/token/metadata
         self,
         *,
         method: str,
         params: dict,
         request_id: Any,
         access_token: str,
+        provider_metadata: dict[str, str] | None = None,
     ) -> dict | None:
         """Handle an MCP JSON-RPC request. Token passed directly as argument.
+
+        ``provider_metadata`` carries non-secret per-connection identifiers (e.g.
+        QuickBooks' realmId) captured at OAuth-callback time; it is forwarded only
+        to tool handlers that declare a ``provider_metadata`` parameter.
 
         Returns None when the payload is a JSON-RPC notification (no ``id``):
         the spec mandates that notifications receive NO response, so the caller
@@ -169,7 +187,9 @@ class NativeConnector(BaseConnector):
                     },
                 )
             case "tools/call":
-                return await _dispatch_tool(self, params, request_id, access_token)
+                return await _dispatch_tool(
+                    self, params, request_id, access_token, provider_metadata
+                )
             case "ping":
                 return _jsonrpc_ok(request_id, {})
             case _:
@@ -179,11 +199,12 @@ class NativeConnector(BaseConnector):
 # --- Tool dispatch (module-level to keep NativeConnector body short) ---
 
 
-async def _dispatch_tool(
+async def _dispatch_tool(  # noqa: PLR0913 -- dispatch needs connector/params/request_id/token/metadata
     connector: NativeConnector,
     params: dict,
     request_id: Any,
     access_token: str,
+    provider_metadata: dict[str, str] | None = None,
 ) -> dict:
     """Look up and execute a registered tool by name."""
     if not isinstance(params, dict):
@@ -194,9 +215,14 @@ async def _dispatch_tool(
 
     if not isinstance(arguments, dict):
         return _jsonrpc_error(request_id, -32602, "Tool arguments must be an object")
-    # Strip a spoofed access_token from untrusted client args without mutating
-    # the caller's dict — the broker injects the real token below.
-    tool_arguments = {key: value for key, value in arguments.items() if key != "access_token"}
+    # Strip broker-injected kwargs (access_token, provider_metadata) from untrusted
+    # client args without mutating the caller's dict — the broker supplies the real
+    # values below, so a spoofed value in arguments must never override them.
+    tool_arguments = {
+        key: value
+        for key, value in arguments.items()
+        if key not in ("access_token", "provider_metadata")
+    }
 
     registered = connector._tools.get(tool_name)
     # An unavailable tool was filtered out of tools/list, so to the client it
@@ -207,7 +233,12 @@ async def _dispatch_tool(
         return _jsonrpc_error(request_id, -32602, f"Unknown tool: {tool_name}")
     try:
         handler = getattr(connector, registered.handler_name)
-        content = await handler(access_token=access_token, **tool_arguments)
+        # Forward provider_metadata only to handlers that declared the parameter,
+        # so handlers without it keep their original (access_token-only) signature.
+        metadata_kwarg = (
+            {"provider_metadata": provider_metadata or {}} if registered.accepts_metadata else {}
+        )
+        content = await handler(access_token=access_token, **metadata_kwarg, **tool_arguments)
     except ValueError as validation_error:
         # ValueError is the connector-authored, pre-sanitized error channel —
         # its message is intended for the remote client. Any other exception type

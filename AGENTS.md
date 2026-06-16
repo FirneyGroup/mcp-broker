@@ -72,6 +72,7 @@ The broker has four connector flavours, all subclassing `BaseConnector`. Flavour
 - `build_auth_header(access_token)` — default `Authorization: Bearer {token}`. Override to add sibling headers (e.g. Notion's `Notion-Version`).
 - `build_token_request_auth(credentials)` — default puts `client_id`/`client_secret` in the POST body (`client_secret_post`). Override to use HTTP Basic Auth (`client_secret_basic`, e.g. Notion).
 - `parse_token_response(raw)` — default pass-through. Override when the provider returns extra fields outside the OAuth 2 standard (e.g. Notion's `workspace_id`).
+- `parse_callback_params(query_params)` — default `{}`. Override to capture **non-secret** per-connection identifiers that arrive on the OAuth callback redirect (not in the token response) and that later API calls require — e.g. QuickBooks' `realmId` (the company id). The returned dict is stored on `AppConnection.provider_metadata` and forwarded to native tool handlers that declare a `provider_metadata` parameter.
 
 **Data contracts** (see `src/broker/models/connector_config.py`):
 
@@ -114,6 +115,7 @@ Flavour is determined by `ConnectorMeta` field values per the Architecture table
 - Synchronous SDK calls inside tool methods MUST be wrapped in `asyncio.get_running_loop().run_in_executor(...)`. **Rationale:** the proxy path is async; a blocking SDK call stalls the entire event loop, freezing every concurrent proxy request across every connector. See `src/connectors/twitter/adapter.py` for the pattern.
 - Tool input schemas (`NativeToolMeta.input_schema`) MUST have `"type": "object"` at the top level. Include a `"required"` list when the tool has mandatory parameters; omit it for tools with only optional or no parameters. **Rationale:** MCP `tools/list` delivers this schema to LLMs verbatim; a malformed top-level shape degrades tool-selection accuracy. `required` is only meaningful when something is actually required (see `src/connectors/twitter/adapter.py:56` — `get_me` has no required fields and correctly omits the list).
 - Tool handlers MUST NOT log, persist, or include `access_token` in their return value. **Rationale:** tokens belong to the broker's in-memory flow only. A handler leaking the token into logs or MCP responses breaks the security model.
+- A tool handler that needs a non-secret per-connection identifier (e.g. QuickBooks' realmId) MAY declare an optional `provider_metadata: dict[str, str] | None = None` parameter; `_dispatch_tool` forwards `AppConnection.provider_metadata` only to handlers that declare it (detected once at registration), so handlers without it keep their `access_token`-only signature. Populate it by overriding `parse_callback_params`. **Rationale:** the realm-style id arrives on the OAuth callback, not the token, and a token is bound to exactly one company — threading it generically (rather than hard-coding a provider concept in the proxy/oauth core) keeps the broker provider-neutral. `provider_metadata` is stored as plaintext, so it MUST hold only non-secret values.
 
 ## Provider Onboarding
 
