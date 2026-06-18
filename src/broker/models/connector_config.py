@@ -58,11 +58,13 @@ class ConnectorMeta(BaseModel):
         ),
     )
     mcp_transport: str = "streamable_http"
-    auth_mode: Literal["broker", "sidecar"] = Field(
+    auth_mode: Literal["broker", "sidecar", "none"] = Field(
         default="broker",
         description=(
             "'broker' = broker manages OAuth (default). "
-            "'sidecar' = sidecar manages its own credentials, broker proxies without token injection."
+            "'sidecar' = sidecar manages its own credentials, broker proxies without token injection. "
+            "'none' = no broker-issued token; the connector targets an open or static-token API and "
+            "self-sources any credential from its own config (skips the OAuth connection gate)."
         ),
     )
     oauth_authorize_url: str | None = Field(
@@ -148,6 +150,15 @@ class ConnectorMeta(BaseModel):
     def is_sidecar_managed(self) -> bool:
         """Whether the sidecar manages its own auth (broker proxies without token injection)."""
         return self.auth_mode == "sidecar"
+
+    @property
+    def requires_oauth(self) -> bool:
+        """Whether the broker must obtain/inject an OAuth token for this connector.
+
+        False for auth_mode='none' (open or static-token APIs that self-source any
+        credential) and 'sidecar' — both skip the broker's OAuth connection gate.
+        """
+        return self.auth_mode == "broker"
 
     @property
     def uses_discovery(self) -> bool:

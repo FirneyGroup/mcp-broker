@@ -264,12 +264,14 @@ def _method_not_allowed_response(method: str) -> JSONResponse:
 async def _dispatch_native_request(
     request: Request,
     connector: NativeConnector,
-    connection: AppConnection,
+    connection: AppConnection | None,
 ) -> Response:
     """Dispatch JSON-RPC request to a native (in-process) connector.
 
     Parses the JSON-RPC body, delegates to connector.handle_mcp_request(),
-    and returns the result as a JSONResponse. Token passed directly.
+    and returns the result as a JSONResponse. Token passed directly. ``connection``
+    is None for auth_mode='none' connectors (open / static-token APIs) — the handler
+    then receives an empty access_token and empty provider_metadata.
     """
     # Native connectors bypass _build_and_stream, so the HTTP-method allowlist
     # must be enforced here too — otherwise PUT would reach tool execution.
@@ -295,8 +297,8 @@ async def _dispatch_native_request(
         method=payload.get("method", ""),
         params=payload.get("params", {}),
         request_id=payload.get("id"),
-        access_token=connection.access_token,
-        provider_metadata=connection.provider_metadata,
+        access_token=connection.access_token if connection else "",
+        provider_metadata=connection.provider_metadata if connection else {},
     )
     # handle_mcp_request returns None for notifications (no id) — JSON-RPC
     # mandates no response body, so reply 204 with an empty body (not b'""').
@@ -470,6 +472,22 @@ async def proxy_mcp_request(  # noqa: PLR0913
             request.method,
             client_host,
         )
+        return await _build_and_stream(request, connector, connector_name, path=path)
+
+    # No-OAuth — open or static-token APIs skip the OAuth connection gate. A native
+    # connector self-sources any static credential from its own broker-side config;
+    # nothing is injected here. (Sidecar, handled above, is the other non-OAuth mode.)
+    if not connector.meta.requires_oauth:
+        client_host = request.client.host if request.client else "unknown"
+        logger.info(
+            "[Proxy] No-auth dispatch: app=%s connector=%s method=%s ip=%s",
+            app_key,
+            connector_name,
+            request.method,
+            client_host,
+        )
+        if isinstance(connector, NativeConnector):
+            return await _dispatch_native_request(request, connector, None)
         return await _build_and_stream(request, connector, connector_name, path=path)
 
     # Broker-managed — resolve OAuth token
