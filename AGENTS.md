@@ -62,7 +62,9 @@ The broker has four connector flavours, all subclassing `BaseConnector`. Flavour
 | **Sidecar** | Deployment convention: `mcp_url` resolves to a Docker service on `firney-net`. Not a distinct dispatch path — the code picks based on `auth_mode`, not on the hostname | `auth_mode="broker"` → Static dispatch (broker injects tokens). `auth_mode="sidecar"` (→ `meta.is_sidecar_managed`) → upstream forward with no `Authorization` header |
 | **Native** | `mcp_url` is `None` (→ `meta.is_native == True`) | Broker serves MCP in-process via `NativeConnector.handle_mcp_request`; tool handlers receive `access_token` as a keyword argument |
 
-**Registration.** Connectors are loaded at startup by `_load_connectors` in `src/broker/main.py`, which iterates `settings.broker.connectors` and calls `importlib.import_module("connectors.{name}.adapter")` for each entry. The import triggers `BaseConnector.__init_subclass__`, which validates URL fields and calls `ConnectorRegistry.auto_register(cls)` to instantiate and store the class (one instance per connector name). A class whose name isn't in the `connectors` list is never imported — templates and half-written connectors stay dormant.
+**Registration.** Connectors are loaded at startup by `_load_connectors` in `src/broker/main.py`, which iterates `settings.broker.connectors` and, for each name, resolves a module to import: an externally-installed package registered under the `mcp_broker.connectors` entry-point group takes precedence, otherwise the in-tree `connectors.{name}.adapter` convention. The import triggers `BaseConnector.__init_subclass__`, which validates URL fields and calls `ConnectorRegistry.auto_register(cls)` to instantiate and store the class (one instance per connector name). A class whose name isn't in the `connectors` list is never imported — templates and half-written connectors stay dormant. A name that resolves BOTH in-tree and via an entry point is a hard error at startup, so an external package cannot silently shadow a reviewed in-tree connector.
+
+**External / private connectors.** A connector may ship as a separate pip package instead of living in this repo (e.g. a private connector kept out of the public tree). It declares `[project.entry-points."mcp_broker.connectors"]` mapping `{name} = "{module}"`, depends on `mcp-broker`, and is installed into the broker image. The operator still opts it in by listing `{name}` under `broker.connectors` (and the relevant `allowed_connectors`) in their real `settings.yaml` — installed ≠ active. Such connectors do NOT appear in this repo's `settings.example.yaml`; they document their own setup in their own package.
 
 **Dispatch.** The route `/proxy/{connector_name}/{path:path}` (in `src/broker/main.py`) looks up the connector via `ConnectorRegistry.get(name)`, then branches in `src/broker/services/proxy.py`: `isinstance(connector, NativeConnector)` → `handle_mcp_request()`; otherwise → httpx streaming forward to `meta.mcp_url` with `build_auth_header(access_token)` applied. Typical MCP clients POST to `/proxy/{name}/mcp`, but the `{path:path}` catch-all lets the proxy forward any subpath the upstream exposes.
 
@@ -87,9 +89,9 @@ Flavour is determined by `ConnectorMeta` field values per the Architecture table
 ### All flavours
 
 - New connectors MUST subclass `BaseConnector` (directly, or via `NativeConnector`) and set `meta = ConnectorMeta(...)` as a class attribute. Do NOT call `ConnectorRegistry.auto_register` manually. **Rationale:** the registry lookup assumes every connector arrived via `__init_subclass__`. Manual registration creates two paths and health-check output diverges.
-- The connector name MUST appear in `settings.example.yaml` under `broker.connectors`. **Rationale:** auto-registration happens on import, but the connectors list controls which are actually loaded. A missing entry means the class exists but is inert.
-- Every new connector MUST ship `src/connectors/{name}/SETUP.md` covering OAuth registration, redirect URI, and minimum required scopes. **Rationale:** OAuth provider setup is always provider-specific. Without SETUP.md, operators have to read adapter code to guess the scopes.
-- Every new connector MUST ship at least one test in `tests/test_{name}_connector.py` asserting: (a) it auto-registers, (b) `meta` validates, (c) any overridden hook returns the expected structure. **Rationale:** without a test, nothing catches a silent meta-validation change or a forgotten override.
+- An **in-tree** connector's name MUST appear in `settings.example.yaml` under `broker.connectors`. An **external/private** connector (shipped as a separate pip package via the `mcp_broker.connectors` entry-point group) MUST NOT — it is documented and registered only in the operator's real `settings.yaml`. Either way the name MUST be listed in some loaded `settings.yaml` to load. **Rationale:** the connectors list controls which connectors are actually loaded; a missing entry means the class exists but is inert. A private connector cannot appear in the public example without leaking, so its activation lives in the operator's real config.
+- Every new connector MUST ship a `SETUP.md` covering OAuth registration, redirect URI, and minimum required scopes — at `src/connectors/{name}/SETUP.md` for in-tree connectors, or in its package repo for external/private connectors. **Rationale:** OAuth provider setup is always provider-specific. Without SETUP.md, operators have to read adapter code to guess the scopes.
+- Every new connector MUST ship at least one test asserting (a) it auto-registers, (b) `meta` validates, (c) any overridden hook returns the expected structure — at `tests/test_{name}_connector.py` for in-tree connectors, or in its package repo's own CI for external/private connectors (whose code never reaches this repo's CI). **Rationale:** without a test, nothing catches a silent meta-validation change or a forgotten override; an external connector's own CI is the only gate once its code lives outside this repo.
 
 ### Static
 
@@ -165,7 +167,7 @@ Scaffolding for each flavour lives in `src/connectors/_template/{static,discover
 
 ## Config Contract
 
-- `settings.yaml` has exactly four top-level sections: `broker`, `store`, `clients`, `apps`. Don't add new top-level sections without updating the loader and this contract. **Rationale:** the loader has explicit handling per section. New sections are silently ignored.
+- `settings.yaml` has exactly four top-level sections: `broker`, `store`, `clients`, `apps`. Don't add new top-level sections without updating the loader and this contract. **Rationale:** the loader has explicit handling per section. Unknown top-level sections are rejected at load — the root `BrokerSettings` model uses `ConfigDict(extra="forbid")`.
 - New config fields MUST have type annotations and live on a Pydantic model with `extra="forbid"`. **Rationale:** see the Architecture Rule — typos would otherwise be silently ignored.
 - YAML references to env vars use `${VAR_NAME}` syntax. No inline defaults in YAML — defaults live on the Pydantic model. **Rationale:** two sources of truth for defaults (YAML and Python) drift. The Pydantic model is authoritative.
 - Per-app broker keys are NEVER stored in `settings.yaml` or `.env`. They live in SQLite (`broker_keys.db`) as SHA-256 hashes, managed via the admin API. **Rationale:** YAML and .env are operator-visible; key rotation would require file edits. The admin API keeps the raw-key surface to a single one-shot response.
@@ -190,6 +192,7 @@ The public surface:
 
 - HTTP API paths (`/proxy`, `/oauth`, `/admin`, `/status`, `/health`)
 - The `BaseConnector` / `ConnectorMeta` contract
+- The `mcp_broker.connectors` entry-point group name (external-connector discovery contract)
 - `settings.yaml` schema and field names
 - `.env` variable names
 - `./start` CLI subcommands and output formats

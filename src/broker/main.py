@@ -9,11 +9,13 @@ import asyncio
 import contextlib
 import html
 import importlib
+import importlib.util
 import logging
 import os
 import time
 from contextlib import asynccontextmanager
 from http import HTTPStatus
+from importlib.metadata import entry_points
 from urllib.parse import quote
 
 import httpx
@@ -60,6 +62,11 @@ logger = logging.getLogger(__name__)
 # Matches the default window of ``TokenStore.list_expiring`` so the loop
 # refreshes exactly the connections the store reports as expiring.
 TOKEN_REFRESH_BUFFER_SECONDS = 600
+
+# OAuth callback query params stripped before a connector's parse_callback_params
+# hook sees them — a connector must never receive (or be able to persist) the
+# single-use authorization code or the signed state.
+_OAUTH_CALLBACK_PARAMS = frozenset({"code", "state", "error", "error_description"})
 
 # Module-level references (set during lifespan startup)
 _store: TokenStore | None = None
@@ -207,16 +214,31 @@ async def _build_dcr_rate_limiter(settings: BrokerSettings) -> DCRRateLimiter | 
     return None
 
 
-def _load_connectors(connector_names: list[str]) -> None:
-    """Import connector adapter modules from the connectors list in settings.
+# Entry-point group through which externally-installed packages contribute connectors.
+# A private connector (kept out of this repo) ships as a pip package declaring this group;
+# the in-tree `connectors.{name}.adapter` convention stays the fallback.
+CONNECTOR_EP_GROUP = "mcp_broker.connectors"
 
-    Each name maps to `connectors.{name}.adapter`. Import triggers auto-registration
-    via BaseConnector.__init_subclass__.
+
+def _load_connectors(connector_names: list[str]) -> None:
+    """Import the adapter module for each connector named in settings.
+
+    Resolution per name: an external package registered under the
+    ``mcp_broker.connectors`` entry-point group wins; otherwise the in-tree
+    ``connectors.{name}.adapter``. Import triggers auto-registration via
+    BaseConnector.__init_subclass__. A name resolvable BOTH ways is a hard error —
+    an external package silently shadowing a reviewed in-tree connector is a footgun.
     """
+    external = {ep.name: ep.value for ep in entry_points(group=CONNECTOR_EP_GROUP)}
     for name in connector_names:
         if not name.isidentifier():
             raise ValueError(f"Invalid connector name: {name!r} (must be a Python identifier)")
-        module_path = f"connectors.{name}.adapter"
+        if name in external and importlib.util.find_spec(f"connectors.{name}") is not None:
+            raise ValueError(
+                f"Connector {name!r} resolves both in-tree and via the "
+                f"{CONNECTOR_EP_GROUP} entry-point group — remove one to disambiguate."
+            )
+        module_path = external.get(name, f"connectors.{name}.adapter")
         try:
             importlib.import_module(module_path)
         except Exception:
@@ -758,6 +780,30 @@ async def oauth_connect(
     return RedirectResponse(url)
 
 
+def _capture_provider_metadata(
+    connector: BaseConnector, query_params: dict[str, str]
+) -> dict[str, str]:
+    """Extract a connector's non-secret callback metadata, safely.
+
+    OAuth params (code/state/error*) are stripped first so a connector hook never
+    sees — let alone persists — the single-use authorization code. The hook is
+    guarded so a faulty connector implementation cannot lose an already-exchanged
+    token: on failure we log and return {} so the connection is still saved.
+    """
+    safe_params = {
+        key: value for key, value in query_params.items() if key not in _OAUTH_CALLBACK_PARAMS
+    }
+    try:
+        return connector.parse_callback_params(safe_params)
+    except Exception:  # noqa: BLE001 -- a faulty hook must not lose an already-exchanged token
+        logger.warning(
+            "[Broker] parse_callback_params failed for %s; storing connection without metadata",
+            connector.meta.name,
+            exc_info=True,
+        )
+        return {}
+
+
 async def _exchange_and_store_token(  # noqa: PLR0913 — OAuth exchange needs all context
     connector: BaseConnector,
     connector_name: str,
@@ -780,6 +826,13 @@ async def _exchange_and_store_token(  # noqa: PLR0913 — OAuth exchange needs a
     connection, returned_app_key = await oauth.exchange_code(
         connector, code, state, resolved, callback_url
     )
+
+    # Capture non-secret provider identifiers that arrive on the callback redirect
+    # rather than in the token response (e.g. QuickBooks' realmId). OAuth params are
+    # stripped and the hook is guarded — see _capture_provider_metadata.
+    provider_metadata = _capture_provider_metadata(connector, dict(request.query_params))
+    if provider_metadata:
+        connection = connection.model_copy(update={"provider_metadata": provider_metadata})
 
     await store.save(returned_app_key, connector_name, connection)
     return returned_app_key
