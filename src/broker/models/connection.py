@@ -19,5 +19,15 @@ class AppConnection(BaseModel):
     scopes: list[str] = Field(default_factory=list)
     connected_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     connected_by: str | None = None
+    provider_metadata: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Non-secret per-connection identifiers captured from the OAuth callback "
+            "(e.g. QuickBooks realmId), populated via BaseConnector.parse_callback_params "
+            "and passed to native tool handlers that declare a provider_metadata parameter. "
+            "Stored as plaintext — never put secrets here; tokens live in the encrypted "
+            "access_token / refresh_token fields."
+        ),
+    )
 
     model_config = ConfigDict(frozen=True)

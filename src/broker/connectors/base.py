@@ -107,3 +107,17 @@ class BaseConnector:
         Default: expects standard OAuth2 fields (access_token, refresh_token, expires_in).
         """
         return raw_response
+
+    def parse_callback_params(self, query_params: dict[str, str]) -> dict[str, str]:
+        """Extract non-secret provider identifiers from the OAuth callback query string.
+
+        Default: no metadata. Override when a provider returns an identifier on the
+        callback redirect (not in the token response) that later API calls require —
+        e.g. QuickBooks' ``realmId`` (the company ID). The returned dict is stored on
+        ``AppConnection.provider_metadata`` and passed to native tool handlers that
+        declare a ``provider_metadata`` parameter.
+
+        MUST return only non-secret values — ``provider_metadata`` is stored as
+        plaintext (tokens belong in the encrypted ``access_token``/``refresh_token``).
+        """
+        return {}

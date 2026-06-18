@@ -296,6 +296,7 @@ async def _dispatch_native_request(
         params=payload.get("params", {}),
         request_id=payload.get("id"),
         access_token=connection.access_token,
+        provider_metadata=connection.provider_metadata,
     )
     # handle_mcp_request returns None for notifications (no id) — JSON-RPC
     # mandates no response body, so reply 204 with an empty body (not b'""').
