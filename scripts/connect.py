@@ -341,7 +341,11 @@ def _show_status_table(
         name = connector.get("name", "unknown")
         display_name = connector.get("display_name", name)
         connection = connected_by_name.get(name)
-        status_label, token_label = _format_token_status(connection)
+        if connector.get("auth_mode") == "none":
+            # Open / static-token API — no outbound connection to make.
+            status_label, token_label = "Open", "no connect needed"
+        else:
+            status_label, token_label = _format_token_status(connection)
         all_connectors.append((connector, connection))
         print(f"{logger_prefix}{i:<4}{display_name:<20}{status_label:<15}{token_label}")
 
@@ -665,19 +669,28 @@ def _select_connector_with_status(
 
 
 def _show_all_configs(
+    connectors: list[dict[str, str]],
     connections: list[dict[str, Any]],
     ctx: McpConfigContext,
 ) -> None:
-    """Print the legend once, then a compact entry per connected connector, and exit."""
-    connected = [c for c in connections if c.get("connected")]
-    if not connected:
-        print(f"{logger_prefix}No connected connectors for {ctx.app_key}")
+    """Print the legend once, then a compact entry per usable connector, and exit.
+
+    A connector is usable from a client when it is either connected via outbound OAuth
+    OR open (auth_mode='none' — no outbound connection needed). Both still require the
+    broker's inbound auth (the printed key headers / oauth url), so both belong here.
+    """
+    connected_names = {c.get("connector") for c in connections if c.get("connected")}
+    usable = [
+        c for c in connectors if c.get("name") in connected_names or c.get("auth_mode") == "none"
+    ]
+    if not usable:
+        print(f"{logger_prefix}No connected or open connectors for {ctx.app_key}")
         print(f"{logger_prefix}Run ./start connect first to set up OAuth")
         sys.exit(1)
     _show_legend(ctx)
-    for conn in connected:
-        name = conn.get("connector", "unknown")
-        transport = _get_connector_transport(ctx.broker_url, name)
+    for connector in usable:
+        name = connector.get("name", "unknown")
+        transport = connector.get("transport", "streamable_http")
         _show_connector(name, transport, ctx)
 
 
@@ -726,11 +739,30 @@ def main() -> None:  # noqa: PLR0915 — CLI entry point with sequential setup s
             allowed_redirect_uris=allowed_redirect_uris,
             auth_mode=args.auth,
         )
-        _show_all_configs(connections, ctx)
+        _show_all_configs(connectors, connections, ctx)
         return
 
     connector_name = _select_connector_with_status(connectors, connections, app_key)
     if not connector_name:
+        return
+
+    chosen = next((c for c in connectors if c.get("name") == connector_name), {})
+    if chosen.get("auth_mode") == "none":
+        # Open / static-token connector — nothing to connect; show its client config.
+        print(
+            f"\n{logger_prefix}{chosen.get('display_name', connector_name)} is an open "
+            "connector — no connection needed; it's ready to use."
+        )
+        ctx = McpConfigContext(
+            broker_url=args.broker_url,
+            app_key=app_key,
+            broker_key=broker_key,
+            oauth_enabled=oauth_enabled,
+            allowed_redirect_uris=allowed_redirect_uris,
+            auth_mode=args.auth,
+        )
+        _show_legend(ctx)
+        _show_connector(connector_name, chosen.get("transport", "streamable_http"), ctx)
         return
 
     _run_connect_flow(

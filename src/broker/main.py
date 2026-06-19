@@ -722,6 +722,24 @@ def _reject_sidecar_managed(connector: BaseConnector) -> None:
         )
 
 
+def _reject_no_auth_connect(connector: BaseConnector) -> None:
+    """Raise 400 if an auth_mode='none' connector is asked to run an OAuth connect.
+
+    These target an open or static-token API — there is no outbound OAuth to perform,
+    so /connect is not applicable. They are ready to use as soon as they are listed in
+    the operator's settings; clients still authenticate to the broker (inbound auth).
+    Returns a clear 400 instead of the misleading 404 that resolve_oauth would raise.
+    """
+    if connector.meta.auth_mode == "none":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{connector.meta.display_name} is an open/static-token connector "
+                "(auth_mode='none') — no outbound connection is required; it is ready to use."
+            ),
+        )
+
+
 def _resolve_oauth_success_url(settings: BrokerSettings, connector_name: str) -> str:
     """Resolve the post-OAuth-callback redirect URL.
 
@@ -759,6 +777,7 @@ async def oauth_connect(
     identity = request.state.identity
     connector = _get_connector_or_404(connector_name)
     _reject_sidecar_managed(connector)
+    _reject_no_auth_connect(connector)
 
     callback_url = str(request.url_for("oauth_callback", connector_name=connector_name))
 
