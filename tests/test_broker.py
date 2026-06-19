@@ -1955,6 +1955,30 @@ class TestSidecarOAuthGuard:
         finally:
             self._restore_auth(old)
 
+    def test_oauth_connect_rejects_no_auth_mode(self) -> None:
+        """GET /oauth/{connector}/connect returns a clear 400 for auth_mode='none' connectors."""
+        from fastapi.testclient import TestClient
+
+        from broker.main import app
+
+        mock_connector = MagicMock()
+        mock_connector.meta.is_sidecar_managed = False
+        mock_connector.meta.auth_mode = "none"
+        mock_connector.meta.display_name = "Open Test"
+
+        old = self._setup_mocked_auth()
+        try:
+            with patch("broker.main._get_connector_or_404", return_value=mock_connector):
+                client = TestClient(app)
+                response = client.get(
+                    "/oauth/open_test/connect",
+                    headers={"x-app-id": "test:app", "x-broker-key": "fake"},
+                )
+                assert response.status_code == 400
+                assert "no outbound connection is required" in response.json()["detail"]
+        finally:
+            self._restore_auth(old)
+
     def test_oauth_disconnect_rejects_sidecar(self) -> None:
         """POST /oauth/{connector}/disconnect returns 404 for sidecar connectors."""
         from fastapi.testclient import TestClient
