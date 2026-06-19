@@ -449,7 +449,7 @@ class McpConfigContext(BaseModel):
     the API-key data, and ``auth_mode`` to decide which lines to print.
     """
 
-    broker_url: str
+    public_url: str  # client-facing base URL for printed connector URLs (broker.public_url)
     app_key: str
     broker_key: str
     oauth_enabled: bool
@@ -480,7 +480,7 @@ def _render_claude_command(connector_name: str, transport: str, ctx: McpConfigCo
     }
     server = {
         "type": _claude_mcp_type(transport),
-        "url": f"{ctx.broker_url}/proxy/{connector_name}/mcp",
+        "url": f"{ctx.public_url}/proxy/{connector_name}/mcp",
         "headers": headers,
     }
     server_json = json.dumps(server, separators=(",", ":"))  # compact, matches example
@@ -536,7 +536,7 @@ def _show_connector(connector_name: str, transport: str, ctx: McpConfigContext) 
     if ctx.auth_mode in ("apikey", "both"):
         print(f"{logger_prefix}  {_render_claude_command(connector_name, transport, ctx)}")
     if ctx.auth_mode in ("oauth", "both"):
-        print(f"{logger_prefix}  oauth url:  {ctx.broker_url}/proxy/{connector_name}/mcp")
+        print(f"{logger_prefix}  oauth url:  {ctx.public_url}/proxy/{connector_name}/mcp")
     print()
 
 
@@ -563,6 +563,18 @@ def _oauth_config(settings: dict[str, Any]) -> tuple[bool, list[str]]:
     return enabled, redirect_uris
 
 
+def _public_url(settings: dict[str, Any], fallback: str) -> str:
+    """Client-facing base URL for the printed connector config.
+
+    Uses broker.public_url — the externally-reachable address clients actually use
+    (e.g. behind Cloudflare) — so the printed ``claude mcp add-json`` / oauth URLs work
+    from anywhere, not just where this admin CLI runs. Falls back to the admin
+    --broker-url when public_url is unset.
+    """
+    public = settings.get("broker", {}).get("public_url") or fallback
+    return public.rstrip("/")
+
+
 def _run_connect_flow(  # noqa: PLR0913 — connect flow needs broker + key + auth-config context
     broker_url: str,
     connector_name: str,
@@ -572,6 +584,7 @@ def _run_connect_flow(  # noqa: PLR0913 — connect flow needs broker + key + au
     oauth_enabled: bool,
     allowed_redirect_uris: list[str],
     auth_mode: AuthMode,
+    public_url: str,
 ) -> None:
     """Create connect token, open browser, poll until connected."""
     print(f"\n{logger_prefix}Connecting {connector_name}...")
@@ -591,7 +604,7 @@ def _run_connect_flow(  # noqa: PLR0913 — connect flow needs broker + key + au
         # Post-connect summary honors --auth (argparse default is "both"); pass
         # --auth=apikey|oauth to ./start connect to show only that shape.
         ctx = McpConfigContext(
-            broker_url=broker_url,
+            public_url=public_url,
             app_key=app_key,
             broker_key=broker_key,
             oauth_enabled=oauth_enabled,
@@ -726,13 +739,14 @@ def main() -> None:  # noqa: PLR0915 — CLI entry point with sequential setup s
 
     connections = _fetch_connections(args.broker_url, app_key, broker_key)
     oauth_enabled, allowed_redirect_uris = _oauth_config(settings)
+    public_url = _public_url(settings, args.broker_url)
 
     if args.show_config:
         if not broker_key:
             print(f"{logger_prefix}No broker key available — rotate or create one first")
             sys.exit(1)
         ctx = McpConfigContext(
-            broker_url=args.broker_url,
+            public_url=public_url,
             app_key=app_key,
             broker_key=broker_key,
             oauth_enabled=oauth_enabled,
@@ -754,7 +768,7 @@ def main() -> None:  # noqa: PLR0915 — CLI entry point with sequential setup s
             "connector — no connection needed; it's ready to use."
         )
         ctx = McpConfigContext(
-            broker_url=args.broker_url,
+            public_url=public_url,
             app_key=app_key,
             broker_key=broker_key,
             oauth_enabled=oauth_enabled,
@@ -774,6 +788,7 @@ def main() -> None:  # noqa: PLR0915 — CLI entry point with sequential setup s
         oauth_enabled,
         allowed_redirect_uris,
         args.auth,
+        public_url,
     )
 
 

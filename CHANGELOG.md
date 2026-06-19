@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- **`./start mcp-config` / `connect` now print the broker's public URL for connector URLs.** The `claude mcp add-json` URL and the `oauth url` are built from `broker.public_url` (the externally-reachable address, e.g. behind Cloudflare) instead of the admin `--broker-url` (typically `localhost`), so the printed config is usable from any client — claude.ai, Cursor, an operator laptop — not just on the host running the CLI. Falls back to `--broker-url` when `public_url` is unset.
+
 ### Added
 
 - **`auth_mode='none'` connectors** — a connector targeting an open API (or one it authenticates to with its own static credential) can set `ConnectorMeta.auth_mode='none'` to skip the broker's OAuth connection gate entirely (no `resolve_oauth`, no stored token, no `/oauth/connect`). Native handlers receive an empty `access_token`/`provider_metadata` and self-source any credential from their own config. New `ConnectorMeta.requires_oauth` property is `False` for `'none'` and `'sidecar'`. Existing connectors default to `'broker'` — no behaviour change. The `./start connect` wizard shows such connectors as **Open (no connect needed)** and skips the OAuth flow; `./start mcp-config` includes them (clients still authenticate to the broker via inbound auth, so they belong in the client config); and `/oauth/{connector}/connect` returns a clear 400 instead of a misleading 404.
