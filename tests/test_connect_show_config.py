@@ -99,6 +99,9 @@ class TestOauthConfig:
 
 
 GENERIC_BROKER_URL = "https://broker.example.com"
+# Client-facing base URL printed in connector configs — a distinct field from
+# broker_url (they share a value here only because it's a generic test fixture).
+GENERIC_PUBLIC_URL = "https://broker.example.com"
 GENERIC_APP_KEY = "acme:claude_ai"
 GENERIC_BROKER_KEY = "br_synthetic_test_value"  # noqa: S105 -- synthetic test key, not a credential
 
@@ -106,7 +109,7 @@ GENERIC_BROKER_KEY = "br_synthetic_test_value"  # noqa: S105 -- synthetic test k
 def _ctx(**overrides: Any):
     """Build an ``McpConfigContext`` with generic defaults."""
     defaults: dict[str, Any] = {
-        "broker_url": GENERIC_BROKER_URL,
+        "public_url": GENERIC_PUBLIC_URL,
         "app_key": GENERIC_APP_KEY,
         "broker_key": GENERIC_BROKER_KEY,
         "oauth_enabled": False,
@@ -147,7 +150,7 @@ class TestShowConnector:
     def test_oauth_only_prints_url_no_command(self, capsys: pytest.CaptureFixture[str]) -> None:
         connect._show_connector("slack", "streamable_http", _ctx(auth_mode="oauth"))
         out = capsys.readouterr().out
-        assert f"oauth url:  {GENERIC_BROKER_URL}/proxy/slack/mcp" in out
+        assert f"oauth url:  {GENERIC_PUBLIC_URL}/proxy/slack/mcp" in out
         # No static credential on the OAuth path.
         assert "claude mcp add-json" not in out
         assert "X-Broker-Key" not in out
@@ -234,7 +237,7 @@ class TestMcpConfigContext:
     def test_extra_forbidden(self) -> None:
         with pytest.raises(ValidationError):
             connect.McpConfigContext(
-                broker_url=GENERIC_BROKER_URL,
+                public_url=GENERIC_PUBLIC_URL,
                 app_key=GENERIC_APP_KEY,
                 broker_key=GENERIC_BROKER_KEY,
                 oauth_enabled=False,
@@ -267,7 +270,7 @@ class TestRenderClaudeCommand:
     def test_apikey_headers_url_and_http_type(self) -> None:
         server = _server_json(connect._render_claude_command("slack", "streamable_http", _ctx()))
         assert server["type"] == "http"
-        assert server["url"] == f"{GENERIC_BROKER_URL}/proxy/slack/mcp"
+        assert server["url"] == f"{GENERIC_PUBLIC_URL}/proxy/slack/mcp"
         assert server["headers"]["X-App-Id"] == GENERIC_APP_KEY
         assert server["headers"]["X-Broker-Key"] == GENERIC_BROKER_KEY
 
@@ -325,6 +328,7 @@ class TestRunConnectFlowHonorsAuthMode:
             False,
             [],
             auth_mode,
+            GENERIC_PUBLIC_URL,
         )
 
     def test_oauth_mode_summary_omits_static_key(

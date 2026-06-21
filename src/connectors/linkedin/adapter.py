@@ -15,9 +15,10 @@ import contextlib
 import json
 import logging
 import re
+from base64 import b64decode
 from collections.abc import Awaitable, Callable
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -39,6 +40,25 @@ MAX_LIMIT = 50
 RATE_LIMIT_RETRY_CAP_SECONDS = 30
 # LinkedIn daily quotas have long retry windows -- don't wait, just fail fast
 DAILY_QUOTA_THRESHOLD_SECONDS = 300
+
+# Media uploads are larger than the JSON calls; the 5s httpx default is too tight.
+MEDIA_UPLOAD_TIMEOUT_SECONDS = 60.0
+# Byte ceilings enforced before the upload PUT. LinkedIn's documented maxima:
+# images have no published MB cap (only a pixel ceiling) -- 10 MB is a safe practical
+# bound; documents (which render as a swipeable carousel) allow up to 100 MB / 300 pages.
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_DOCUMENT_BYTES = 100 * 1024 * 1024
+# Base64 inflates bytes by ~4/3. _decode_media rejects an over-long encoded string before
+# decoding it (OOM defence -- mirrors the notion_api upload_file tool); the same ceiling is
+# surfaced as the schema maxLength, which is advisory only -- the broker does not validate
+# inputs against it. Ceil-divide the byte cap by 3, then multiply by 4.
+_MAX_IMAGE_BASE64_CHARS = -(-MAX_IMAGE_BYTES // 3) * 4
+_MAX_DOCUMENT_BASE64_CHARS = -(-MAX_DOCUMENT_BYTES // 3) * 4
+
+# initializeUpload returns the URL the media bytes are PUT to with the access token
+# attached, so that URL is restricted to LinkedIn's own domains (see _validate_upload_url).
+_UPLOAD_HOST_SUFFIXES = (".linkedin.com", ".licdn.com")
+_EXACT_UPLOAD_HOSTS = frozenset({"linkedin.com", "licdn.com"})
 
 # === SCOPES ===
 
@@ -114,6 +134,48 @@ def _validate_org_id(org_id: str) -> None:
     """Validate numeric organization ID. Prevents path traversal in URL construction."""
     if not _ORG_ID_RE.match(org_id):
         raise ValueError(f"Invalid organization ID: {org_id!r}")
+
+
+def _decode_media(media_base64: str, max_bytes: int, label: str) -> bytes:
+    """Decode base64 media and enforce the size ceiling BEFORE any HTTP call.
+
+    The schema's maxLength is advisory -- the broker does not validate inputs against it
+    (native.py passes raw arguments straight to the handler) -- so the real gate is here:
+    reject an over-long encoded string before decoding (so an oversized payload is never
+    expanded ~4/3 in memory), then re-check the decoded byte length.
+    """
+    # base64 inflates ~4/3, so bound the encoded length first (ceil(max_bytes / 3) * 4).
+    if len(media_base64) > -(-max_bytes // 3) * 4:
+        raise ValueError(f"The {label} exceeds the upload limit of {max_bytes} bytes")
+    try:
+        raw_bytes = b64decode(media_base64, validate=True)
+    except ValueError as exc:  # binascii.Error subclasses ValueError
+        raise ValueError(f"The {label} is not valid base64") from exc
+    if not raw_bytes:
+        raise ValueError(f"The {label} is empty")
+    if len(raw_bytes) > max_bytes:
+        raise ValueError(
+            f"The {label} is {len(raw_bytes)} bytes; the upload limit is {max_bytes} bytes"
+        )
+    return raw_bytes
+
+
+def _validate_upload_url(url: str) -> None:
+    """Guard the media-upload PUT, which carries the live access token.
+
+    initializeUpload returns the URL the bytes are PUT to with the token in the
+    Authorization header. Restrict it to HTTPS on a LinkedIn-owned host so a
+    malformed or compromised initializeUpload response can't redirect the token to
+    an attacker-controlled or internal address (SSRF + token leak). Allowlisting
+    LinkedIn's domains is stricter than rejecting only private IPs -- nothing
+    outside them is accepted, raw-IP hosts included.
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if parsed.scheme != "https":
+        raise ValueError("LinkedIn upload URL must use HTTPS")
+    if host not in _EXACT_UPLOAD_HOSTS and not host.endswith(_UPLOAD_HOST_SUFFIXES):
+        raise ValueError(f"Unexpected LinkedIn upload host: {host!r}")
 
 
 # === SERIALIZATION HELPERS ===
@@ -422,6 +484,90 @@ _CREATE_POST_META = NativeToolMeta(
     },
 )
 
+_CREATE_IMAGE_POST_META = NativeToolMeta(
+    name="create_image_post",
+    description=(
+        "Create a LinkedIn post with an attached image, as the authenticated member "
+        "or a managed organization. The image is supplied as base64-encoded bytes "
+        "(PNG/JPG/GIF). If author_urn is omitted, posts as the authenticated member. "
+        "Text max 3000 chars."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "text": {
+                "type": "string",
+                "description": "Post text content (max 3000 chars)",
+            },
+            "image_base64": {
+                "type": "string",
+                "description": "Base64-encoded image bytes (PNG/JPG/GIF, up to 10 MB).",
+                "maxLength": _MAX_IMAGE_BASE64_CHARS,
+            },
+            "alt_text": {
+                "type": "string",
+                "description": "Alternative text describing the image, for accessibility (optional).",
+            },
+            "author_urn": {
+                "type": "string",
+                "description": (
+                    "URN of the author -- urn:li:person:{id} or urn:li:organization:{id}. "
+                    "Defaults to the authenticated member if omitted."
+                ),
+            },
+            "visibility": {
+                "type": "string",
+                "enum": ["PUBLIC", "CONNECTIONS"],
+                "description": "Post visibility (default: PUBLIC)",
+                "default": "PUBLIC",
+            },
+        },
+        "required": ["text", "image_base64"],
+    },
+)
+
+_CREATE_DOCUMENT_POST_META = NativeToolMeta(
+    name="create_document_post",
+    description=(
+        "Create a LinkedIn post with an attached document (PDF/PPTX/DOCX), as the "
+        "authenticated member or a managed organization. A multi-page document renders "
+        "as a swipeable carousel in the feed. The document is supplied as base64-encoded "
+        "bytes. If author_urn is omitted, posts as the authenticated member. Text max 3000 chars."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "text": {
+                "type": "string",
+                "description": "Post text content (max 3000 chars)",
+            },
+            "document_base64": {
+                "type": "string",
+                "description": "Base64-encoded document bytes (PDF/PPT/PPTX/DOC/DOCX, up to 100 MB).",
+                "maxLength": _MAX_DOCUMENT_BASE64_CHARS,
+            },
+            "title": {
+                "type": "string",
+                "description": "Document title shown on the carousel (required).",
+            },
+            "author_urn": {
+                "type": "string",
+                "description": (
+                    "URN of the author -- urn:li:person:{id} or urn:li:organization:{id}. "
+                    "Defaults to the authenticated member if omitted."
+                ),
+            },
+            "visibility": {
+                "type": "string",
+                "enum": ["PUBLIC", "CONNECTIONS"],
+                "description": "Post visibility (default: PUBLIC)",
+                "default": "PUBLIC",
+            },
+        },
+        "required": ["text", "document_base64", "title"],
+    },
+)
+
 _DELETE_POST_META = NativeToolMeta(
     name="delete_post",
     description="Delete a LinkedIn post by its URN (urn:li:share:*, urn:li:ugcPost:*, or urn:li:activity:*).",
@@ -642,6 +788,62 @@ class LinkedInConnector(NativeConnector):
             created = await _create_post_rest(access_token, resolved_urn, text, visibility)
         else:
             created = await _create_post_v2(access_token, resolved_urn, text, visibility)
+        return _mcp_text_content(created)
+
+    @native_tool(_CREATE_IMAGE_POST_META)
+    async def create_image_post(  # noqa: PLR0913 -- MCP tool signature
+        self,
+        *,
+        access_token: str,
+        text: str,
+        image_base64: str,
+        alt_text: str = "",
+        author_urn: str = "",
+        visibility: str = "PUBLIC",
+    ) -> list[dict[str, Any]]:
+        """Create a post with an attached image (member or managed org author).
+
+        Image/document posts always use the versioned /rest/ media flow -- it is the
+        only path that supports documents, and the docs confirm member-owned uploads
+        work with the self-serve w_member_social scope.
+        """
+        if len(text) > MAX_POST_LENGTH:
+            raise ValueError(f"Post text exceeds {MAX_POST_LENGTH} characters ({len(text)} given)")
+        raw_bytes = _decode_media(image_base64, MAX_IMAGE_BYTES, "image")
+        author = await _resolve_author_urn(access_token, author_urn)
+        media_attrs = {"altText": alt_text} if alt_text else {}
+        created = await _create_media_post(
+            access_token, author, text, visibility, "images", raw_bytes, media_attrs=media_attrs
+        )
+        return _mcp_text_content(created)
+
+    @native_tool(_CREATE_DOCUMENT_POST_META)
+    async def create_document_post(  # noqa: PLR0913 -- MCP tool signature
+        self,
+        *,
+        access_token: str,
+        text: str,
+        document_base64: str,
+        title: str = "",
+        author_urn: str = "",
+        visibility: str = "PUBLIC",
+    ) -> list[dict[str, Any]]:
+        """Create a post with an attached document; a multi-page doc renders as a carousel."""
+        if len(text) > MAX_POST_LENGTH:
+            raise ValueError(f"Post text exceeds {MAX_POST_LENGTH} characters ({len(text)} given)")
+        if not title:
+            raise ValueError("A document title is required")
+        raw_bytes = _decode_media(document_base64, MAX_DOCUMENT_BYTES, "document")
+        author = await _resolve_author_urn(access_token, author_urn)
+        created = await _create_media_post(
+            access_token,
+            author,
+            text,
+            visibility,
+            "documents",
+            raw_bytes,
+            media_attrs={"title": title},
+        )
         return _mcp_text_content(created)
 
     @native_tool(_DELETE_POST_META)
@@ -872,25 +1074,90 @@ class LinkedInConnector(NativeConnector):
 # --- Private helpers (module-level to keep connector body short) ---
 
 
+def _rest_post_body(
+    author_urn: str, text: str, visibility: str, *, media: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Build a /rest/posts request body, optionally carrying an attached media reference."""
+    body: dict[str, Any] = {
+        "author": author_urn,
+        "commentary": text,
+        "visibility": visibility,
+        "distribution": {
+            "feedDistribution": "MAIN_FEED",
+            "targetEntities": [],
+            "thirdPartyDistributionChannels": [],
+        },
+        "lifecycleState": "PUBLISHED",
+        "isReshareDisabledByAuthor": False,
+    }
+    if media is not None:
+        body["content"] = {"media": media}
+    return body
+
+
 async def _create_post_rest(
     access_token: str, author_urn: str, text: str, visibility: str
 ) -> dict[str, Any]:
     """Create post via /rest/posts (Community Management API, versioned)."""
     return await _linkedin_post(
+        access_token, "/rest/posts", _rest_post_body(author_urn, text, visibility)
+    )
+
+
+async def _initialize_media_upload(
+    access_token: str, collection: str, owner_urn: str
+) -> tuple[str, str]:
+    """Initialize a versioned media upload. Returns (upload_url, media_urn).
+
+    collection is the /rest/ resource ('images' or 'documents'); the returned URN
+    keys off its singular form ('image' / 'document') and is referenced in the post.
+    """
+    response = await _linkedin_post(
         access_token,
-        "/rest/posts",
-        {
-            "author": author_urn,
-            "commentary": text,
-            "visibility": visibility,
-            "distribution": {
-                "feedDistribution": "MAIN_FEED",
-                "targetEntities": [],
-                "thirdPartyDistributionChannels": [],
-            },
-            "lifecycleState": "PUBLISHED",
-            "isReshareDisabledByAuthor": False,
-        },
+        f"/rest/{collection}",
+        {"initializeUploadRequest": {"owner": owner_urn}},
+        extra_params={"action": "initializeUpload"},
+    )
+    value = response.get("value", {})
+    upload_url = value.get("uploadUrl")
+    media_urn = value.get(collection[:-1])  # 'images' -> 'image', 'documents' -> 'document'
+    if not upload_url or not media_urn:
+        raise ValueError("LinkedIn did not return a media upload URL or asset URN")
+    return upload_url, media_urn
+
+
+async def _upload_media_binary(access_token: str, upload_url: str, raw_bytes: bytes) -> None:
+    """PUT raw media bytes to the pre-signed LinkedIn upload URL from initializeUpload.
+
+    The upload URL is a LinkedIn media host, not a /rest/ resource, so it takes the
+    Bearer token but no Linkedin-Version header.
+    """
+    _validate_upload_url(upload_url)
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/octet-stream",
+    }
+    async with httpx.AsyncClient(timeout=MEDIA_UPLOAD_TIMEOUT_SECONDS) as client:
+        response = await client.put(upload_url, headers=headers, content=raw_bytes)
+        _check_status(response)
+
+
+async def _create_media_post(  # noqa: PLR0913 -- carries the full post + media payload
+    access_token: str,
+    author_urn: str,
+    text: str,
+    visibility: str,
+    collection: str,
+    raw_bytes: bytes,
+    *,
+    media_attrs: dict[str, Any],
+) -> dict[str, Any]:
+    """Upload media then create a /rest/posts post referencing it (versioned flow)."""
+    upload_url, media_urn = await _initialize_media_upload(access_token, collection, author_urn)
+    await _upload_media_binary(access_token, upload_url, raw_bytes)
+    media = {"id": media_urn, **media_attrs}
+    return await _linkedin_post(
+        access_token, "/rest/posts", _rest_post_body(author_urn, text, visibility, media=media)
     )
 
 
