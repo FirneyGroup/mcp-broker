@@ -116,13 +116,15 @@ class TestRegistration:
         # LinkedIn rejects code_verifier — broker cannot send PKCE.
         assert linkedin_connector.meta.supports_pkce is False
 
-    def test_has_ten_tools(self, linkedin_connector):
-        assert len(linkedin_connector._tools) == 10  # noqa: PLR2004 -- full tool surface
+    def test_has_twelve_tools(self, linkedin_connector):
+        assert len(linkedin_connector._tools) == 12  # noqa: PLR2004 -- full tool surface
 
     def test_tool_names(self, linkedin_connector):
         assert set(linkedin_connector._tools.keys()) == {
             "get_me",
             "create_post",
+            "create_image_post",
+            "create_document_post",
             "delete_post",
             "get_org_posts",
             "get_managed_orgs",
@@ -183,13 +185,13 @@ class TestMCPDispatch:
         assert response["result"]["serverInfo"]["name"] == "linkedin"
 
     async def test_tools_list_excludes_org_tools_by_default(self, linkedin_connector):
-        # With self-serve scopes, only the 3 member tools are advertised; the 7
+        # With self-serve scopes, only the 5 member tools are advertised; the 7
         # org tools are filtered out of tools/list so the LLM never sees them.
         response = await linkedin_connector.handle_mcp_request(
             method="tools/list", params={}, request_id=2, access_token="fake"
         )
         listed = {tool["name"] for tool in response["result"]["tools"]}
-        assert listed == {"get_me", "create_post", "delete_post"}
+        assert listed == _MEMBER_TOOL_NAMES
 
     async def test_unknown_method_returns_error(self, linkedin_connector):
         response = await linkedin_connector.handle_mcp_request(
@@ -220,7 +222,13 @@ _ORG_TOOL_NAMES = {
     "get_org_analytics",
     "get_post_analytics",
 }
-_MEMBER_TOOL_NAMES = {"get_me", "create_post", "delete_post"}
+_MEMBER_TOOL_NAMES = {
+    "get_me",
+    "create_post",
+    "create_image_post",
+    "create_document_post",
+    "delete_post",
+}
 
 
 class TestToolAvailability:
@@ -386,6 +394,112 @@ class TestPostingPathSelection:
             await linkedin_connector.delete_post(access_token="fake", post_urn="urn:li:ugcPost:123")
         path = mock_delete.call_args.args[1]
         assert path.startswith("/v2/ugcPosts/")
+
+
+# =============================================================================
+# MEDIA POSTS — image/document tools upload then post via the versioned flow
+# =============================================================================
+
+# base64 of small placeholder bytes -- decodes cleanly, well under the size cap.
+_FAKE_MEDIA_B64 = "aW1n"  # b"img"
+
+
+class TestMediaPosts:
+    """create_image_post / create_document_post: validate, upload, then post."""
+
+    async def test_image_post_initializes_uploads_then_posts(self, linkedin_connector):
+        with (
+            patch(
+                "connectors.linkedin.adapter._resolve_author_urn", new_callable=AsyncMock
+            ) as mock_resolve,
+            patch(
+                "connectors.linkedin.adapter._initialize_media_upload", new_callable=AsyncMock
+            ) as mock_init,
+            patch(
+                "connectors.linkedin.adapter._upload_media_binary", new_callable=AsyncMock
+            ) as mock_upload,
+            patch(
+                "connectors.linkedin.adapter._linkedin_post", new_callable=AsyncMock
+            ) as mock_post,
+        ):
+            mock_resolve.return_value = "urn:li:person:abc"
+            mock_init.return_value = ("https://upload.example/u", "urn:li:image:1")
+            mock_post.return_value = {"id": "urn:li:share:9"}
+            content = await linkedin_connector.create_image_post(
+                access_token="fake", text="hi", image_base64=_FAKE_MEDIA_B64, alt_text="a cat"
+            )
+
+        # Upload targets the /rest/images collection...
+        assert mock_init.call_args.args[1] == "images"
+        mock_upload.assert_awaited_once()
+        # ...and the post references the returned image URN with the alt text.
+        body = mock_post.call_args.args[2]
+        assert body["content"]["media"] == {"id": "urn:li:image:1", "altText": "a cat"}
+        assert json.loads(content[0]["text"]) == {"id": "urn:li:share:9"}
+
+    async def test_document_post_uses_documents_collection_and_title(self, linkedin_connector):
+        with (
+            patch(
+                "connectors.linkedin.adapter._resolve_author_urn", new_callable=AsyncMock
+            ) as mock_resolve,
+            patch(
+                "connectors.linkedin.adapter._initialize_media_upload", new_callable=AsyncMock
+            ) as mock_init,
+            patch("connectors.linkedin.adapter._upload_media_binary", new_callable=AsyncMock),
+            patch(
+                "connectors.linkedin.adapter._linkedin_post", new_callable=AsyncMock
+            ) as mock_post,
+        ):
+            mock_resolve.return_value = "urn:li:person:abc"
+            mock_init.return_value = ("https://upload.example/u", "urn:li:document:2")
+            mock_post.return_value = {"id": "urn:li:share:10"}
+            await linkedin_connector.create_document_post(
+                access_token="fake", text="deck", document_base64=_FAKE_MEDIA_B64, title="Q3 update"
+            )
+
+        assert mock_init.call_args.args[1] == "documents"
+        body = mock_post.call_args.args[2]
+        assert body["content"]["media"] == {"id": "urn:li:document:2", "title": "Q3 update"}
+
+    async def test_document_post_requires_title(self, linkedin_connector):
+        with pytest.raises(ValueError, match="title is required"):
+            await linkedin_connector.create_document_post(
+                access_token="fake", text="deck", document_base64=_FAKE_MEDIA_B64, title=""
+            )
+
+    async def test_image_post_rejects_oversize_text(self, linkedin_connector):
+        with pytest.raises(ValueError, match="exceeds"):
+            await linkedin_connector.create_image_post(
+                access_token="fake", text="x" * 3001, image_base64=_FAKE_MEDIA_B64
+            )
+
+
+class TestDecodeMedia:
+    """_decode_media is the real size/format gate (schema maxLength is advisory)."""
+
+    def test_rejects_invalid_base64(self):
+        from connectors.linkedin.adapter import _decode_media
+
+        with pytest.raises(ValueError, match="not valid base64"):
+            _decode_media("not-base64!!!", 1024, "image")
+
+    def test_rejects_empty(self):
+        from connectors.linkedin.adapter import _decode_media
+
+        with pytest.raises(ValueError, match="empty"):
+            _decode_media("", 1024, "image")
+
+    def test_rejects_oversize(self):
+        from connectors.linkedin.adapter import _decode_media
+
+        # _FAKE_MEDIA_B64 decodes to 3 bytes -- over a 2-byte cap.
+        with pytest.raises(ValueError, match="upload limit"):
+            _decode_media(_FAKE_MEDIA_B64, 2, "document")
+
+    def test_returns_bytes_within_limit(self):
+        from connectors.linkedin.adapter import _decode_media
+
+        assert _decode_media(_FAKE_MEDIA_B64, 1024, "image") == b"img"
 
 
 # =============================================================================
