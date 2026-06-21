@@ -384,6 +384,32 @@ class TestPostImageTweet:
         # The created tweet is surfaced to the caller.
         assert json.loads(content[0]["text"]) == {"id": "t1", "text": "hi"}
 
+    async def test_image_only_omits_empty_text(self, twitter_connector):
+        from types import SimpleNamespace
+
+        media_client = MagicMock()
+        media_client.upload.return_value = SimpleNamespace(
+            data=SimpleNamespace(id="m1"), errors=None
+        )
+        posts_client = MagicMock()
+        posts_client.create.return_value = SimpleNamespace(
+            model_dump=lambda **_: {"data": {"id": "t1", "text": ""}}
+        )
+        fake_client = SimpleNamespace(media=media_client, posts=posts_client)
+
+        with patch("connectors.twitter.adapter.XClient", return_value=fake_client):
+            content = await twitter_connector.post_image_tweet(
+                access_token="tok", images_base64=[_FAKE_PNG_B64]
+            )
+
+        # An image-only tweet (default text="") must NOT send an empty `text` field -- X
+        # rejects it. Without the omit-when-empty guard, the body would carry "text": "".
+        create_body = posts_client.create.call_args.kwargs["body"]
+        dumped = create_body.model_dump(exclude_none=True)
+        assert "text" not in dumped
+        assert dumped["media"]["media_ids"] == ["m1"]
+        assert json.loads(content[0]["text"]) == {"id": "t1", "text": ""}
+
     async def test_rejects_more_than_four_images(self, twitter_connector):
         with patch("connectors.twitter.adapter._post_image_tweet_sync") as mock_sync:
             with pytest.raises(ValueError, match="At most 4 images"):

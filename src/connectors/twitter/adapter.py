@@ -293,7 +293,9 @@ def _upload_image(client: XClient, image_base64: str) -> str:
     media_id = response.data.id if response.data else None
     if not media_id:
         errors = getattr(response, "errors", None)
-        raise ValueError(_summarize_post_errors(errors) if errors else "X returned no media id")
+        if errors:
+            raise ValueError(_summarize_post_errors(errors, "the media upload"))
+        raise ValueError("X returned no media id")
     return str(media_id)
 
 
@@ -303,9 +305,12 @@ def _post_image_tweet_sync(
     """Upload 1-4 images then post a tweet referencing them. Returns the tweet object."""
     client = XClient(access_token=access_token)
     media_ids = [_upload_image(client, image) for image in images_base64]
-    # media is a plain dict (Pydantic coerces it) -- the same pattern _create_post uses for
-    # `reply`, avoiding an import of the nested CreateRequestMedia model.
-    body_fields: dict[str, Any] = {"text": text, "media": {"media_ids": media_ids}}
+    # Omit `text` when empty: an image-only tweet is valid, but X rejects an empty `text`
+    # field. media is a plain dict (Pydantic coerces it) -- the same pattern _create_post uses
+    # for `reply`, avoiding an import of the nested CreateRequestMedia model.
+    body_fields: dict[str, Any] = {"media": {"media_ids": media_ids}}
+    if text:
+        body_fields["text"] = text
     envelope = _model_to_dict(client.posts.create(body=CreateRequest(**body_fields)))
     tweet = envelope.get("data")
     if tweet is None and envelope.get("errors"):
@@ -401,18 +406,20 @@ def _model_to_dict(model: Any) -> Any:
     return dict(model)
 
 
-def _summarize_post_errors(errors: Any) -> str:
+def _summarize_post_errors(errors: Any, subject: str = "the tweet") -> str:
     """Summarize X's `errors` array into a sanitized client-facing message.
 
-    Only the human-readable `title` of each error is surfaced. X error objects can
-    carry URLs and resource identifiers in other fields; those are dropped so the
-    ValueError stays free of URLs and tokens per the connector's error-channel rules.
+    `subject` names what X rejected -- "the tweet" by default, or "the media upload" when the
+    failure is on the upload call, before any tweet is attempted. Only the human-readable
+    `title` of each error is surfaced. X error objects can carry URLs and resource identifiers
+    in other fields; those are dropped so the ValueError stays free of URLs and tokens per the
+    connector's error-channel rules.
     """
     titles = [
         title for error in errors if isinstance(error, dict) and (title := error.get("title"))
     ]
     summary = "; ".join(titles) if titles else "unknown error"
-    return f"X rejected the tweet: {summary}"
+    return f"X rejected {subject}: {summary}"
 
 
 def _weighted_tweet_length(text: str) -> int:
