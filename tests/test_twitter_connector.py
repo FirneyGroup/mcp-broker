@@ -7,6 +7,7 @@ input validation, and edge cases.
 
 from __future__ import annotations
 
+import base64
 import json
 from unittest.mock import MagicMock, patch
 
@@ -54,12 +55,13 @@ class TestRegistration:
     def test_display_name(self, twitter_connector):
         assert twitter_connector.meta.display_name == "Twitter/X"
 
-    def test_has_seven_tools(self, twitter_connector):
-        assert len(twitter_connector._tools) == 7
+    def test_has_eight_tools(self, twitter_connector):
+        assert len(twitter_connector._tools) == 8
 
     def test_tool_names(self, twitter_connector):
         expected_names = {
             "post_tweet",
+            "post_image_tweet",
             "get_me",
             "delete_tweet",
             "get_my_tweets",
@@ -87,6 +89,10 @@ class TestRegistration:
 
     def test_scopes_include_users_read(self, twitter_connector):
         assert "users.read" in twitter_connector.meta.scopes
+
+    def test_scopes_include_media_write(self, twitter_connector):
+        # Required for media upload (post_image_tweet); needs a reconnect to be granted.
+        assert "media.write" in twitter_connector.meta.scopes
 
     def test_is_native_connector(self, twitter_connector):
         assert twitter_connector.meta.mcp_url is None
@@ -163,7 +169,7 @@ class TestMCPDispatch:
         server_info = response["result"]["serverInfo"]
         assert server_info["name"] == "twitter"
 
-    async def test_tools_list_returns_all_seven(self, twitter_connector):
+    async def test_tools_list_returns_all_eight(self, twitter_connector):
         response = await twitter_connector.handle_mcp_request(
             method="tools/list",
             params={},
@@ -171,8 +177,9 @@ class TestMCPDispatch:
             access_token="fake_token",
         )
         tool_names = [t["name"] for t in response["result"]["tools"]]
-        assert len(tool_names) == 7
+        assert len(tool_names) == 8
         assert "post_tweet" in tool_names
+        assert "post_image_tweet" in tool_names
         assert "post_thread" in tool_names
         assert "reply_to_tweet" in tool_names
 
@@ -333,6 +340,212 @@ class TestPostTweet:
             tweet = _post_tweet_sync("fake_token", "ok")
 
         assert tweet == {"id": "555", "text": "ok"}
+
+
+# =============================================================================
+# TOOL: post_image_tweet
+# =============================================================================
+
+_FAKE_PNG_B64 = base64.b64encode(b"\x89PNG\r\n\x1a\npixels").decode()
+
+
+class TestPostImageTweet:
+    """Tests for the post_image_tweet tool."""
+
+    async def test_uploads_images_then_posts(self, twitter_connector):
+        from types import SimpleNamespace
+
+        png_two = base64.b64encode(b"\x89PNG\r\n\x1a\nimg2").decode()
+        media_client = MagicMock()
+        media_client.upload.side_effect = [
+            SimpleNamespace(data=SimpleNamespace(id="m1"), errors=None),
+            SimpleNamespace(data=SimpleNamespace(id="m2"), errors=None),
+        ]
+        posts_client = MagicMock()
+        posts_client.create.return_value = SimpleNamespace(
+            model_dump=lambda **_: {"data": {"id": "t1", "text": "hi"}}
+        )
+        fake_client = SimpleNamespace(media=media_client, posts=posts_client)
+
+        with patch("connectors.twitter.adapter.XClient", return_value=fake_client):
+            content = await twitter_connector.post_image_tweet(
+                access_token="tok", images_base64=[_FAKE_PNG_B64, png_two], text="hi"
+            )
+
+        # Each image was uploaded as base64 with the image category and sniffed MIME.
+        assert media_client.upload.call_count == 2
+        first_body = media_client.upload.call_args_list[0].kwargs["body"]
+        assert first_body.media == _FAKE_PNG_B64
+        assert first_body.media_category == "tweet_image"
+        assert first_body.media_type == "image/png"
+        # The post attached both returned media_ids.
+        create_body = posts_client.create.call_args.kwargs["body"]
+        assert create_body.model_dump(exclude_none=True)["media"]["media_ids"] == ["m1", "m2"]
+        # The created tweet is surfaced to the caller.
+        assert json.loads(content[0]["text"]) == {"id": "t1", "text": "hi"}
+
+    async def test_image_only_omits_empty_text(self, twitter_connector):
+        from types import SimpleNamespace
+
+        media_client = MagicMock()
+        media_client.upload.return_value = SimpleNamespace(
+            data=SimpleNamespace(id="m1"), errors=None
+        )
+        posts_client = MagicMock()
+        posts_client.create.return_value = SimpleNamespace(
+            model_dump=lambda **_: {"data": {"id": "t1", "text": ""}}
+        )
+        fake_client = SimpleNamespace(media=media_client, posts=posts_client)
+
+        with patch("connectors.twitter.adapter.XClient", return_value=fake_client):
+            content = await twitter_connector.post_image_tweet(
+                access_token="tok", images_base64=[_FAKE_PNG_B64]
+            )
+
+        # An image-only tweet (default text="") must NOT send an empty `text` field -- X
+        # rejects it. Without the omit-when-empty guard, the body would carry "text": "".
+        create_body = posts_client.create.call_args.kwargs["body"]
+        dumped = create_body.model_dump(exclude_none=True)
+        assert "text" not in dumped
+        assert dumped["media"]["media_ids"] == ["m1"]
+        assert json.loads(content[0]["text"]) == {"id": "t1", "text": ""}
+
+    def test_unwrap_tweet_raises_clean_error_when_no_data(self):
+        from connectors.twitter.adapter import _unwrap_tweet
+
+        # An envelope with neither data nor errors must yield a ValueError, not a TypeError
+        # from dict(None). Shared by post_tweet and post_image_tweet.
+        with pytest.raises(ValueError, match="no tweet data"):
+            _unwrap_tweet({})
+
+    # Validation raises in the handler before run_in_executor, so the ValueError itself proves
+    # no upload/post was attempted -- no need to patch and assert the sync path wasn't called.
+    async def test_rejects_more_than_four_images(self, twitter_connector):
+        with pytest.raises(ValueError, match="At most 4 images"):
+            await twitter_connector.post_image_tweet(
+                access_token="tok", images_base64=[_FAKE_PNG_B64] * 5
+            )
+
+    async def test_rejects_empty_image_list(self, twitter_connector):
+        with pytest.raises(ValueError, match="At least one image"):
+            await twitter_connector.post_image_tweet(access_token="tok", images_base64=[])
+
+    async def test_rejects_text_over_280(self, twitter_connector):
+        with pytest.raises(ValueError, match="exceeds 280"):
+            await twitter_connector.post_image_tweet(
+                access_token="tok", images_base64=[_FAKE_PNG_B64], text="x" * 281
+            )
+
+
+class TestUploadImage:
+    """_upload_image validates and uploads one image, returning its media_id."""
+
+    def test_rejects_invalid_base64(self):
+        from connectors.twitter.adapter import _upload_image
+
+        with pytest.raises(ValueError, match="not valid base64"):
+            _upload_image(MagicMock(), "not-base64!!!")
+
+    def test_rejects_unsupported_format(self):
+        from connectors.twitter.adapter import _upload_image
+
+        not_an_image = base64.b64encode(b"plain text, not an image").decode()
+        with pytest.raises(ValueError, match="Unsupported image format"):
+            _upload_image(MagicMock(), not_an_image)
+
+    def test_detects_png_and_returns_media_id(self):
+        from types import SimpleNamespace
+
+        from connectors.twitter.adapter import _upload_image
+
+        client = MagicMock()
+        client.media.upload.return_value = SimpleNamespace(
+            data=SimpleNamespace(id="m9"), errors=None
+        )
+        media_id = _upload_image(client, _FAKE_PNG_B64)
+
+        assert media_id == "m9"
+        body = client.media.upload.call_args.kwargs["body"]
+        assert body.media_type == "image/png"
+        assert body.media_category == "tweet_image"
+
+    def test_403_upload_error_points_at_media_write_scope(self):
+        from types import SimpleNamespace
+
+        from requests import HTTPError
+
+        from connectors.twitter.adapter import _upload_image
+
+        client = MagicMock()
+        client.media.upload.side_effect = HTTPError(
+            response=SimpleNamespace(status_code=403)  # noqa: PLR2004 -- HTTP status code
+        )
+        # A bare HTTPError must become an actionable message, not an opaque "HTTPError".
+        with pytest.raises(ValueError, match="media.write"):
+            _upload_image(client, _FAKE_PNG_B64)
+
+    def test_rejects_overlong_base64_before_decoding(self, monkeypatch):
+        from connectors.twitter import adapter
+
+        # Shrink the ceiling so the test stays cheap. An over-long AND invalid-base64 string
+        # must be rejected by the length guard before b64decode runs -- so the error names the
+        # size limit rather than "not valid base64".
+        monkeypatch.setattr(adapter, "_MAX_IMAGE_BASE64_CHARS", 8)
+        with pytest.raises(ValueError, match="upload limit"):
+            adapter._upload_image(MagicMock(), "!" * 100)
+
+    def test_detects_gif_and_routes_to_tweet_gif_category(self):
+        from types import SimpleNamespace
+
+        from connectors.twitter.adapter import _upload_image
+
+        gif_b64 = base64.b64encode(b"GIF89a" + b"\x00" * 10).decode()
+        client = MagicMock()
+        client.media.upload.return_value = SimpleNamespace(
+            data=SimpleNamespace(id="g1"), errors=None
+        )
+        media_id = _upload_image(client, gif_b64)
+
+        assert media_id == "g1"
+        body = client.media.upload.call_args.kwargs["body"]
+        assert body.media_type == "image/gif"
+        # GIFs must route to the animated-GIF category, not tweet_image.
+        assert body.media_category == "tweet_gif"
+
+    def test_detects_webp(self):
+        from types import SimpleNamespace
+
+        from connectors.twitter.adapter import _upload_image
+
+        # WEBP magic is RIFF + 4-byte size + WEBP at offset 8.
+        webp_b64 = base64.b64encode(b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 4).decode()
+        client = MagicMock()
+        client.media.upload.return_value = SimpleNamespace(
+            data=SimpleNamespace(id="w1"), errors=None
+        )
+        media_id = _upload_image(client, webp_b64)
+
+        assert media_id == "w1"
+        body = client.media.upload.call_args.kwargs["body"]
+        assert body.media_type == "image/webp"
+        assert body.media_category == "tweet_image"
+
+    def test_rejects_empty_image(self):
+        from connectors.twitter.adapter import _upload_image
+
+        # "" is valid base64 that decodes to b"" -- caught by the empty guard, not the decoder.
+        with pytest.raises(ValueError, match="empty"):
+            _upload_image(MagicMock(), "")
+
+    def test_rejects_image_over_byte_limit(self, monkeypatch):
+        from connectors.twitter import adapter
+
+        # Lift the pre-decode char ceiling and shrink the byte cap so a small valid PNG trips
+        # the decoded-byte ceiling -- proves the byte check still rejects an oversized image.
+        monkeypatch.setattr(adapter, "_MAX_IMAGE_BASE64_CHARS", 10_000)
+        monkeypatch.setattr(adapter, "MAX_IMAGE_BYTES", 4)
+        with pytest.raises(ValueError, match="X limit"):
+            adapter._upload_image(MagicMock(), _FAKE_PNG_B64)
 
 
 # =============================================================================

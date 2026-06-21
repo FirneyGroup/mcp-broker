@@ -96,6 +96,7 @@ Should return a list of Twitter MCP tools, then the authenticated user's profile
 | Tool | Purpose |
 |------|---------|
 | `post_tweet` | Post a tweet (max 280 chars) |
+| `post_image_tweet` | Post a tweet with 1–4 attached images (base64; PNG/JPG/GIF/WEBP, ≤5 MB each). Requires the `media.write` scope — reconnect to grant it. |
 | `post_thread` | Post a thread — ordered tweets chained as replies (each max 280 chars, up to 25) |
 | `reply_to_tweet` | Reply to (comment on) an existing tweet by ID (max 280 chars) |
 | `get_me` | Get authenticated user's profile (id, name, username) |
@@ -113,7 +114,8 @@ These are handled automatically by `TwitterConnector` — documented here for re
 | **Auth method** | `client_secret_basic` — HTTP Basic Auth header (base64-encoded `client_id:client_secret`) |
 | **Authorize URL** | `https://x.com/i/oauth2/authorize` |
 | **Token URL** | `https://api.x.com/2/oauth2/token` |
-| **Scopes** | `tweet.read`, `tweet.write`, `users.read`, `offline.access` |
+| **Scopes** | `tweet.read`, `tweet.write`, `users.read`, `media.write`, `offline.access` |
+| **`media.write`** | Required for `post_image_tweet` (media upload). Added to the scope set — an **existing connection must reconnect** (`./start connect`) to be granted it; the other tools keep working without a reconnect. |
 | **PKCE** | Required (S256) — the broker sends PKCE on all flows automatically |
 | **Token refresh** | Supported via `offline.access` scope — broker refreshes automatically |
 | **SDK** | [xdk](https://pypi.org/project/xdk/) — sync/requests-based, wrapped in `run_in_executor` |
@@ -129,6 +131,7 @@ These are handled automatically by `TwitterConnector` — documented here for re
 | Token exchange fails (401) | Verify `TWITTER_OAUTH2_CLIENT_ID` and `TWITTER_OAUTH2_CLIENT_SECRET` in `.env` |
 | `search_tweets` returns 400 | Your X app is on Free tier — search requires Basic ($200/mo) |
 | `post_tweet` returns 403 | Check your app has write permissions enabled in X Developer Portal |
+| `post_image_tweet` fails on media upload | The connection predates the `media.write` scope — reconnect via `./start connect` to grant it |
 | Tweet exceeds 280 chars | Connector validates locally before calling X API |
 | Token expired | Broker auto-refreshes via `offline.access` scope. If still failing, reconnect |
 | `ImportError: xdk` | Run `pip install -e ".[twitter]"` to install the optional dependency |
