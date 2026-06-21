@@ -17,6 +17,7 @@ import re
 from base64 import b64decode, b64encode
 from typing import Any
 
+from requests import HTTPError
 from xdk import Client as XClient
 from xdk.media.models import UploadRequest
 from xdk.posts.models import CreateRequest
@@ -229,6 +230,23 @@ def _post_tweet_sync(access_token: str, text: str) -> dict[str, Any]:
     return _model_to_dict(tweet)
 
 
+def _describe_media_http_error(exc: HTTPError) -> str:
+    """Turn an HTTP error from the media-upload call into an actionable client message.
+
+    A 403 here is almost always the missing media.write scope; xdk raises a bare
+    requests.HTTPError, so without this the connector would surface an opaque "HTTPError".
+    """
+    status = exc.response.status_code if exc.response is not None else None
+    if status == 403:  # noqa: PLR2004 -- HTTP status code
+        return (
+            "X rejected the media upload (HTTP 403 Forbidden) -- the Twitter connection is "
+            "likely missing the media.write scope; reconnect to grant it (see SETUP.md)"
+        )
+    if status == 401:  # noqa: PLR2004 -- HTTP status code
+        return "X media upload was unauthorized (HTTP 401) -- reconnect the Twitter account"
+    return f"X media upload failed (HTTP {status})" if status else "X media upload failed"
+
+
 def _detect_image_mime(raw_bytes: bytes) -> str:
     """Sniff the image MIME from its magic bytes -- X needs media_type on the upload."""
     if raw_bytes[:8] == b"\x89PNG\r\n\x1a\n":
@@ -261,9 +279,12 @@ def _upload_image(client: XClient, image_base64: str) -> str:
         )
     mime = _detect_image_mime(raw_bytes)
     category = "tweet_gif" if mime == "image/gif" else "tweet_image"
-    response = client.media.upload(
-        body=UploadRequest(media=image_base64, media_category=category, media_type=mime)
-    )
+    try:
+        response = client.media.upload(
+            body=UploadRequest(media=image_base64, media_category=category, media_type=mime)
+        )
+    except HTTPError as exc:
+        raise ValueError(_describe_media_http_error(exc)) from exc
     media_id = response.data.id if response.data else None
     if not media_id:
         errors = getattr(response, "errors", None)

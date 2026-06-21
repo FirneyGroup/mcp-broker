@@ -439,6 +439,21 @@ class TestUploadImage:
         assert body.media_type == "image/png"
         assert body.media_category == "tweet_image"
 
+    def test_403_upload_error_points_at_media_write_scope(self):
+        from types import SimpleNamespace
+
+        from requests import HTTPError
+
+        from connectors.twitter.adapter import _upload_image
+
+        client = MagicMock()
+        client.media.upload.side_effect = HTTPError(
+            response=SimpleNamespace(status_code=403)  # noqa: PLR2004 -- HTTP status code
+        )
+        # A bare HTTPError must become an actionable message, not an opaque "HTTPError".
+        with pytest.raises(ValueError, match="media.write"):
+            _upload_image(client, _FAKE_PNG_B64)
+
 
 # =============================================================================
 # TOOL: get_me
