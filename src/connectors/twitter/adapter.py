@@ -216,19 +216,26 @@ def _create_post(client: XClient, text: str, in_reply_to: str | None = None) -> 
     return _model_to_dict(client.posts.create(body=CreateRequest(**body_fields)))
 
 
-def _post_tweet_sync(access_token: str, text: str) -> dict[str, Any]:
-    """Post a tweet via xdk. Returns the unwrapped tweet object ({id, text}).
+def _unwrap_tweet(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Return the created tweet's data, or raise a sanitized ValueError.
 
-    X reports creation failures in the envelope's `errors` array (sometimes with
-    no usable `data`). When that happens, raise a sanitized ValueError — the
-    connector's documented client-facing error channel — rather than returning a
-    tweet object that was never actually posted.
+    X reports creation failures in the envelope's `errors` array — surfaced as the
+    connector's client-facing error channel rather than a tweet that was never posted.
+    An envelope with neither `data` nor `errors` (an unusual malformed 200) would otherwise
+    reach dict(None) and surface a TypeError as an internal error.
     """
-    envelope = _create_post(XClient(access_token=access_token), text)
     tweet = envelope.get("data")
-    if tweet is None and envelope.get("errors"):
-        raise ValueError(_summarize_post_errors(envelope["errors"]))
+    if tweet is None:
+        if envelope.get("errors"):
+            raise ValueError(_summarize_post_errors(envelope["errors"]))
+        raise ValueError("X returned no tweet data")
     return _model_to_dict(tweet)
+
+
+def _post_tweet_sync(access_token: str, text: str) -> dict[str, Any]:
+    """Post a tweet via xdk. Returns the unwrapped tweet object ({id, text})."""
+    envelope = _create_post(XClient(access_token=access_token), text)
+    return _unwrap_tweet(envelope)
 
 
 def _describe_media_http_error(exc: HTTPError) -> str:
@@ -312,10 +319,7 @@ def _post_image_tweet_sync(
     if text:
         body_fields["text"] = text
     envelope = _model_to_dict(client.posts.create(body=CreateRequest(**body_fields)))
-    tweet = envelope.get("data")
-    if tweet is None and envelope.get("errors"):
-        raise ValueError(_summarize_post_errors(envelope["errors"]))
-    return _model_to_dict(tweet)
+    return _unwrap_tweet(envelope)
 
 
 def _post_thread_sync(access_token: str, tweets: list[str]) -> dict[str, Any]:

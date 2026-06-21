@@ -410,6 +410,14 @@ class TestPostImageTweet:
         assert dumped["media"]["media_ids"] == ["m1"]
         assert json.loads(content[0]["text"]) == {"id": "t1", "text": ""}
 
+    def test_unwrap_tweet_raises_clean_error_when_no_data(self):
+        from connectors.twitter.adapter import _unwrap_tweet
+
+        # An envelope with neither data nor errors must yield a ValueError, not a TypeError
+        # from dict(None). Shared by post_tweet and post_image_tweet.
+        with pytest.raises(ValueError, match="no tweet data"):
+            _unwrap_tweet({})
+
     async def test_rejects_more_than_four_images(self, twitter_connector):
         with patch("connectors.twitter.adapter._post_image_tweet_sync") as mock_sync:
             with pytest.raises(ValueError, match="At most 4 images"):
