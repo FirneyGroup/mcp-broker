@@ -89,3 +89,16 @@ async def test_list_keys_excludes_hashes(key_store: FirestoreBrokerKeyStore) -> 
     for entry in listed:
         assert "key_hash" not in entry
         assert "created_at" in entry
+
+
+async def test_list_keys_skips_malformed_doc(key_store: FirestoreBrokerKeyStore) -> None:
+    """A key doc missing app_key must not break list_keys — skip it, like verify()."""
+    await key_store.create_key("acme:app1")
+    # Inject a malformed doc (no app_key) directly into the collection.
+    await (
+        key_store._db.collection(key_store._collection)
+        .document("malformed")
+        .set({"key_hash": "x", "created_at": "t", "rotated_at": None})
+    )
+    listed = await key_store.list_keys()
+    assert [entry["app_key"] for entry in listed] == ["acme:app1"]

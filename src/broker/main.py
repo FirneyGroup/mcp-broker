@@ -29,7 +29,7 @@ from broker.api.wellknown import (
     handle_broker_protected_resource_metadata,
     handle_protected_resource_metadata,
 )
-from broker.config import BrokerSettings, load_settings
+from broker.config import BrokerSettings, FirestoreStoreConfig, load_settings
 from broker.connectors.base import BaseConnector
 from broker.connectors.native import NativeConnector
 from broker.connectors.registry import ConnectorRegistry
@@ -166,16 +166,31 @@ def _abort_if_multiworker_with_oauth(oauth_enabled: bool, store_backend: str = "
         )
 
 
+def _active_firestore_config(settings: BrokerSettings) -> FirestoreStoreConfig | None:
+    """The Firestore store config iff the firestore backend is selected, else None.
+
+    The ``StoreConfig`` validator guarantees ``store.firestore`` is populated
+    whenever ``backend == "firestore"``, so a non-None return is equivalent to
+    "firestore backend active" — collapsing the previously-duplicated two-part
+    guard into one call (the None check also narrows the type for callers).
+    """
+    if settings.store.backend != "firestore":
+        return None
+    return settings.store.firestore
+
+
 async def _build_connect_token_store(settings: BrokerSettings) -> ConnectTokenStoreABC:
     """Connect token store: Firestore (shared) on the firestore backend, else in-memory."""
-    if settings.store.backend == "firestore" and settings.store.firestore is not None:
-        fs = settings.store.firestore
-        store = FirestoreConnectTokenStore(
+    fs = _active_firestore_config(settings)
+    store: ConnectTokenStoreABC = (
+        FirestoreConnectTokenStore(
             project_id=fs.project_id, database=fs.database, collection_prefix=fs.collection_prefix
         )
-        await store.setup()
-        return store
-    return ConnectTokenStore()
+        if fs is not None
+        else ConnectTokenStore()
+    )
+    await store.setup()
+    return store
 
 
 async def _build_outbound_state_store(settings: BrokerSettings) -> OutboundOAuthStateStore | None:
@@ -184,14 +199,14 @@ async def _build_outbound_state_store(settings: BrokerSettings) -> OutboundOAuth
     Returns None for non-Firestore backends so OAuthHandler falls back to its
     in-memory module singleton (preserving the single-instance default).
     """
-    if settings.store.backend == "firestore" and settings.store.firestore is not None:
-        fs = settings.store.firestore
-        store = FirestoreOutboundOAuthStateStore(
-            project_id=fs.project_id, database=fs.database, collection_prefix=fs.collection_prefix
-        )
-        await store.setup()
-        return store
-    return None
+    fs = _active_firestore_config(settings)
+    if fs is None:
+        return None
+    store = FirestoreOutboundOAuthStateStore(
+        project_id=fs.project_id, database=fs.database, collection_prefix=fs.collection_prefix
+    )
+    await store.setup()
+    return store
 
 
 async def _build_dcr_rate_limiter(settings: BrokerSettings) -> DCRRateLimiter | None:
@@ -200,18 +215,18 @@ async def _build_dcr_rate_limiter(settings: BrokerSettings) -> DCRRateLimiter | 
     Returns None for non-Firestore backends so OAuthServerEndpoints constructs
     its in-memory default (preserving the single-worker invariant).
     """
-    if settings.store.backend == "firestore" and settings.store.firestore is not None:
-        fs = settings.store.firestore
-        limiter = FirestoreDCRRateLimiter(
-            max_per_window=settings.broker.oauth.dcr_rate_limit_per_ip,
-            window_seconds=settings.broker.oauth.dcr_rate_limit_window_seconds,
-            project_id=fs.project_id,
-            database=fs.database,
-            collection_prefix=fs.collection_prefix,
-        )
-        await limiter.setup()
-        return limiter
-    return None
+    fs = _active_firestore_config(settings)
+    if fs is None:
+        return None
+    limiter = FirestoreDCRRateLimiter(
+        max_per_window=settings.broker.oauth.dcr_rate_limit_per_ip,
+        window_seconds=settings.broker.oauth.dcr_rate_limit_window_seconds,
+        project_id=fs.project_id,
+        database=fs.database,
+        collection_prefix=fs.collection_prefix,
+    )
+    await limiter.setup()
+    return limiter
 
 
 # Entry-point group through which externally-installed packages contribute connectors.
@@ -327,8 +342,8 @@ async def lifespan(app: FastAPI):  # noqa: PLR0915 — startup sequence, all ste
     _client_registry = BrokerClientRegistry(_settings.clients)
 
     # 4. Create and initialize API key store (backend-aware).
-    if _settings.store.backend == "firestore" and _settings.store.firestore is not None:
-        fs = _settings.store.firestore
+    fs = _active_firestore_config(_settings)
+    if fs is not None:
         key_store: BrokerKeyStore = FirestoreBrokerKeyStore(
             project_id=fs.project_id, database=fs.database, collection_prefix=fs.collection_prefix
         )
@@ -341,8 +356,8 @@ async def lifespan(app: FastAPI):  # noqa: PLR0915 — startup sequence, all ste
     #     Leaving it None keeps the broker's surface area unchanged for users
     #     who haven't flipped `broker.oauth.enabled`.
     if _settings.broker.oauth.enabled:
-        if _settings.store.backend == "firestore" and _settings.store.firestore is not None:
-            fs_oauth = _settings.store.firestore
+        fs_oauth = _active_firestore_config(_settings)
+        if fs_oauth is not None:
             inbound_store: InboundAuthStore = FirestoreInboundAuthStore(
                 project_id=fs_oauth.project_id,
                 database=fs_oauth.database,

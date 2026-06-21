@@ -166,6 +166,9 @@ class _DCRRateLimiter(DCRRateLimiter):
         self._window_seconds = window_seconds
         self._events: dict[str, list[float]] = {}
 
+    async def setup(self) -> None:
+        """No-op — in-memory state needs no initialization."""
+
     async def allow(self, client_ip: str) -> bool:
         """True if the IP is under the cap; records the event when True."""
         now_ts = time.time()
