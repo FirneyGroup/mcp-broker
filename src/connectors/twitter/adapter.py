@@ -14,10 +14,11 @@ import asyncio
 import json
 import logging
 import re
-from base64 import b64encode
+from base64 import b64decode, b64encode
 from typing import Any
 
 from xdk import Client as XClient
+from xdk.media.models import UploadRequest
 from xdk.posts.models import CreateRequest
 
 from broker.connectors.native import NativeConnector, NativeToolMeta, native_tool
@@ -56,6 +57,14 @@ MIN_SEARCH_RESULTS = 10
 
 _TWEET_ID_RE = re.compile(r"^\d{1,20}$")
 
+# X media: up to 4 images per tweet, 5 MB each. Images are uploaded first (base64),
+# then the returned media_ids are attached to the tweet.
+MAX_IMAGES_PER_TWEET = 4
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+# Bound the base64 string at the schema so an oversized image is rejected before it is
+# buffered/decoded (base64 inflates ~4/3: ceil(bytes / 3) * 4).
+_MAX_IMAGE_BASE64_CHARS = -(-MAX_IMAGE_BYTES // 3) * 4
+
 # === TOOL METADATA ===
 
 _POST_TWEET_META = NativeToolMeta(
@@ -71,6 +80,29 @@ _POST_TWEET_META = NativeToolMeta(
             "text": {"type": "string", "description": "Tweet text (max 280 chars)"},
         },
         "required": ["text"],
+    },
+)
+
+_POST_IMAGE_TWEET_META = NativeToolMeta(
+    name="post_image_tweet",
+    description=(
+        "Post a tweet to X/Twitter with 1-4 attached images (PNG/JPG/GIF/WEBP), each supplied "
+        "as base64-encoded bytes (up to 5 MB each). Text is optional and must be 280 characters "
+        "or fewer. Returns the created tweet object."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "images_base64": {
+                "type": "array",
+                "items": {"type": "string", "maxLength": _MAX_IMAGE_BASE64_CHARS},
+                "minItems": 1,
+                "maxItems": MAX_IMAGES_PER_TWEET,
+                "description": "1-4 base64-encoded images (PNG/JPG/GIF/WEBP, up to 5 MB each)",
+            },
+            "text": {"type": "string", "description": "Tweet text (optional, max 280 chars)"},
+        },
+        "required": ["images_base64"],
     },
 )
 
@@ -191,6 +223,64 @@ def _post_tweet_sync(access_token: str, text: str) -> dict[str, Any]:
     tweet object that was never actually posted.
     """
     envelope = _create_post(XClient(access_token=access_token), text)
+    tweet = envelope.get("data")
+    if tweet is None and envelope.get("errors"):
+        raise ValueError(_summarize_post_errors(envelope["errors"]))
+    return _model_to_dict(tweet)
+
+
+def _detect_image_mime(raw_bytes: bytes) -> str:
+    """Sniff the image MIME from its magic bytes -- X needs media_type on the upload."""
+    if raw_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if raw_bytes[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if raw_bytes[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if raw_bytes[:4] == b"RIFF" and raw_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    raise ValueError("Unsupported image format (expected PNG, JPEG, GIF, or WEBP)")
+
+
+def _upload_image(client: XClient, image_base64: str) -> str:
+    """Validate and upload one image; return its media_id.
+
+    X takes the media as base64 in a JSON body (xdk serializes the UploadRequest), so the
+    base64 is kept for the call but decoded first to enforce the 5 MB limit and sniff the
+    MIME -- both before the bytes leave the process.
+    """
+    try:
+        raw_bytes = b64decode(image_base64, validate=True)
+    except ValueError as exc:  # binascii.Error subclasses ValueError
+        raise ValueError("An image is not valid base64") from exc
+    if not raw_bytes:
+        raise ValueError("An image is empty")
+    if len(raw_bytes) > MAX_IMAGE_BYTES:
+        raise ValueError(
+            f"An image is {len(raw_bytes)} bytes; the X limit is {MAX_IMAGE_BYTES} bytes (5 MB)"
+        )
+    mime = _detect_image_mime(raw_bytes)
+    category = "tweet_gif" if mime == "image/gif" else "tweet_image"
+    response = client.media.upload(
+        body=UploadRequest(media=image_base64, media_category=category, media_type=mime)
+    )
+    media_id = response.data.id if response.data else None
+    if not media_id:
+        errors = getattr(response, "errors", None)
+        raise ValueError(_summarize_post_errors(errors) if errors else "X returned no media id")
+    return str(media_id)
+
+
+def _post_image_tweet_sync(
+    access_token: str, text: str, images_base64: list[str]
+) -> dict[str, Any]:
+    """Upload 1-4 images then post a tweet referencing them. Returns the tweet object."""
+    client = XClient(access_token=access_token)
+    media_ids = [_upload_image(client, image) for image in images_base64]
+    # media is a plain dict (Pydantic coerces it) -- the same pattern _create_post uses for
+    # `reply`, avoiding an import of the nested CreateRequestMedia model.
+    body_fields: dict[str, Any] = {"text": text, "media": {"media_ids": media_ids}}
+    envelope = _model_to_dict(client.posts.create(body=CreateRequest(**body_fields)))
     tweet = envelope.get("data")
     if tweet is None and envelope.get("errors"):
         raise ValueError(_summarize_post_errors(envelope["errors"]))
@@ -404,7 +494,7 @@ class TwitterConnector(NativeConnector):
         display_name="Twitter/X",
         oauth_authorize_url="https://x.com/i/oauth2/authorize",
         oauth_token_url="https://api.x.com/2/oauth2/token",  # noqa: S106 — endpoint URL, not a password
-        scopes=("tweet.read", "tweet.write", "users.read", "offline.access"),
+        scopes=("tweet.read", "tweet.write", "users.read", "media.write", "offline.access"),
     )
 
     # --- OAuth override ---
@@ -433,6 +523,28 @@ class TwitterConnector(NativeConnector):
             )
         loop = asyncio.get_running_loop()
         tweet_response = await loop.run_in_executor(None, _post_tweet_sync, access_token, text)
+        return _mcp_text_content(tweet_response)
+
+    @native_tool(_POST_IMAGE_TWEET_META)
+    async def post_image_tweet(
+        self, *, access_token: str, images_base64: list[str], text: str = ""
+    ) -> list[dict[str, Any]]:
+        """Post a tweet with 1-4 attached images. Validates count and text length before upload."""
+        if not images_base64:
+            raise ValueError("At least one image is required")
+        if len(images_base64) > MAX_IMAGES_PER_TWEET:
+            raise ValueError(
+                f"At most {MAX_IMAGES_PER_TWEET} images per tweet ({len(images_base64)} given)"
+            )
+        weighted_length = _weighted_tweet_length(text)
+        if weighted_length > MAX_TWEET_LENGTH:
+            raise ValueError(
+                f"Tweet exceeds {MAX_TWEET_LENGTH} characters ({weighted_length} weighted given)"
+            )
+        loop = asyncio.get_running_loop()
+        tweet_response = await loop.run_in_executor(
+            None, _post_image_tweet_sync, access_token, text, images_base64
+        )
         return _mcp_text_content(tweet_response)
 
     @native_tool(_GET_ME_META)
