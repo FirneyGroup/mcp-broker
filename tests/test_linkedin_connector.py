@@ -549,6 +549,14 @@ class TestDecodeMedia:
 
         assert _decode_media(_FAKE_MEDIA_B64, 1024, "image") == b"img"
 
+    def test_rejects_overlong_base64_before_decoding(self):
+        from connectors.linkedin.adapter import _decode_media
+
+        # Over-long AND invalid base64: the length guard must fire before b64decode runs,
+        # so the error names the size limit rather than "not valid base64".
+        with pytest.raises(ValueError, match="upload limit"):
+            _decode_media("!" * 100, 2, "image")
+
 
 class TestValidateUploadUrl:
     """The upload PUT carries the access token, so its URL must be a LinkedIn HTTPS host."""

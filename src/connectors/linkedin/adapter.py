@@ -48,9 +48,10 @@ MEDIA_UPLOAD_TIMEOUT_SECONDS = 60.0
 # bound; documents (which render as a swipeable carousel) allow up to 100 MB / 300 pages.
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_DOCUMENT_BYTES = 100 * 1024 * 1024
-# Base64 inflates bytes by ~4/3. Bounding the encoded string at the schema rejects an
-# oversized payload before it is buffered and decoded (OOM defence -- mirrors the
-# notion_api upload_file tool). Ceil-divide the byte cap by 3, then multiply by 4.
+# Base64 inflates bytes by ~4/3. _decode_media rejects an over-long encoded string before
+# decoding it (OOM defence -- mirrors the notion_api upload_file tool); the same ceiling is
+# surfaced as the schema maxLength, which is advisory only -- the broker does not validate
+# inputs against it. Ceil-divide the byte cap by 3, then multiply by 4.
 _MAX_IMAGE_BASE64_CHARS = -(-MAX_IMAGE_BYTES // 3) * 4
 _MAX_DOCUMENT_BASE64_CHARS = -(-MAX_DOCUMENT_BYTES // 3) * 4
 
@@ -136,12 +137,16 @@ def _validate_org_id(org_id: str) -> None:
 
 
 def _decode_media(media_base64: str, max_bytes: int, label: str) -> bytes:
-    """Decode base64 media and enforce the byte ceiling BEFORE any HTTP call.
+    """Decode base64 media and enforce the size ceiling BEFORE any HTTP call.
 
-    The schema's maxLength is advisory (an LLM may ignore it), so the real gate is
-    here: decode strictly, then check the decoded length to avoid buffering an
-    oversized file in memory and shipping it upstream.
+    The schema's maxLength is advisory -- the broker does not validate inputs against it
+    (native.py passes raw arguments straight to the handler) -- so the real gate is here:
+    reject an over-long encoded string before decoding (so an oversized payload is never
+    expanded ~4/3 in memory), then re-check the decoded byte length.
     """
+    # base64 inflates ~4/3, so bound the encoded length first (ceil(max_bytes / 3) * 4).
+    if len(media_base64) > -(-max_bytes // 3) * 4:
+        raise ValueError(f"The {label} exceeds the upload limit of {max_bytes} bytes")
     try:
         raw_bytes = b64decode(media_base64, validate=True)
     except ValueError as exc:  # binascii.Error subclasses ValueError
