@@ -464,6 +464,59 @@ class TestUploadImage:
         with pytest.raises(ValueError, match="upload limit"):
             adapter._upload_image(MagicMock(), "!" * 100)
 
+    def test_detects_gif_and_routes_to_tweet_gif_category(self):
+        from types import SimpleNamespace
+
+        from connectors.twitter.adapter import _upload_image
+
+        gif_b64 = base64.b64encode(b"GIF89a" + b"\x00" * 10).decode()
+        client = MagicMock()
+        client.media.upload.return_value = SimpleNamespace(
+            data=SimpleNamespace(id="g1"), errors=None
+        )
+        media_id = _upload_image(client, gif_b64)
+
+        assert media_id == "g1"
+        body = client.media.upload.call_args.kwargs["body"]
+        assert body.media_type == "image/gif"
+        # GIFs must route to the animated-GIF category, not tweet_image.
+        assert body.media_category == "tweet_gif"
+
+    def test_detects_webp(self):
+        from types import SimpleNamespace
+
+        from connectors.twitter.adapter import _upload_image
+
+        # WEBP magic is RIFF + 4-byte size + WEBP at offset 8.
+        webp_b64 = base64.b64encode(b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 4).decode()
+        client = MagicMock()
+        client.media.upload.return_value = SimpleNamespace(
+            data=SimpleNamespace(id="w1"), errors=None
+        )
+        media_id = _upload_image(client, webp_b64)
+
+        assert media_id == "w1"
+        body = client.media.upload.call_args.kwargs["body"]
+        assert body.media_type == "image/webp"
+        assert body.media_category == "tweet_image"
+
+    def test_rejects_empty_image(self):
+        from connectors.twitter.adapter import _upload_image
+
+        # "" is valid base64 that decodes to b"" -- caught by the empty guard, not the decoder.
+        with pytest.raises(ValueError, match="empty"):
+            _upload_image(MagicMock(), "")
+
+    def test_rejects_image_over_byte_limit(self, monkeypatch):
+        from connectors.twitter import adapter
+
+        # Lift the pre-decode char ceiling and shrink the byte cap so a small valid PNG trips
+        # the decoded-byte ceiling -- proves the byte check still rejects an oversized image.
+        monkeypatch.setattr(adapter, "_MAX_IMAGE_BASE64_CHARS", 10_000)
+        monkeypatch.setattr(adapter, "MAX_IMAGE_BYTES", 4)
+        with pytest.raises(ValueError, match="X limit"):
+            adapter._upload_image(MagicMock(), _FAKE_PNG_B64)
+
 
 # =============================================================================
 # TOOL: get_me
