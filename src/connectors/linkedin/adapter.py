@@ -18,7 +18,7 @@ import re
 from base64 import b64decode
 from collections.abc import Awaitable, Callable
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -53,6 +53,11 @@ MAX_DOCUMENT_BYTES = 100 * 1024 * 1024
 # notion_api upload_file tool). Ceil-divide the byte cap by 3, then multiply by 4.
 _MAX_IMAGE_BASE64_CHARS = -(-MAX_IMAGE_BYTES // 3) * 4
 _MAX_DOCUMENT_BASE64_CHARS = -(-MAX_DOCUMENT_BYTES // 3) * 4
+
+# initializeUpload returns the URL the media bytes are PUT to with the access token
+# attached, so that URL is restricted to LinkedIn's own domains (see _validate_upload_url).
+_UPLOAD_HOST_SUFFIXES = (".linkedin.com", ".licdn.com")
+_EXACT_UPLOAD_HOSTS = frozenset({"linkedin.com", "licdn.com"})
 
 # === SCOPES ===
 
@@ -148,6 +153,24 @@ def _decode_media(media_base64: str, max_bytes: int, label: str) -> bytes:
             f"The {label} is {len(raw_bytes)} bytes; the upload limit is {max_bytes} bytes"
         )
     return raw_bytes
+
+
+def _validate_upload_url(url: str) -> None:
+    """Guard the media-upload PUT, which carries the live access token.
+
+    initializeUpload returns the URL the bytes are PUT to with the token in the
+    Authorization header. Restrict it to HTTPS on a LinkedIn-owned host so a
+    malformed or compromised initializeUpload response can't redirect the token to
+    an attacker-controlled or internal address (SSRF + token leak). Allowlisting
+    LinkedIn's domains is stricter than rejecting only private IPs -- nothing
+    outside them is accepted, raw-IP hosts included.
+    """
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if parsed.scheme != "https":
+        raise ValueError("LinkedIn upload URL must use HTTPS")
+    if host not in _EXACT_UPLOAD_HOSTS and not host.endswith(_UPLOAD_HOST_SUFFIXES):
+        raise ValueError(f"Unexpected LinkedIn upload host: {host!r}")
 
 
 # === SERIALIZATION HELPERS ===
@@ -1104,6 +1127,7 @@ async def _upload_media_binary(access_token: str, upload_url: str, raw_bytes: by
     The upload URL is a LinkedIn media host, not a /rest/ resource, so it takes the
     Bearer token but no Linkedin-Version header.
     """
+    _validate_upload_url(upload_url)
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/octet-stream",
