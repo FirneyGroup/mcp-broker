@@ -1122,7 +1122,7 @@ async def _initialize_media_upload(
     upload_url = value.get("uploadUrl")
     media_urn = value.get(collection[:-1])  # 'images' -> 'image', 'documents' -> 'document'
     if not upload_url or not media_urn:
-        raise ValueError("LinkedIn did not return a media upload URL")
+        raise ValueError("LinkedIn did not return a media upload URL or asset URN")
     return upload_url, media_urn
 
 
