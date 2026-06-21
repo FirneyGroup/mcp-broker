@@ -454,6 +454,16 @@ class TestUploadImage:
         with pytest.raises(ValueError, match="media.write"):
             _upload_image(client, _FAKE_PNG_B64)
 
+    def test_rejects_overlong_base64_before_decoding(self, monkeypatch):
+        from connectors.twitter import adapter
+
+        # Shrink the ceiling so the test stays cheap. An over-long AND invalid-base64 string
+        # must be rejected by the length guard before b64decode runs -- so the error names the
+        # size limit rather than "not valid base64".
+        monkeypatch.setattr(adapter, "_MAX_IMAGE_BASE64_CHARS", 8)
+        with pytest.raises(ValueError, match="upload limit"):
+            adapter._upload_image(MagicMock(), "!" * 100)
+
 
 # =============================================================================
 # TOOL: get_me

@@ -62,8 +62,9 @@ _TWEET_ID_RE = re.compile(r"^\d{1,20}$")
 # then the returned media_ids are attached to the tweet.
 MAX_IMAGES_PER_TWEET = 4
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
-# Bound the base64 string at the schema so an oversized image is rejected before it is
-# buffered/decoded (base64 inflates ~4/3: ceil(bytes / 3) * 4).
+# Bound the base64 string before decoding (enforced in _upload_image; the schema maxLength
+# is advisory -- the broker does not validate inputs against it). base64 inflates ~4/3:
+# ceil(bytes / 3) * 4.
 _MAX_IMAGE_BASE64_CHARS = -(-MAX_IMAGE_BYTES // 3) * 4
 
 # === TOOL METADATA ===
@@ -267,6 +268,10 @@ def _upload_image(client: XClient, image_base64: str) -> str:
     base64 is kept for the call but decoded first to enforce the 5 MB limit and sniff the
     MIME -- both before the bytes leave the process.
     """
+    # The schema maxLength is advisory (the broker does not validate inputs against it), so
+    # reject an over-long encoded string before decoding -- never expand an oversized payload.
+    if len(image_base64) > _MAX_IMAGE_BASE64_CHARS:
+        raise ValueError(f"An image exceeds the {MAX_IMAGE_BYTES}-byte (5 MB) upload limit")
     try:
         raw_bytes = b64decode(image_base64, validate=True)
     except ValueError as exc:  # binascii.Error subclasses ValueError
