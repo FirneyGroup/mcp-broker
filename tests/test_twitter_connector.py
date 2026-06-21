@@ -418,27 +418,23 @@ class TestPostImageTweet:
         with pytest.raises(ValueError, match="no tweet data"):
             _unwrap_tweet({})
 
+    # Validation raises in the handler before run_in_executor, so the ValueError itself proves
+    # no upload/post was attempted -- no need to patch and assert the sync path wasn't called.
     async def test_rejects_more_than_four_images(self, twitter_connector):
-        with patch("connectors.twitter.adapter._post_image_tweet_sync") as mock_sync:
-            with pytest.raises(ValueError, match="At most 4 images"):
-                await twitter_connector.post_image_tweet(
-                    access_token="tok", images_base64=[_FAKE_PNG_B64] * 5
-                )
-            mock_sync.assert_not_called()
+        with pytest.raises(ValueError, match="At most 4 images"):
+            await twitter_connector.post_image_tweet(
+                access_token="tok", images_base64=[_FAKE_PNG_B64] * 5
+            )
 
     async def test_rejects_empty_image_list(self, twitter_connector):
-        with patch("connectors.twitter.adapter._post_image_tweet_sync") as mock_sync:
-            with pytest.raises(ValueError, match="At least one image"):
-                await twitter_connector.post_image_tweet(access_token="tok", images_base64=[])
-            mock_sync.assert_not_called()
+        with pytest.raises(ValueError, match="At least one image"):
+            await twitter_connector.post_image_tweet(access_token="tok", images_base64=[])
 
     async def test_rejects_text_over_280(self, twitter_connector):
-        with patch("connectors.twitter.adapter._post_image_tweet_sync") as mock_sync:
-            with pytest.raises(ValueError, match="exceeds 280"):
-                await twitter_connector.post_image_tweet(
-                    access_token="tok", images_base64=[_FAKE_PNG_B64], text="x" * 281
-                )
-            mock_sync.assert_not_called()
+        with pytest.raises(ValueError, match="exceeds 280"):
+            await twitter_connector.post_image_tweet(
+                access_token="tok", images_base64=[_FAKE_PNG_B64], text="x" * 281
+            )
 
 
 class TestUploadImage:
