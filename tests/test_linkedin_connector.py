@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+import respx
 
 from broker.connectors.registry import ConnectorRegistry
 
@@ -116,13 +117,15 @@ class TestRegistration:
         # LinkedIn rejects code_verifier — broker cannot send PKCE.
         assert linkedin_connector.meta.supports_pkce is False
 
-    def test_has_ten_tools(self, linkedin_connector):
-        assert len(linkedin_connector._tools) == 10  # noqa: PLR2004 -- full tool surface
+    def test_has_twelve_tools(self, linkedin_connector):
+        assert len(linkedin_connector._tools) == 12  # noqa: PLR2004 -- full tool surface
 
     def test_tool_names(self, linkedin_connector):
         assert set(linkedin_connector._tools.keys()) == {
             "get_me",
             "create_post",
+            "create_image_post",
+            "create_document_post",
             "delete_post",
             "get_org_posts",
             "get_managed_orgs",
@@ -183,13 +186,13 @@ class TestMCPDispatch:
         assert response["result"]["serverInfo"]["name"] == "linkedin"
 
     async def test_tools_list_excludes_org_tools_by_default(self, linkedin_connector):
-        # With self-serve scopes, only the 3 member tools are advertised; the 7
+        # With self-serve scopes, only the 5 member tools are advertised; the 7
         # org tools are filtered out of tools/list so the LLM never sees them.
         response = await linkedin_connector.handle_mcp_request(
             method="tools/list", params={}, request_id=2, access_token="fake"
         )
         listed = {tool["name"] for tool in response["result"]["tools"]}
-        assert listed == {"get_me", "create_post", "delete_post"}
+        assert listed == _MEMBER_TOOL_NAMES
 
     async def test_unknown_method_returns_error(self, linkedin_connector):
         response = await linkedin_connector.handle_mcp_request(
@@ -220,7 +223,13 @@ _ORG_TOOL_NAMES = {
     "get_org_analytics",
     "get_post_analytics",
 }
-_MEMBER_TOOL_NAMES = {"get_me", "create_post", "delete_post"}
+_MEMBER_TOOL_NAMES = {
+    "get_me",
+    "create_post",
+    "create_image_post",
+    "create_document_post",
+    "delete_post",
+}
 
 
 class TestToolAvailability:
@@ -386,6 +395,196 @@ class TestPostingPathSelection:
             await linkedin_connector.delete_post(access_token="fake", post_urn="urn:li:ugcPost:123")
         path = mock_delete.call_args.args[1]
         assert path.startswith("/v2/ugcPosts/")
+
+
+# =============================================================================
+# MEDIA POSTS — image/document tools upload then post via the versioned flow
+# =============================================================================
+
+# base64 of small placeholder bytes -- decodes cleanly, well under the size cap.
+_FAKE_MEDIA_B64 = "aW1n"  # b"img"
+
+
+class TestMediaPosts:
+    """create_image_post / create_document_post: validate, upload, then post."""
+
+    @respx.mock
+    async def test_image_post_uploads_then_posts(self, linkedin_connector):
+        # Assert on the observable HTTP traffic to LinkedIn, not on internal helper calls.
+        init = respx.post("https://api.linkedin.com/rest/images").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "value": {
+                        "uploadUrl": "https://www.linkedin.com/dms-uploads/abc",
+                        "image": "urn:li:image:1",
+                    }
+                },
+            )
+        )
+        upload = respx.put("https://www.linkedin.com/dms-uploads/abc").mock(
+            return_value=httpx.Response(201)
+        )
+        create = respx.post("https://api.linkedin.com/rest/posts").mock(
+            return_value=httpx.Response(201, headers={"x-restli-id": "urn:li:share:9"})
+        )
+
+        content = await linkedin_connector.create_image_post(
+            access_token="tok",
+            text="hi",
+            image_base64=_FAKE_MEDIA_B64,
+            alt_text="a cat",
+            author_urn="urn:li:person:abc",
+        )
+
+        # initializeUpload carried the owner URN and the action param.
+        init_request = init.calls.last.request
+        assert init_request.url.params["action"] == "initializeUpload"
+        assert json.loads(init_request.content) == {
+            "initializeUploadRequest": {"owner": "urn:li:person:abc"}
+        }
+        # The PUT sent the exact decoded bytes, with the bearer token, to the returned URL.
+        upload_request = upload.calls.last.request
+        assert upload_request.content == b"img"
+        assert upload_request.headers["authorization"] == "Bearer tok"
+        # The created post referenced the returned image URN with the alt text.
+        post_body = json.loads(create.calls.last.request.content)
+        assert post_body["author"] == "urn:li:person:abc"
+        assert post_body["content"]["media"] == {"id": "urn:li:image:1", "altText": "a cat"}
+        # The new post id is surfaced to the caller.
+        assert json.loads(content[0]["text"]) == {"id": "urn:li:share:9"}
+
+    @respx.mock
+    async def test_document_post_uploads_to_documents_with_title(self, linkedin_connector):
+        respx.post("https://api.linkedin.com/rest/documents").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "value": {
+                        "uploadUrl": "https://www.linkedin.com/dms-uploads/doc",
+                        "document": "urn:li:document:2",
+                    }
+                },
+            )
+        )
+        respx.put("https://www.linkedin.com/dms-uploads/doc").mock(return_value=httpx.Response(201))
+        create = respx.post("https://api.linkedin.com/rest/posts").mock(
+            return_value=httpx.Response(201, headers={"x-restli-id": "urn:li:share:10"})
+        )
+
+        await linkedin_connector.create_document_post(
+            access_token="tok",
+            text="deck",
+            document_base64=_FAKE_MEDIA_B64,
+            title="Q3 update",
+            author_urn="urn:li:person:abc",
+        )
+
+        post_body = json.loads(create.calls.last.request.content)
+        assert post_body["content"]["media"] == {"id": "urn:li:document:2", "title": "Q3 update"}
+
+    @respx.mock
+    async def test_upload_to_non_linkedin_host_is_rejected(self, linkedin_connector):
+        # A malformed/compromised initializeUpload response must not cause the bearer
+        # token to be PUT to a non-LinkedIn host, and no post may be created.
+        respx.post("https://api.linkedin.com/rest/images").mock(
+            return_value=httpx.Response(
+                200,
+                json={"value": {"uploadUrl": "https://evil.example/u", "image": "urn:li:image:1"}},
+            )
+        )
+        upload = respx.put("https://evil.example/u").mock(return_value=httpx.Response(201))
+        create = respx.post("https://api.linkedin.com/rest/posts").mock(
+            return_value=httpx.Response(201)
+        )
+
+        with pytest.raises(ValueError, match="Unexpected LinkedIn upload host"):
+            await linkedin_connector.create_image_post(
+                access_token="tok",
+                text="hi",
+                image_base64=_FAKE_MEDIA_B64,
+                author_urn="urn:li:person:abc",
+            )
+
+        assert not upload.called
+        assert not create.called
+
+    async def test_document_post_requires_title(self, linkedin_connector):
+        with pytest.raises(ValueError, match="title is required"):
+            await linkedin_connector.create_document_post(
+                access_token="fake", text="deck", document_base64=_FAKE_MEDIA_B64, title=""
+            )
+
+    async def test_image_post_rejects_oversize_text(self, linkedin_connector):
+        with pytest.raises(ValueError, match="exceeds"):
+            await linkedin_connector.create_image_post(
+                access_token="fake", text="x" * 3001, image_base64=_FAKE_MEDIA_B64
+            )
+
+
+class TestDecodeMedia:
+    """_decode_media is the real size/format gate (schema maxLength is advisory)."""
+
+    def test_rejects_invalid_base64(self):
+        from connectors.linkedin.adapter import _decode_media
+
+        with pytest.raises(ValueError, match="not valid base64"):
+            _decode_media("not-base64!!!", 1024, "image")
+
+    def test_rejects_empty(self):
+        from connectors.linkedin.adapter import _decode_media
+
+        with pytest.raises(ValueError, match="empty"):
+            _decode_media("", 1024, "image")
+
+    def test_rejects_oversize(self):
+        from connectors.linkedin.adapter import _decode_media
+
+        # _FAKE_MEDIA_B64 decodes to 3 bytes -- over a 2-byte cap.
+        with pytest.raises(ValueError, match="upload limit"):
+            _decode_media(_FAKE_MEDIA_B64, 2, "document")
+
+    def test_returns_bytes_within_limit(self):
+        from connectors.linkedin.adapter import _decode_media
+
+        assert _decode_media(_FAKE_MEDIA_B64, 1024, "image") == b"img"
+
+    def test_rejects_overlong_base64_before_decoding(self):
+        from connectors.linkedin.adapter import _decode_media
+
+        # Over-long AND invalid base64: the length guard must fire before b64decode runs,
+        # so the error names the size limit rather than "not valid base64".
+        with pytest.raises(ValueError, match="upload limit"):
+            _decode_media("!" * 100, 2, "image")
+
+
+class TestValidateUploadUrl:
+    """The upload PUT carries the access token, so its URL must be a LinkedIn HTTPS host."""
+
+    def test_accepts_linkedin_https_host(self):
+        from connectors.linkedin.adapter import _validate_upload_url
+
+        # Does not raise.
+        _validate_upload_url("https://www.linkedin.com/dms-uploads/abc")
+
+    def test_rejects_non_https(self):
+        from connectors.linkedin.adapter import _validate_upload_url
+
+        with pytest.raises(ValueError, match="HTTPS"):
+            _validate_upload_url("http://www.linkedin.com/dms-uploads/abc")
+
+    def test_rejects_non_linkedin_host(self):
+        from connectors.linkedin.adapter import _validate_upload_url
+
+        with pytest.raises(ValueError, match="Unexpected LinkedIn upload host"):
+            _validate_upload_url("https://evil.example/u")
+
+    def test_rejects_lookalike_host(self):
+        from connectors.linkedin.adapter import _validate_upload_url
+
+        # Suffix check requires the leading dot, so a lookalike domain is rejected.
+        with pytest.raises(ValueError, match="Unexpected LinkedIn upload host"):
+            _validate_upload_url("https://evil-linkedin.com/u")
 
 
 # =============================================================================
