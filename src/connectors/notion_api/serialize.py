@@ -22,17 +22,18 @@ def _plain_text(rich: list[dict[str, Any]] | None) -> str:
     return "".join(part.get("plain_text", "") for part in rich or [])
 
 
-def _block_file_url(body: dict[str, Any]) -> str | None:
-    """Extract the file URL from a file-bearing block body, or None if absent.
+def _file_ref_url(ref: dict[str, Any]) -> str | None:
+    """Extract the URL from a Notion file reference, or None if absent.
 
-    Notion nests the URL under a sub-key named by the body's own ``type``: a
-    Notion-hosted file lives at ``file.url`` (a signed URL that expires ~1h after
-    the read, so callers must read fresh at use time), an external file at
-    ``external.url``. A freshly-attached upload may still be a ``file_upload``
-    reference with no URL yet — that case returns None.
+    A file reference (a ``files`` property entry or a file-bearing block's body)
+    nests the URL under a sub-key named by its own ``type``: a Notion-hosted file
+    lives at ``file.url`` (a signed URL that expires ~1h after the read, so callers
+    must read fresh at use time), an external file at ``external.url``. A
+    freshly-attached upload may still be a ``file_upload`` reference with no URL
+    yet — that case returns None.
     """
-    source = body.get("type")
-    holder = body.get(source) if source else None
+    source = ref.get("type")
+    holder = ref.get(source) if source else None
     return holder.get("url") if isinstance(holder, dict) else None
 
 
@@ -46,6 +47,10 @@ def _simplify_property(prop: dict[str, Any]) -> Any:  # noqa: PLR0911 — one re
         return value.get("name") if value else None
     if ptype == "multi_select":
         return [opt.get("name") for opt in value or []]
+    if ptype == "files":
+        # A files property is a list of file references; surface each resolvable
+        # (signed, fresh-per-read) URL so readers can fetch the attached assets.
+        return [url for ref in value or [] if (url := _file_ref_url(ref))]
     if ptype == "date":
         return value if value else None
     if ptype in ("number", "checkbox", "url", "email", "phone_number"):
@@ -90,7 +95,7 @@ def _simplify_block(block: dict[str, Any]) -> dict[str, Any]:
         "has_children": block.get("has_children", False),
     }
     if btype in _FILE_BLOCK_TYPES and isinstance(body, dict):
-        url = _block_file_url(body)
+        url = _file_ref_url(body)
         if url:
             simplified["url"] = url
     return simplified

@@ -388,6 +388,48 @@ class TestSimplifyProperty:
         prop = {"type": "relation", "relation": [{"id": "page-a"}, {"id": "page-b"}]}
         assert _simplify_property(prop) == ["page-a", "page-b"]
 
+    def test_files_surfaces_signed_and_external_urls(self):
+        from connectors.notion_api.serialize import _simplify_property
+
+        # A files property mixes Notion-hosted (file.url, signed) and external (external.url) refs.
+        prop = {
+            "type": "files",
+            "files": [
+                {
+                    "name": "poster.pdf",
+                    "type": "file",
+                    "file": {
+                        "url": "https://prod-files.notion-static.com/signed?x=1",
+                        "expiry_time": "2026-06-22T13:00:00Z",
+                    },
+                },
+                {
+                    "name": "cat.png",
+                    "type": "external",
+                    "external": {"url": "https://example.com/cat.png"},
+                },
+            ],
+        }
+        assert _simplify_property(prop) == [
+            "https://prod-files.notion-static.com/signed?x=1",
+            "https://example.com/cat.png",
+        ]
+
+    def test_files_empty_returns_empty_list(self):
+        from connectors.notion_api.serialize import _simplify_property
+
+        assert _simplify_property({"type": "files", "files": []}) == []
+
+    def test_files_skips_refs_without_url(self):
+        from connectors.notion_api.serialize import _simplify_property
+
+        # A not-yet-resolved upload has no URL and is skipped, not surfaced as None.
+        prop = {
+            "type": "files",
+            "files": [{"name": "x", "type": "file_upload", "file_upload": {"id": "up-1"}}],
+        }
+        assert _simplify_property(prop) == []
+
 
 class TestSimplifyPage:
     """_simplify_page reduces a page to page_id/url/title + flat properties."""
