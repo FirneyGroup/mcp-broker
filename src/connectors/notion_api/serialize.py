@@ -10,10 +10,31 @@ from __future__ import annotations
 
 from typing import Any
 
+# === CONSTANTS ===
+
+# Block types whose body carries a file reference (Notion-hosted, external, or a
+# still-pending upload). For these, _simplify_block surfaces the file's URL.
+_FILE_BLOCK_TYPES = ("file", "image", "video", "pdf", "audio")
+
 
 def _plain_text(rich: list[dict[str, Any]] | None) -> str:
     """Join a Notion rich_text array to plain text."""
     return "".join(part.get("plain_text", "") for part in rich or [])
+
+
+def _file_ref_url(ref: dict[str, Any]) -> str | None:
+    """Extract the URL from a Notion file reference, or None if absent.
+
+    A file reference (a ``files`` property entry or a file-bearing block's body)
+    nests the URL under a sub-key named by its own ``type``: a Notion-hosted file
+    lives at ``file.url`` (a signed URL that expires ~1h after the read, so callers
+    must read fresh at use time), an external file at ``external.url``. A
+    freshly-attached upload may still be a ``file_upload`` reference with no URL
+    yet — that case returns None.
+    """
+    source = ref.get("type")
+    holder = ref.get(source) if source else None
+    return holder.get("url") if isinstance(holder, dict) else None
 
 
 def _simplify_property(prop: dict[str, Any]) -> Any:  # noqa: PLR0911 — one return per Notion property type
@@ -26,6 +47,10 @@ def _simplify_property(prop: dict[str, Any]) -> Any:  # noqa: PLR0911 — one re
         return value.get("name") if value else None
     if ptype == "multi_select":
         return [opt.get("name") for opt in value or []]
+    if ptype == "files":
+        # A files property is a list of file references; surface each resolvable
+        # (signed, fresh-per-read) URL so readers can fetch the attached assets.
+        return [url for ref in value or [] if (url := _file_ref_url(ref))]
     if ptype == "date":
         return value if value else None
     if ptype in ("number", "checkbox", "url", "email", "phone_number"):
@@ -54,16 +79,26 @@ def _simplify_page(page: dict[str, Any]) -> dict[str, Any]:
 
 
 def _simplify_block(block: dict[str, Any]) -> dict[str, Any]:
-    """Reduce a Notion block to id/type/text/has_children (text = plain text of its rich_text)."""
+    """Reduce a Notion block to id/type/text/has_children (text = plain text of its rich_text).
+
+    File-bearing blocks (image, file, pdf, video, audio) additionally carry a ``url``
+    key when the block has a resolvable file URL, so readers can fetch the attached
+    asset. The key is omitted for blocks with no URL — non-file blocks are unchanged.
+    """
     btype = block.get("type", "")
     body = block.get(btype)
     rich = body.get("rich_text") if isinstance(body, dict) else None
-    return {
+    simplified: dict[str, Any] = {
         "id": block.get("id"),
         "type": btype,
         "text": _plain_text(rich),
         "has_children": block.get("has_children", False),
     }
+    if btype in _FILE_BLOCK_TYPES and isinstance(body, dict):
+        url = _file_ref_url(body)
+        if url:
+            simplified["url"] = url
+    return simplified
 
 
 def _simplify_user(user: dict[str, Any]) -> dict[str, Any]:
