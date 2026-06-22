@@ -128,9 +128,11 @@ class ConnectorMeta(BaseModel):
                     raise ValueError(f"{field_name} must use HTTPS: {url}")
 
         # Sidecar connectors don't inject tokens — no HTTPS requirement on mcp_url.
-        # Broker connectors require HTTPS unless the URL is a Docker-internal hostname.
+        # Broker AND managed_key connectors inject a credential into the upstream request, so a
+        # non-native (mcp_url set) one MUST use HTTPS unless the URL is a Docker-internal hostname —
+        # otherwise the injected token/key would cross the wire in cleartext.
         if (
-            self.auth_mode == "broker"
+            self.auth_mode in ("broker", "managed_key")
             and self.mcp_url
             and not self.mcp_url.startswith("https://")
             and not _is_internal_url(self.mcp_url)

@@ -12,13 +12,17 @@ import logging
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
+import respx
 from fastapi.responses import JSONResponse
 
 from broker.config import BrokerConfig, BrokerSettings
+from broker.connectors.base import BaseConnector
 from broker.connectors.native import NativeConnector, NativeToolMeta, native_tool
 from broker.connectors.registry import ConnectorRegistry
 from broker.models.connector_config import ConnectorMeta
+from broker.services import proxy as proxy_module
 from broker.services.proxy import _resolve_managed_key, proxy_mcp_request
 
 _CONNECTOR = "managed_key_test"
@@ -168,3 +172,60 @@ async def test_proxy_not_configured_returns_503_and_does_not_dispatch() -> None:
     assert isinstance(response, JSONResponse)
     assert response.status_code == 503  # noqa: PLR2004 — HTTP status
     assert _RECEIVED == [], "handler ran despite no configured key"
+
+
+# === non-native (remote) managed_key forwards the key as a Bearer header ===
+
+
+class _ManagedKeyRemoteConnector(BaseConnector):
+    """A remote (mcp_url set) managed_key connector — exercises the forwarding path."""
+
+    meta = ConnectorMeta(
+        name="managed_key_remote_test",
+        display_name="Managed Key Remote",
+        mcp_url="https://upstream.test/mcp",
+        auth_mode="managed_key",
+    )
+
+
+def _remote_request(app_key: str, body: bytes) -> MagicMock:
+    request = MagicMock()
+    request.state.identity.app_key = app_key
+    request.method = "POST"
+    request.client.host = "127.0.0.1"
+    # Internal headers that MUST be stripped before forwarding upstream.
+    request.headers = {
+        "x-broker-key": "br_secret",
+        "x-app-id": app_key,
+        "content-type": "application/json",
+    }
+    request.body = AsyncMock(return_value=body)
+    return request
+
+
+@respx.mock
+async def test_remote_managed_key_injects_bearer_and_strips_internal_headers() -> None:
+    name = "managed_key_remote_test"
+    if ConnectorRegistry.get(name) is None:
+        ConnectorRegistry.auto_register(_ManagedKeyRemoteConnector)
+    upstream = respx.post("https://upstream.test/mcp").mock(
+        return_value=httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {}})
+    )
+    proxy_module.clients[name] = httpx.AsyncClient()
+    try:
+        settings = _settings({"acme": {"chat": {name: {"api_key": _KEY}}}})
+        response = await proxy_mcp_request(
+            name,
+            _remote_request("acme:chat", _TOOLS_CALL),
+            store=MagicMock(),
+            oauth_handler=MagicMock(),
+            settings=settings,
+        )
+        assert response.status_code == 200  # noqa: PLR2004 — HTTP status
+        assert upstream.called
+        sent = upstream.calls.last.request
+        assert sent.headers.get("authorization") == f"Bearer {_KEY}", "key not injected as Bearer"
+        assert "x-broker-key" not in sent.headers, "internal X-Broker-Key not stripped"
+    finally:
+        await proxy_module.clients.pop(name).aclose()
+        ConnectorRegistry._connectors.pop(name, None)
