@@ -450,6 +450,53 @@ class TestSimplifyBlock:
         simplified = _simplify_block(block)
         assert simplified["text"] == ""
         assert simplified["type"] == "image"
+        # No resolvable URL (external sub-key absent) — no url key is added.
+        assert "url" not in simplified
+
+    def test_notion_hosted_file_block_surfaces_signed_url(self):
+        from connectors.notion_api.serialize import _simplify_block
+
+        # A file uploaded to Notion is hosted: body.type == "file", url under file.url.
+        block = {
+            "id": "block-3",
+            "type": "file",
+            "file": {
+                "type": "file",
+                "file": {
+                    "url": "https://prod-files.notion-static.com/signed?x=1",
+                    "expiry_time": "2026-06-22T13:00:00Z",
+                },
+                "caption": [],
+            },
+            "has_children": False,
+        }
+        simplified = _simplify_block(block)
+        assert simplified["url"] == "https://prod-files.notion-static.com/signed?x=1"
+        assert simplified["type"] == "file"
+
+    def test_external_image_block_surfaces_external_url(self):
+        from connectors.notion_api.serialize import _simplify_block
+
+        # An externally-hosted image: body.type == "external", url under external.url.
+        block = {
+            "id": "block-4",
+            "type": "image",
+            "image": {"type": "external", "external": {"url": "https://example.com/cat.png"}},
+        }
+        simplified = _simplify_block(block)
+        assert simplified["url"] == "https://example.com/cat.png"
+
+    def test_pending_file_upload_block_omits_url(self):
+        from connectors.notion_api.serialize import _simplify_block
+
+        # A just-attached upload not yet resolved to a hosted file carries no URL.
+        block = {
+            "id": "block-5",
+            "type": "file",
+            "file": {"type": "file_upload", "file_upload": {"id": "upload-abc"}},
+        }
+        simplified = _simplify_block(block)
+        assert "url" not in simplified
 
 
 class TestSimplifyUser:

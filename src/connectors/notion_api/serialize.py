@@ -10,10 +10,30 @@ from __future__ import annotations
 
 from typing import Any
 
+# === CONSTANTS ===
+
+# Block types whose body carries a file reference (Notion-hosted, external, or a
+# still-pending upload). For these, _simplify_block surfaces the file's URL.
+_FILE_BLOCK_TYPES = ("file", "image", "video", "pdf", "audio")
+
 
 def _plain_text(rich: list[dict[str, Any]] | None) -> str:
     """Join a Notion rich_text array to plain text."""
     return "".join(part.get("plain_text", "") for part in rich or [])
+
+
+def _block_file_url(body: dict[str, Any]) -> str | None:
+    """Extract the file URL from a file-bearing block body, or None if absent.
+
+    Notion nests the URL under a sub-key named by the body's own ``type``: a
+    Notion-hosted file lives at ``file.url`` (a signed URL that expires ~1h after
+    the read, so callers must read fresh at use time), an external file at
+    ``external.url``. A freshly-attached upload may still be a ``file_upload``
+    reference with no URL yet — that case returns None.
+    """
+    source = body.get("type")
+    holder = body.get(source) if source else None
+    return holder.get("url") if isinstance(holder, dict) else None
 
 
 def _simplify_property(prop: dict[str, Any]) -> Any:  # noqa: PLR0911 — one return per Notion property type
@@ -54,16 +74,26 @@ def _simplify_page(page: dict[str, Any]) -> dict[str, Any]:
 
 
 def _simplify_block(block: dict[str, Any]) -> dict[str, Any]:
-    """Reduce a Notion block to id/type/text/has_children (text = plain text of its rich_text)."""
+    """Reduce a Notion block to id/type/text/has_children (text = plain text of its rich_text).
+
+    File-bearing blocks (image, file, pdf, video, audio) additionally carry a ``url``
+    key when the block has a resolvable file URL, so readers can fetch the attached
+    asset. The key is omitted for blocks with no URL — non-file blocks are unchanged.
+    """
     btype = block.get("type", "")
     body = block.get(btype)
     rich = body.get("rich_text") if isinstance(body, dict) else None
-    return {
+    simplified: dict[str, Any] = {
         "id": block.get("id"),
         "type": btype,
         "text": _plain_text(rich),
         "has_children": block.get("has_children", False),
     }
+    if btype in _FILE_BLOCK_TYPES and isinstance(body, dict):
+        url = _block_file_url(body)
+        if url:
+            simplified["url"] = url
+    return simplified
 
 
 def _simplify_user(user: dict[str, Any]) -> dict[str, Any]:
