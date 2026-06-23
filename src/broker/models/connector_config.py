@@ -145,6 +145,11 @@ class ConnectorMeta(BaseModel):
         if self.mcp_oauth_url and not self.mcp_oauth_url.startswith("https://"):
             raise ValueError(f"mcp_oauth_url must use HTTPS: {self.mcp_oauth_url}")
 
+        # managed_key is a no-OAuth mode. mcp_oauth_url would flip uses_discovery to True,
+        # making the connect wizard present it as needing OAuth — contradicting the intent.
+        if self.auth_mode == "managed_key" and self.mcp_oauth_url:
+            raise ValueError("mcp_oauth_url must not be set when auth_mode='managed_key'")
+
         return self
 
     @property

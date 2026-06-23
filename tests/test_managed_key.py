@@ -204,7 +204,7 @@ def _remote_request(app_key: str, body: bytes) -> MagicMock:
 
 
 @respx.mock
-async def test_remote_managed_key_injects_bearer_and_strips_internal_headers() -> None:
+async def test_remote_managed_key_injects_bearer_and_strips_internal_headers(caplog) -> None:
     name = "managed_key_remote_test"
     if ConnectorRegistry.get(name) is None:
         ConnectorRegistry.auto_register(_ManagedKeyRemoteConnector)
@@ -213,6 +213,7 @@ async def test_remote_managed_key_injects_bearer_and_strips_internal_headers() -
     )
     proxy_module.clients[name] = httpx.AsyncClient()
     try:
+        caplog.set_level(logging.DEBUG)
         settings = _settings({"acme": {"chat": {name: {"api_key": _KEY}}}})
         response = await proxy_mcp_request(
             name,
@@ -226,6 +227,24 @@ async def test_remote_managed_key_injects_bearer_and_strips_internal_headers() -
         sent = upstream.calls.last.request
         assert sent.headers.get("authorization") == f"Bearer {_KEY}", "key not injected as Bearer"
         assert "x-broker-key" not in sent.headers, "internal X-Broker-Key not stripped"
+        assert _KEY not in caplog.text, "api_key leaked into logs on the remote forward path"
     finally:
         await proxy_module.clients.pop(name).aclose()
         ConnectorRegistry._connectors.pop(name, None)
+
+
+# === meta validation guards ===
+
+
+def test_managed_key_rejects_mcp_oauth_url() -> None:
+    with pytest.raises(ValueError, match="mcp_oauth_url must not be set"):
+        ConnectorMeta(
+            name="x", display_name="X", auth_mode="managed_key", mcp_oauth_url="https://x.test"
+        )
+
+
+def test_managed_key_remote_requires_https() -> None:
+    with pytest.raises(ValueError, match="must use HTTPS"):
+        ConnectorMeta(
+            name="x", display_name="X", auth_mode="managed_key", mcp_url="http://x.test/mcp"
+        )
