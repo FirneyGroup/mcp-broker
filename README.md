@@ -18,21 +18,47 @@ flowchart LR
 
 Works with any MCP-compatible client (Claude Desktop, Claude Code, Google ADK, custom agents).
 
+## What it's for
+
+Two jobs, and most people come for one and stay for the other.
+
+**1. Write a connector without standing up a server.** OAuth 2.1 with PKCE, token storage and encryption, refresh, and the MCP plumbing are already here. A connector to an OAuth-2.1 MCP server is a config object — this is the entire HubSpot connector, `src/connectors/hubspot/adapter.py`:
+
+```python
+class HubSpotConnector(BaseConnector):
+    meta = ConnectorMeta(
+        name="hubspot",
+        display_name="HubSpot",
+        mcp_url="https://mcp.hubspot.com",
+        mcp_transport="sse",
+        oauth_authorize_url="https://mcp.hubspot.com/oauth/authorize",
+        oauth_token_url="https://mcp.hubspot.com/oauth/v3/token",
+        scopes=(),
+    )
+```
+
+No route to register, no token handling, no refresh loop. It auto-registers on import. If the provider has no MCP server at all, a **native** connector wraps its REST API or Python SDK and the broker serves MCP for it in-process — you write tool handlers, not a server. See [Adding a Connector](#adding-a-connector).
+
+**2. Share what you built with your team.** One broker serves many apps and agents. The person who sets up a connector does the OAuth consent once; everyone else points a client at a URL and never handles a credential. Access is per-app: each app gets its own key, its own OAuth credentials, and its own allow-list of connectors. Turn on the inbound OAuth server and colleagues can add the broker straight into claude.ai as a custom connector. See [Sharing Across Your Organisation](#sharing-across-your-organisation).
+
 ## Is this for me?
 
 **Use mcp-broker if you:**
+- Want to build a custom MCP tool or connector quickly — wrap a Python SDK or an internal API without writing an MCP server, auth layer, or token store
+- Have something worth sharing internally, and want colleagues or other agents to use it without each one holding credentials
 - Operate multiple AI agents or apps that need OAuth access to the same set of third-party services (Notion, HubSpot, Google Workspace, etc.)
 - Want per-app credential isolation — compromising one app's broker key should not expose the others
-- Prefer agents that never touch raw OAuth tokens or client secrets
 - Need to drop in new OAuth providers without redeploying every agent that uses them
-- Want to author custom MCP tools — wrap a Python SDK or expose internal APIs via a native connector, without standing up a separate MCP server
 
 **Skip mcp-broker if you:**
 - Have a single agent with a single hardcoded credential — a `.env` var is simpler
+- Need per-end-user accounts and consent — the broker's isolation boundary is the **app**, not the individual user (see [Sharing Across Your Organisation](#sharing-across-your-organisation))
 - Need a full identity provider with user authentication — use Keycloak, Auth0, or similar
 
 ## Table of Contents
 
+- [What it's for](#what-its-for)
+- [Is this for me?](#is-this-for-me)
 - [Quickstart](#quickstart)
 - [How It Works](#how-it-works)
 - [Features](#features)
@@ -44,6 +70,7 @@ Works with any MCP-compatible client (Claude Desktop, Claude Code, Google ADK, c
 - [Key Management](#key-management)
 - [Inbound OAuth 2.1 (claude.ai)](#inbound-oauth-21-claudeai)
 - [Adding a Connector](#adding-a-connector)
+- [Sharing Across Your Organisation](#sharing-across-your-organisation)
 - [API Reference](#api-reference)
 - [Testing](#testing)
 - [Security](#security)
@@ -439,6 +466,19 @@ If any public endpoint returns 403, the deployment's edge auth is blocking — e
 
 ## Adding a Connector
 
+This is the part most people are here for, so a sense of scale first. Every shipped connector, by lines in its `adapter.py`:
+
+| Connector | Flavour | Lines | What that buys |
+|---|---|---:|---|
+| `hubspot` | Static | 31 | Full OAuth 2.1 + PKCE against HubSpot's MCP server |
+| `bigquery` | Static | 44 | Same, with a custom auth header |
+| `workspace_mcp` | Sidecar | 62 | Google Workspace via a container running next to the broker |
+| `notion` | Discovery | 87 | Zero-config OAuth — endpoints and client credentials discovered at connect |
+| `twitter` | Native | 644 | 8 hand-written tools wrapping a Python SDK, no upstream MCP server |
+| `notion_api` | Native | 1487 | 19 tools over Notion's REST API, including queries the hosted MCP server doesn't expose |
+
+The split is the point. If the provider already runs an OAuth 2.1 MCP server, you are writing **configuration** and the line count stays in the tens. The four-figure files are native connectors, where the length is your own tool logic — schemas and handlers — not plumbing. Nothing in either column is auth code, token storage, refresh, or transport.
+
 All connectors auto-register via `__init_subclass__` on import. Four flavours exist — pick one before writing code:
 
 | Flavour | When to use | Where the MCP server runs | Where credentials come from |
@@ -465,6 +505,48 @@ All connectors auto-register via `__init_subclass__` on import. Four flavours ex
 - Native → `src/connectors/twitter/adapter.py` (xdk SDK wrapped with `run_in_executor`)
 
 **Reviewers check against** [AGENTS.md § Connector Rules](AGENTS.md#connector-rules-must) — every `MUST` in that section is enforced on PR review.
+
+## Sharing Across Your Organisation
+
+A connector is only worth writing once. The broker is built so the person who writes it is the only person who deals with credentials.
+
+**The shape.** One broker instance serves many apps. An "app" is an `app_key` of the form `client_id:app_id` — a team, an agent, a product surface, whatever you decide the unit is. Each app gets:
+
+- its own **broker key** (`br_*`), SHA-256 hashed at rest, rotatable and revocable on its own
+- its own **OAuth credentials** per connector, under `apps:` in `settings.yaml`
+- its own **allow-list** of connectors, via `allowed_connectors`
+- its own **scopes** (`proxy`, `status`)
+
+```yaml
+clients:
+  my_company:
+    research_agent:
+      scopes: [proxy, status]
+      allowed_connectors: [notion, reddit]        # cannot reach hubspot
+    sales_agent:
+      scopes: [proxy]
+      allowed_connectors: [hubspot, notion_api]   # cannot reach reddit
+```
+
+Compromising `research_agent`'s key exposes Notion and Reddit for that app. It does not expose HubSpot, and it does not expose `sales_agent`.
+
+**What a colleague actually does.** Nothing, in credential terms. You run `./start connect` once per connector to complete the OAuth consent; the token is encrypted and stored broker-side. A teammate — or their agent — sends MCP requests to `/proxy/{connector}/mcp` with a broker key and app id. They never see an OAuth token, a client secret, or a refresh flow. Adding a new provider to the org is one connector, one consent, and a config line per app that should reach it — no redeploy of anything downstream.
+
+**Sharing into claude.ai.** Turn on the [inbound OAuth 2.1 server](#inbound-oauth-21-claudeai) and the broker becomes an OAuth authorization server in its own right. Colleagues add its URL as a custom connector in claude.ai, click through consent, and their Claude gets the tools — no broker key to distribute, no keys pasted into a chat client.
+
+**Two limits to design around, stated plainly:**
+
+1. **The isolation boundary is the app, not the person.** All requests for an app share that app's stored upstream tokens. If `sales_agent` is connected to HubSpot, everyone using `sales_agent` acts as that one HubSpot connection. Give people or teams separate `app_key`s when they should not share an upstream account.
+2. **Inbound OAuth mints against a single `app_key`.** Every claude.ai user who connects gets tokens for the one app named in `broker.oauth.app_key`, so they all share its connectors and its upstream connections. That is fine for a team tool and wrong for per-customer separation. If you need per-end-user credentials, the broker is a building block rather than the finished answer.
+
+**Taking access away.** Revocation is per-app and does not disturb anyone else:
+
+| To do this | Use |
+|---|---|
+| Rotate one app's key | `POST /admin/keys/{app_key}/rotate` |
+| Cut one app off entirely | `DELETE /admin/keys/{app_key}` |
+| Kick that app's claude.ai sessions, keep the key | `POST /admin/oauth/revoke/{app_key}` |
+| Drop one upstream connection, keep the app | `DELETE /admin/connections/{app_key}/{connector}` |
 
 ## API Reference
 
