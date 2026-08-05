@@ -35,7 +35,7 @@ dependencies = [
     "pyyaml",
     # CVE floors: GHSA-537c-gmf6-5ccf (cryptography),
     # CVE-2026-53538/53539/53540 (python-multipart).
-    "cryptography>=48.0.1",
+    "cryptography>=50.0.0",
     "python-dotenv",
     "python-multipart>=0.0.31",
     "google-cloud-firestore>=2.15.0",
