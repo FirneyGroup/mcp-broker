@@ -30,6 +30,46 @@ jobs:
           rm -f findings.json claudecode-results.json claudecode-error.log
           rm -rf claudecode .claudecode-marker
 
+      # Write scan instructions from THIS workflow file (must match main — Anthropic
+      # gate) into RUNNER_TEMP. Never read docs/ from the untrusted PR checkout.
+      - name: Write trusted security scan instructions
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/claude-security-scan-instructions.txt" <<'INSTRUCTIONS'
+          Firney ADK security priorities (apply in addition to general SAST):
+
+          1. Multi-tenant isolation
+             - Every data query/filter that touches tenant data MUST scope by client_id
+               (or equivalent app-scoped key). Missing client_id filters are HIGH.
+             - Do not allow one tenant's auth context to read another tenant's sessions,
+               recipes, tool configs, or artifacts.
+
+          2. Recipe / app-config store
+             - Unsigned recipe load must fail closed when signatures are required.
+             - Platform-owned tool config fields (credentials, write_mode, project_id,
+               maximum_bytes_billed, bare url/key/uri) must not be tenant-overridable.
+             - Cold recipe version / cache keys must not collide distinct recipe bodies.
+
+          3. Auth and API keys
+             - Never log raw API keys, OAuth tokens, or JWTs.
+             - Trusted-header and Firebase auth paths must not skip tenant binding.
+
+          4. A2A / untrusted input
+             - Request body size must be capped before buffering (streaming/chunked paths too).
+             - MIME admission must not bypass required screening when screening is enabled.
+             - Declared file parts that skip Model Armor are known residual risk (#112) —
+               only flag NEW bypasses, not the documented trade-off.
+
+          5. Workflow / CI (when reviewing workflow files)
+             - Prefer scoped Bash(command:*) patterns over unrestricted Bash.
+             - Do not trust PR-tree files as evidence that a security scan ran.
+             - Minimize GITHUB_TOKEN permissions; avoid id-token: write unless OIDC is used.
+
+          Ignore pure style, naming, and pre-existing issues outside the PR diff.
+          INSTRUCTIONS
+          # Strip the leading indent from the heredoc body for a clean file.
+          sed -i 's/^          //' "${RUNNER_TEMP}/claude-security-scan-instructions.txt"
+
       # FirneyGroup fork with OAuth (upstream still lacks oauth input as of pin).
       # Sync: gh repo sync FirneyGroup/claude-code-security-review
       # Pin: 657c445 (fork main, OAuth support). Re-pin after sync.
@@ -45,7 +85,7 @@ jobs:
           comment-pr: false
           upload-results: true
           exclude-directories: data,logs,.venv,node_modules,dist,build
-          custom-security-scan-instructions: docs/security/claude-security-scan-instructions.txt
+          custom-security-scan-instructions: ${{ runner.temp }}/claude-security-scan-instructions.txt
 
       # Move results out of the PR tree immediately so later steps never read
       # attacker-controlled paths from the checkout root.
@@ -65,12 +105,10 @@ jobs:
               staged=1
             fi
           done
-          # Prefer nested path the action may leave before copy
           if [ -f claudecode/claudecode-results.json ] && [ ! -f "$DEST/claudecode-results.json" ]; then
             cp claudecode/claudecode-results.json "$DEST/claudecode-results.json"
             staged=1
           fi
-          # Wipe workspace copies so a later step cannot accidentally re-read them
           rm -f findings.json claudecode-results.json claudecode-error.log
           rm -rf claudecode
           echo "results_dir=$DEST" >> "$GITHUB_OUTPUT"
@@ -94,18 +132,24 @@ jobs:
           STATUS="no results (scan may have failed or been skipped)"
           RESULTS_JSON="[]"
 
+          # Guard every jq call so set -e never aborts before the summary posts.
           if [ -f "${RESULTS_DIR}/findings.json" ]; then
-            FINDINGS=$(jq 'if type == "array" then length else 0 end' "${RESULTS_DIR}/findings.json")
-            RESULTS_JSON=$(cat "${RESULTS_DIR}/findings.json")
+            FINDINGS=$(jq 'if type == "array" then length else 0 end' "${RESULTS_DIR}/findings.json" 2>/dev/null || echo "0")
+            RESULTS_JSON=$(jq '.' "${RESULTS_DIR}/findings.json" 2>/dev/null || echo "[]")
             STATUS="completed (security step: ${SECURITY_OUTCOME})"
           elif [ -f "${RESULTS_DIR}/claudecode-results.json" ]; then
             FINDINGS=$(jq -r '.findings | if . == null then 0 else length end' "${RESULTS_DIR}/claudecode-results.json" 2>/dev/null || echo "0")
-            RESULTS_JSON=$(jq '.findings // []' "${RESULTS_DIR}/claudecode-results.json")
+            RESULTS_JSON=$(jq '.findings // []' "${RESULTS_DIR}/claudecode-results.json" 2>/dev/null || echo "[]")
             STATUS="completed (security step: ${SECURITY_OUTCOME})"
             if jq -e '.error' "${RESULTS_DIR}/claudecode-results.json" >/dev/null 2>&1; then
-              ERR=$(jq -r '.error' "${RESULTS_DIR}/claudecode-results.json")
+              ERR=$(jq -r '.error // "unknown"' "${RESULTS_DIR}/claudecode-results.json" 2>/dev/null || echo "unknown")
               STATUS="error: ${ERR}"
             fi
+          fi
+
+          # Normalize non-numeric FINDINGS so later arithmetic is safe.
+          if ! [[ "${FINDINGS}" =~ ^[0-9]+$ ]]; then
+            FINDINGS=0
           fi
 
           BODY=$(cat <<MD
@@ -126,17 +170,17 @@ jobs:
           gh pr comment "$PR" --body "$BODY"
           echo "Posted security summary (findings=${FINDINGS})"
 
-          # Post inlines for findings not already commented (dedupe by path+line+snippet)
-          if [ "$FINDINGS" -gt 0 ] 2>/dev/null; then
+          if [ "${FINDINGS}" -gt 0 ]; then
             EXISTING=$(gh api "repos/${REPO}/pulls/${PR}/comments" --paginate \
               --jq '[.[] | select(.body | test("Security Issue";"i")) | "\(.path):\(.line // .original_line // 0)"] | unique | .[]' || true)
-            echo "$RESULTS_JSON" | jq -c '.[]' | while read -r row; do
-              path=$(echo "$row" | jq -r '.file // .path // empty')
-              line=$(echo "$row" | jq -r '.line // (.start.line // 1)')
-              desc=$(echo "$row" | jq -r '.description // .extra.message // "Security vulnerability detected"')
-              sev=$(echo "$row" | jq -r '.severity // "HIGH"')
-              catg=$(echo "$row" | jq -r '.category // "security_issue"')
-              rec=$(echo "$row" | jq -r '.recommendation // .extra.metadata.recommendation // empty')
+            echo "${RESULTS_JSON}" | jq -c '.[]?' 2>/dev/null | while read -r row; do
+              [ -n "${row}" ] || continue
+              path=$(echo "$row" | jq -r '.file // .path // empty' 2>/dev/null || true)
+              line=$(echo "$row" | jq -r '.line // (.start.line // 1)' 2>/dev/null || echo "1")
+              desc=$(echo "$row" | jq -r '.description // .extra.message // "Security vulnerability detected"' 2>/dev/null || echo "Security vulnerability detected")
+              sev=$(echo "$row" | jq -r '.severity // "HIGH"' 2>/dev/null || echo "HIGH")
+              catg=$(echo "$row" | jq -r '.category // "security_issue"' 2>/dev/null || echo "security_issue")
+              rec=$(echo "$row" | jq -r '.recommendation // .extra.metadata.recommendation // empty' 2>/dev/null || true)
               key="${path}:${line}"
               if printf '%s\n' "$EXISTING" | grep -Fxq "$key"; then
                 echo "Skip existing inline $key"
@@ -146,14 +190,13 @@ jobs:
               if [ -n "$rec" ] && [ "$rec" != "null" ]; then
                 body=$(printf '%s\n**Recommendation:** %s\n' "$body" "$rec")
               fi
-              # Best-effort inline; line must be in the diff
               if gh api "repos/${REPO}/pulls/${PR}/comments" \
                 -f body="$body" -f path="$path" -F line="$line" -f side=RIGHT -f commit_id="$SHA" 2>/dev/null; then
                 echo "Posted inline $key"
               else
                 echo "Could not post inline $key (line may be outside diff)"
               fi
-            done
+            done || true
           fi
 
       - name: Verify security scan produced results
@@ -168,14 +211,14 @@ jobs:
             exit 1
           fi
           if [ -f "${RESULTS_DIR}/findings.json" ]; then
-            n=$(jq 'if type == "array" then length else 0 end' "${RESULTS_DIR}/findings.json")
+            n=$(jq 'if type == "array" then length else 0 end' "${RESULTS_DIR}/findings.json" 2>/dev/null || echo "0")
             echo "OK: staged findings.json (${n} findings) under RUNNER_TEMP"
             exit 0
           fi
           if [ -f "${RESULTS_DIR}/claudecode-results.json" ]; then
             echo "OK: staged claudecode-results.json under RUNNER_TEMP"
             if jq -e '.error' "${RESULTS_DIR}/claudecode-results.json" >/dev/null 2>&1; then
-              echo "::error::Security scan reported an error: $(jq -r '.error' "${RESULTS_DIR}/claudecode-results.json")"
+              echo "::error::Security scan reported an error: $(jq -r '.error' "${RESULTS_DIR}/claudecode-results.json" 2>/dev/null || echo unknown)"
               exit 1
             fi
             exit 0
