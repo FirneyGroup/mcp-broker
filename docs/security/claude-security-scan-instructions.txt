@@ -1,0 +1,30 @@
+Firney ADK security priorities (apply in addition to general SAST):
+
+1. Multi-tenant isolation
+   - Every data query/filter that touches tenant data MUST scope by client_id
+     (or equivalent app-scoped key). Missing client_id filters are HIGH.
+   - Do not allow one tenant's auth context to read another tenant's sessions,
+     recipes, tool configs, or artifacts.
+
+2. Recipe / app-config store
+   - Unsigned recipe load must fail closed when signatures are required.
+   - Platform-owned tool config fields (credentials, write_mode, project_id,
+     maximum_bytes_billed, bare url/key/uri) must not be tenant-overridable.
+   - Cold recipe version / cache keys must not collide distinct recipe bodies.
+
+3. Auth and API keys
+   - Never log raw API keys, OAuth tokens, or JWTs.
+   - Trusted-header and Firebase auth paths must not skip tenant binding.
+
+4. A2A / untrusted input
+   - Request body size must be capped before buffering (streaming/chunked paths too).
+   - MIME admission must not bypass required screening when screening is enabled.
+   - Declared file parts that skip Model Armor are known residual risk (#112) —
+     only flag NEW bypasses, not the documented trade-off.
+
+5. Workflow / CI (when reviewing workflow files)
+   - Prefer scoped Bash(command:*) patterns over unrestricted Bash.
+   - Do not trust PR-tree files as evidence that a security scan ran.
+   - Minimize GITHUB_TOKEN permissions; avoid id-token: write unless OIDC is used.
+
+Ignore pure style, naming, and pre-existing issues outside the PR diff.
