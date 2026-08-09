@@ -13,6 +13,9 @@ permissions:
   pull-requests: write
   issues: write
   actions: read
+  # Required by claude-code-action: mints GitHub App token via OIDC
+  # even when Claude API auth uses CLAUDE_CODE_OAUTH_TOKEN.
+  id-token: write
 
 concurrency:
   group: claude-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number }}
