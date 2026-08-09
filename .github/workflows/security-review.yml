@@ -8,27 +8,177 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
-  id-token: write
 
+# Do not cancel mid-scan on rapid pushes.
 concurrency:
   group: security-review-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   security-review:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 2
 
-      # FirneyGroup fork of anthropics/claude-code-security-review with OAuth
-      # support (upstream PR #41) merged in. Pinned to commit SHA per the
-      # repo's third-party-action policy. Switch to the upstream action and
-      # re-pin once anthropics merges PR #41.
-      - uses: FirneyGroup/claude-code-security-review@657c44557a3ef75ddbc3e684e3f455e5d87773b0  # main
+      # PR tree is untrusted. Never leave result filenames the gate will trust.
+      - name: Clear untrusted security result paths
+        run: |
+          set -euo pipefail
+          rm -f findings.json claudecode-results.json claudecode-error.log
+          rm -rf claudecode .claudecode-marker
+
+      # FirneyGroup fork with OAuth (upstream still lacks oauth input as of pin).
+      # Sync: gh repo sync FirneyGroup/claude-code-security-review
+      # Pin: 657c445 (fork main, OAuth support). Re-pin after sync.
+      - name: Claude Code Security Review
+        id: security
+        uses: FirneyGroup/claude-code-security-review@657c44557a3ef75ddbc3e684e3f455e5d87773b0
         with:
           claude-code-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          comment-pr: true
+          claude-model: claude-opus-5
+          run-every-commit: true
+          # We post summary + inlines ourselves so later commits can still comment
+          # (upstream script skips ALL inlines if any prior Security Issue exists).
+          comment-pr: false
           upload-results: true
+          exclude-directories: data,logs,.venv,node_modules,dist,build
+          custom-security-scan-instructions: docs/security/claude-security-scan-instructions.txt
+
+      # Move results out of the PR tree immediately so later steps never read
+      # attacker-controlled paths from the checkout root.
+      - name: Stage scan results outside checkout
+        id: stage
+        if: always()
+        env:
+          SECURITY_OUTCOME: ${{ steps.security.outcome }}
+        run: |
+          set -euo pipefail
+          DEST="${RUNNER_TEMP}/security-review-results"
+          mkdir -p "$DEST"
+          staged=0
+          for f in findings.json claudecode-results.json claudecode-error.log; do
+            if [ -f "$f" ]; then
+              cp "$f" "$DEST/$f"
+              staged=1
+            fi
+          done
+          # Prefer nested path the action may leave before copy
+          if [ -f claudecode/claudecode-results.json ] && [ ! -f "$DEST/claudecode-results.json" ]; then
+            cp claudecode/claudecode-results.json "$DEST/claudecode-results.json"
+            staged=1
+          fi
+          # Wipe workspace copies so a later step cannot accidentally re-read them
+          rm -f findings.json claudecode-results.json claudecode-error.log
+          rm -rf claudecode
+          echo "results_dir=$DEST" >> "$GITHUB_OUTPUT"
+          echo "staged=$staged" >> "$GITHUB_OUTPUT"
+          echo "security_outcome=$SECURITY_OUTCOME" >> "$GITHUB_OUTPUT"
+          ls -la "$DEST" || true
+
+      - name: Post security review summary and inlines
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RESULTS_DIR: ${{ steps.stage.outputs.results_dir }}
+          SECURITY_OUTCOME: ${{ steps.security.outcome }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          FINDINGS=0
+          STATUS="no results (scan may have failed or been skipped)"
+          RESULTS_JSON="[]"
+
+          if [ -f "${RESULTS_DIR}/findings.json" ]; then
+            FINDINGS=$(jq 'if type == "array" then length else 0 end' "${RESULTS_DIR}/findings.json")
+            RESULTS_JSON=$(cat "${RESULTS_DIR}/findings.json")
+            STATUS="completed (security step: ${SECURITY_OUTCOME})"
+          elif [ -f "${RESULTS_DIR}/claudecode-results.json" ]; then
+            FINDINGS=$(jq -r '.findings | if . == null then 0 else length end' "${RESULTS_DIR}/claudecode-results.json" 2>/dev/null || echo "0")
+            RESULTS_JSON=$(jq '.findings // []' "${RESULTS_DIR}/claudecode-results.json")
+            STATUS="completed (security step: ${SECURITY_OUTCOME})"
+            if jq -e '.error' "${RESULTS_DIR}/claudecode-results.json" >/dev/null 2>&1; then
+              ERR=$(jq -r '.error' "${RESULTS_DIR}/claudecode-results.json")
+              STATUS="error: ${ERR}"
+            fi
+          fi
+
+          BODY=$(cat <<MD
+          ## Security Review — full scan
+
+          - **PR:** #${PR}
+          - **Head:** \`${SHA}\`
+          - **Model:** \`claude-opus-5\`
+          - **Security step:** ${SECURITY_OUTCOME}
+          - **Status:** ${STATUS}
+          - **Findings:** ${FINDINGS}
+          - **Job:** ${RUN_URL}
+
+          Inline comments are re-posted for findings not already present on this head.
+          MD
+          )
+          BODY=$(printf '%s\n' "$BODY" | sed 's/^          //')
+          gh pr comment "$PR" --body "$BODY"
+          echo "Posted security summary (findings=${FINDINGS})"
+
+          # Post inlines for findings not already commented (dedupe by path+line+snippet)
+          if [ "$FINDINGS" -gt 0 ] 2>/dev/null; then
+            EXISTING=$(gh api "repos/${REPO}/pulls/${PR}/comments" --paginate \
+              --jq '[.[] | select(.body | test("Security Issue";"i")) | "\(.path):\(.line // .original_line // 0)"] | unique | .[]' || true)
+            echo "$RESULTS_JSON" | jq -c '.[]' | while read -r row; do
+              path=$(echo "$row" | jq -r '.file // .path // empty')
+              line=$(echo "$row" | jq -r '.line // (.start.line // 1)')
+              desc=$(echo "$row" | jq -r '.description // .extra.message // "Security vulnerability detected"')
+              sev=$(echo "$row" | jq -r '.severity // "HIGH"')
+              catg=$(echo "$row" | jq -r '.category // "security_issue"')
+              rec=$(echo "$row" | jq -r '.recommendation // .extra.metadata.recommendation // empty')
+              key="${path}:${line}"
+              if printf '%s\n' "$EXISTING" | grep -Fxq "$key"; then
+                echo "Skip existing inline $key"
+                continue
+              fi
+              body=$(printf '🤖 **Security Issue: %s**\n\n**Severity:** %s\n**Category:** %s\n**Tool:** ClaudeCode AI Security Analysis\n' "$desc" "$sev" "$catg")
+              if [ -n "$rec" ] && [ "$rec" != "null" ]; then
+                body=$(printf '%s\n**Recommendation:** %s\n' "$body" "$rec")
+              fi
+              # Best-effort inline; line must be in the diff
+              if gh api "repos/${REPO}/pulls/${PR}/comments" \
+                -f body="$body" -f path="$path" -F line="$line" -f side=RIGHT -f commit_id="$SHA" 2>/dev/null; then
+                echo "Posted inline $key"
+              else
+                echo "Could not post inline $key (line may be outside diff)"
+              fi
+            done
+          fi
+
+      - name: Verify security scan produced results
+        if: github.event_name == 'pull_request'
+        env:
+          RESULTS_DIR: ${{ steps.stage.outputs.results_dir }}
+          SECURITY_OUTCOME: ${{ steps.security.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "${SECURITY_OUTCOME}" != "success" ]; then
+            echo "::error::Security action step outcome was '${SECURITY_OUTCOME}', not success."
+            exit 1
+          fi
+          if [ -f "${RESULTS_DIR}/findings.json" ]; then
+            n=$(jq 'if type == "array" then length else 0 end' "${RESULTS_DIR}/findings.json")
+            echo "OK: staged findings.json (${n} findings) under RUNNER_TEMP"
+            exit 0
+          fi
+          if [ -f "${RESULTS_DIR}/claudecode-results.json" ]; then
+            echo "OK: staged claudecode-results.json under RUNNER_TEMP"
+            if jq -e '.error' "${RESULTS_DIR}/claudecode-results.json" >/dev/null 2>&1; then
+              echo "::error::Security scan reported an error: $(jq -r '.error' "${RESULTS_DIR}/claudecode-results.json")"
+              exit 1
+            fi
+            exit 0
+          fi
+          echo "::error::No staged results under RUNNER_TEMP after security step. Scan skipped or failed silently."
+          exit 1
