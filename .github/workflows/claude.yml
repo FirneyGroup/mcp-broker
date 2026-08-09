@@ -8,21 +8,25 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
+# Minimum permissions. No id-token (OAuth only). actions:read for CI MCP.
 permissions:
   contents: read
   pull-requests: write
   issues: write
   actions: read
-  # Required by claude-code-action: mints GitHub App token via OIDC
-  # even when Claude API auth uses CLAUDE_CODE_OAUTH_TOKEN.
+  # Required by claude-code-action: it mints a GitHub App token via OIDC
+  # even when Claude auth uses CLAUDE_CODE_OAUTH_TOKEN.
   id-token: write
 
+# One review at a time per PR/issue. Do not cancel mid-scan on rapid pushes.
 concurrency:
   group: claude-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: false
 
 jobs:
   claude-review:
+    # Restrict @claude comment triggers to write-associated actors so arbitrary
+    # commenters cannot start a secrets-bearing agent run.
     if: |
       (github.event_name == 'pull_request') ||
       (
@@ -40,12 +44,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # Full history so base...head diffs and git show work for the whole PR.
           fetch-depth: 0
 
+      # Fetch base without --depth=1 (that would shallow the whole clone and
+      # destroy base...head history). Pass base_ref via env and validate it so
+      # it is never shell-interpolated from the expression expansion.
       - name: Fetch PR base branch
         if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          git fetch origin "${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}" --depth=1 || true
+          set -euo pipefail
+          if [[ ! "${BASE_REF}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::Refusing unsafe base_ref: ${BASE_REF}"
+            exit 1
+          fi
+          git fetch origin "refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" || true
 
       - name: Claude Code Review
         id: claude
@@ -72,19 +87,20 @@ jobs:
             - Walk every changed source file that can affect behaviour (skip pure lockfile
               noise only after naming it). Read surrounding code before flagging.
             - If CI failed and you need context, use the github_ci MCP tools (actions: read).
-            - If CLAUDE.md / AGENTS.md exists, treat it as authoritative for project conventions.
 
             ## Focus (priority order)
             1. Bugs and logic errors — incorrect behavior, off-by-one, race conditions
             2. Security — injection, auth bypass, leaked secrets, tenant isolation
-            3. Missing error handling at system boundaries (external API, DB, network)
+            3. Missing error handling at system boundaries (external API, DB). Exception:
+               do not add try/except in tool run() — the adapter handles those.
             4. Dropped context — removed info callers, logs, or downstream need
-            5. Architecture violations against CLAUDE.md / existing project patterns
+            5. Architecture — wrong dependency direction, missing client_id filter,
+               tool package importing from firney-adk
 
             ARCHITECTURE RULES — CLAUDE.md is authoritative when present: multi-tenant client_id filtering; one-way tool→framework dependency (tool packages never import the framework app); v2 tool contract (run() returns plain dict; no tool_context/**kwargs; no try/except in run()); API models in app/models/; frozen ToolConfigBase; state prefixes user:/app:/temp:. Flag missing client_id filters and wrong dependency direction.
 
             ## Do not comment on
-            - Naming, formatting, import order (linters own these)
+            - Naming, formatting, import order (Ruff)
             - Pre-existing issues only in unchanged lines
             - Missing docstrings or type annotations
             - Theoretical issues without a concrete failure scenario
@@ -95,7 +111,8 @@ jobs:
                `mcp__github_inline_comment__create_inline_comment`.
             2. Always post a **new** top-level PR comment via `gh pr comment`
                (do **not** edit or reuse an old bot comment). Include:
-               - PR number and head SHA (from `gh pr view`)
+               - PR number and **exact** head SHA `${{ github.event.pull_request.head.sha }}`
+                 (copy this SHA literally into the comment)
                - That this was a **full base...head scan**
                - Model used if known
                - What you verified (bullet list of areas)
@@ -106,23 +123,28 @@ jobs:
             If a tool is denied, switch to an allowed tool — do not stop without commenting.
           claude_args: |
             --model claude-opus-5
-            --allowedTools "Read,Glob,Grep,mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh api:*),Bash(git log:*),Bash(git show:*),Bash(git diff:*)"
+            --allowedTools "Read,Glob,Grep,mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr view:*),Bash(gh pr diff:*),Bash(git log:*),Bash(git show:*),Bash(git diff:*)"
 
+      # Require a comment that names THIS head SHA so a prior concurrent run
+      # cannot satisfy the gate for a silent failure.
+      # Note: `gh api --jq` does not support `--arg`; pipe to jq instead.
       - name: Verify Claude left a PR comment
         if: github.event_name == 'pull_request' && steps.claude.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           sleep 8
           COUNT=$(gh api "repos/${{ github.repository }}/issues/${PR}/comments" --paginate \
-            --jq '[.[] | select(
-              (.user.login | test("claude";"i")) and
-              (.created_at | fromdateiso8601) > (now - 1800)
-            )] | length')
-          echo "Recent NEW claude issue comments (by created_at): $COUNT"
+            | jq --arg sha "$HEAD_SHA" '[.[] | select(
+                (.user.login | test("claude";"i")) and
+                (.created_at | fromdateiso8601) > (now - 1800) and
+                (.body | contains($sha))
+              )] | length')
+          echo "Recent NEW claude issue comments mentioning head ${HEAD_SHA}: $COUNT"
           if [ "$COUNT" -lt 1 ]; then
-            echo "::error::Claude Code Review finished without a new PR comment. Re-run or widen tools; do not treat silence as approval."
+            echo "::error::Claude Code Review finished without a new PR comment that includes head SHA ${HEAD_SHA}."
             exit 1
           fi
