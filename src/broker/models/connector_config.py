@@ -58,13 +58,17 @@ class ConnectorMeta(BaseModel):
         ),
     )
     mcp_transport: str = "streamable_http"
-    auth_mode: Literal["broker", "sidecar", "none"] = Field(
+    auth_mode: Literal["broker", "sidecar", "none", "managed_key"] = Field(
         default="broker",
         description=(
             "'broker' = broker manages OAuth (default). "
             "'sidecar' = sidecar manages its own credentials, broker proxies without token injection. "
             "'none' = no broker-issued token; the connector targets an open or static-token API and "
-            "self-sources any credential from its own config (skips the OAuth connection gate)."
+            "self-sources any credential from its own config (skips the OAuth connection gate). "
+            "'managed_key' = no OAuth, but the broker injects a per-app static key read from "
+            "apps.{client}.{app}.{connector}.api_key as the handler's access_token. For API-key "
+            "services (e.g. image generation) where each app brings its own key and there is no "
+            "OAuth flow to populate the token store."
         ),
     )
     oauth_authorize_url: str | None = Field(
@@ -124,9 +128,11 @@ class ConnectorMeta(BaseModel):
                     raise ValueError(f"{field_name} must use HTTPS: {url}")
 
         # Sidecar connectors don't inject tokens — no HTTPS requirement on mcp_url.
-        # Broker connectors require HTTPS unless the URL is a Docker-internal hostname.
+        # Broker AND managed_key connectors inject a credential into the upstream request, so a
+        # non-native (mcp_url set) one MUST use HTTPS unless the URL is a Docker-internal hostname —
+        # otherwise the injected token/key would cross the wire in cleartext.
         if (
-            self.auth_mode == "broker"
+            self.auth_mode in ("broker", "managed_key")
             and self.mcp_url
             and not self.mcp_url.startswith("https://")
             and not _is_internal_url(self.mcp_url)
@@ -138,6 +144,11 @@ class ConnectorMeta(BaseModel):
         # remote auth server lives on the public internet).
         if self.mcp_oauth_url and not self.mcp_oauth_url.startswith("https://"):
             raise ValueError(f"mcp_oauth_url must use HTTPS: {self.mcp_oauth_url}")
+
+        # managed_key is a no-OAuth mode. mcp_oauth_url would flip uses_discovery to True,
+        # making the connect wizard present it as needing OAuth — contradicting the intent.
+        if self.auth_mode == "managed_key" and self.mcp_oauth_url:
+            raise ValueError("mcp_oauth_url must not be set when auth_mode='managed_key'")
 
         return self
 
@@ -156,9 +167,19 @@ class ConnectorMeta(BaseModel):
         """Whether the broker must obtain/inject an OAuth token for this connector.
 
         False for auth_mode='none' (open or static-token APIs that self-source any
-        credential) and 'sidecar' — both skip the broker's OAuth connection gate.
+        credential), 'sidecar', and 'managed_key' (broker injects a static per-app
+        key, not an OAuth token) — all skip the broker's OAuth connection gate.
         """
         return self.auth_mode == "broker"
+
+    @property
+    def uses_managed_key(self) -> bool:
+        """Whether the broker injects a per-app static key (from apps config) as the token.
+
+        The key is read from apps.{client}.{app}.{connector}.api_key at request time and
+        handed to the handler as access_token — no OAuth, no token store.
+        """
+        return self.auth_mode == "managed_key"
 
     @property
     def uses_discovery(self) -> bool:

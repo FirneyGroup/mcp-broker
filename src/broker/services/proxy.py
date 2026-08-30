@@ -440,6 +440,83 @@ async def _build_and_stream(  # noqa: PLR0913 — path forwarding requires all p
     return await _send_and_stream(client, upstream_request, connector.meta.display_name)
 
 
+def _resolve_managed_key(
+    connector_name: str, app_key: str, settings: BrokerSettings
+) -> str | JSONResponse:
+    """Resolve the per-app static key for a managed_key connector.
+
+    Reads apps.{client}.{app}.{connector}.api_key. Returns the key string, or a 503
+    JSONResponse when no key is configured for this app. The key is never logged.
+    """
+    try:
+        credentials = settings.get_app_credentials(app_key, connector_name)
+    except KeyError:
+        return _managed_key_not_configured(connector_name, app_key)
+    api_key = credentials.get("api_key", "")
+    if not api_key:
+        return _managed_key_not_configured(connector_name, app_key)
+    return api_key
+
+
+async def _dispatch_managed_key(  # noqa: PLR0913 — managed-key dispatch needs request + routing context
+    request: Request,
+    connector: BaseConnector,
+    connector_name: str,
+    app_key: str,
+    settings: BrokerSettings,
+    path: str,
+) -> Response:
+    """Resolve the per-app static key and dispatch (native in-process, or upstream Bearer).
+
+    Returns a 503 JSONResponse when the app has no api_key configured for this connector.
+    """
+    key_or_error = _resolve_managed_key(connector_name, app_key, settings)
+    if isinstance(key_or_error, JSONResponse):
+        return key_or_error
+    client_host = request.client.host if request.client else "unknown"
+    logger.info(
+        "[Proxy] Managed-key dispatch: app=%s connector=%s method=%s ip=%s",
+        app_key,
+        connector_name,
+        request.method,
+        client_host,
+    )
+    # Transient connection — carries the per-app key as access_token. Never persisted.
+    connection = AppConnection(connector_name=connector_name, access_token=key_or_error)
+    if isinstance(connector, NativeConnector):
+        return await _dispatch_native_request(request, connector, connection)
+    return await _build_and_stream(
+        request, connector, connector_name, connection=connection, path=path
+    )
+
+
+def _managed_key_not_configured(connector_name: str, app_key: str) -> JSONResponse:
+    """503 when a managed_key connector has no api_key configured for this app.
+
+    Distinct from upstream_not_connected: there is no OAuth to complete — the operator
+    must add apps.{client}.{app}.{connector}.api_key. The key value is never echoed.
+    """
+    logger.warning(
+        "[managed_key_not_configured] app_key=%s connector=%s — no api_key in apps config; "
+        "set apps.<client>.<app>.%s.api_key in settings.yaml",
+        app_key,
+        connector_name,
+        connector_name,
+    )
+    return JSONResponse(
+        {
+            "error": "managed_key_not_configured",
+            "error_description": (
+                f"No api_key configured for connector '{connector_name}' and app '{app_key}'. "
+                f"Set apps.<client>.<app>.{connector_name}.api_key in settings.yaml."
+            ),
+            "connector": connector_name,
+            "app_key": app_key,
+        },
+        status_code=503,
+    )
+
+
 async def proxy_mcp_request(  # noqa: PLR0913
     connector_name: str,
     request: Request,
@@ -473,6 +550,14 @@ async def proxy_mcp_request(  # noqa: PLR0913
             client_host,
         )
         return await _build_and_stream(request, connector, connector_name, path=path)
+
+    # Managed-key — no OAuth, but inject a per-app static key (apps.*.api_key) as the
+    # handler's access_token. Checked before the no-auth branch because managed_key also
+    # has requires_oauth == False. (Extracted to keep this function under the complexity cap.)
+    if connector.meta.uses_managed_key:
+        return await _dispatch_managed_key(
+            request, connector, connector_name, app_key, settings, path
+        )
 
     # No-OAuth — open or static-token APIs skip the OAuth connection gate. A native
     # connector self-sources any static credential from its own broker-side config;
